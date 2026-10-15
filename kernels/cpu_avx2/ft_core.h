@@ -149,8 +149,40 @@ alignas(32) int32_t SHV[8];
 #ifndef FT_OPT_BSUM_SHUF
 #define FT_OPT_BSUM_SHUF 0
 #endif
+// [bdw-opt] With BSUM_SHUF, use maddubs for N of the 32 groups to rebalance p0/p5
+// after changing extraction. An odd multiplier permutes groups to spread them;
+// the default multiplier 5 preserves the original experimental schedule.
+#ifndef FT_OPT_BSUM_MADD_N
+#define FT_OPT_BSUM_MADD_N 0
+#endif
+static_assert(FT_OPT_BSUM_MADD_N >= 0 && FT_OPT_BSUM_MADD_N <= 32, "BSUM_MADD_N must be 0..32");
+#ifndef FT_OPT_BSUM_MADD_PERM
+#define FT_OPT_BSUM_MADD_PERM 5
+#endif
+static_assert(FT_OPT_BSUM_MADD_PERM >= 1 && FT_OPT_BSUM_MADD_PERM <= 31 && (FT_OPT_BSUM_MADD_PERM & 1),
+              "BSUM_MADD_PERM must be odd and in 1..31");
+// [bdw-opt] init_tables produces four repeating shuffle masks for groups 0..28;
+// only the clamped tail groups 29..31 need distinct masks. Reuse their addresses
+// so the compiler can share constants instead of spilling 32 separate loads.
+#ifndef FT_OPT_CTRL_REUSE
+#define FT_OPT_CTRL_REUSE 0
+#endif
 #ifndef FT_OPT_FLOAT_EXTRACT
 #define FT_OPT_FLOAT_EXTRACT 0
+#endif
+// [bdw-opt] Exact exponent-based extraction; overrides FLOAT_EXTRACT when enabled.
+// SHV is in [9,16]. With u = shuffled >> 9, reinterpret (u | exponent) as
+// 2^(32-sh) + u * 2^(9-sh). Truncation followed by &65535 is exactly
+// (shuffled >> sh)&65535: discarded low bits cannot carry into the quotient,
+// and the bias is a multiple of 65536. All constructed floats are positive,
+// normal and below 2^24. This removes cvtdq2ps/mulps and one live constant.
+// Mode 1 requires the usual masked FP precision exception (fractional cvtt may
+// set MXCSR.PE). Mode 2 masks those fractional bits first, preserving FP status.
+#ifndef FT_OPT_EXP_EXTRACT
+#define FT_OPT_EXP_EXTRACT 0
+#endif
+#if FT_OPT_EXP_EXTRACT
+alignas(32) int32_t XEXP[8];
 #endif
 alignas(32) int32_t XMASK[8];   // [bdw-opt bdw] 0xffff << SHV[j]
 alignas(32) float XSCL[8];      // [bdw-opt bdw] 2^-SHV[j]
@@ -160,6 +192,9 @@ inline int mem_of_stream(int q) { q = ((q % 96) + 96) % 96; return 4 * (q / 4) +
 void init_tables()
 {
     for (int j = 0; j < 8; ++j) SHV[j] = 16 - (3 + 3 * j) % 8;
+#if FT_OPT_EXP_EXTRACT
+    for (int j = 0; j < 8; ++j) XEXP[j] = (127 + 32 - SHV[j]) << 23;
+#endif
     for (int j = 0; j < 8; ++j) { XMASK[j] = int32_t(uint32_t(0xffffu) << SHV[j]); XSCL[j] = std::ldexp(1.0f, -SHV[j]); }
     for (int g = 0; g < 32; ++g)
     {
@@ -191,6 +226,9 @@ struct Consts
     __m256i m16, mul, one8, one16, sh, expm, magic;
     __m256 kinv, caff;
     __m256i m00ff, bsctrl, xmask; __m256 xscale;   // [bdw-opt bdw] (after kinv/caff: matches consts() init order)
+#if FT_OPT_EXP_EXTRACT
+    __m256i xexp;
+#endif
 };
 
 inline Consts consts()
@@ -201,7 +239,11 @@ inline Consts consts()
              _mm256_set1_epi32(0x00FF00FF),
              _mm256_setr_epi8(1, -128, 3, -128, 5, -128, 7, -128, 9, -128, 11, -128, 13, -128, 15, -128,
                               1, -128, 3, -128, 5, -128, 7, -128, 9, -128, 11, -128, 13, -128, 15, -128),
-             _mm256_load_si256(reinterpret_cast<const __m256i*>(XMASK)), _mm256_load_ps(XSCL) };
+             _mm256_load_si256(reinterpret_cast<const __m256i*>(XMASK)), _mm256_load_ps(XSCL)
+#if FT_OPT_EXP_EXTRACT
+             , _mm256_load_si256(reinterpret_cast<const __m256i*>(XEXP))
+#endif
+    };
 }
 
 template <int g>
@@ -228,6 +270,7 @@ __attribute__((always_inline)) inline __m256 decode8(const uint8_t* tile, const 
 template <int g>
 __attribute__((always_inline)) inline __m256i decode8p(const uint8_t* tile, const Consts& K)
 {
+    constexpr int ctrl_g = FT_OPT_CTRL_REUSE && g < 29 ? (g & 3) : g;
     __m256i win;
     if constexpr (g == 0)
     {
@@ -240,15 +283,27 @@ __attribute__((always_inline)) inline __m256i decode8p(const uint8_t* tile, cons
         constexpr int L = 4 * ((3 * g - 2) / 4) < 80 ? 4 * ((3 * g - 2) / 4) : 80;   // [upstream 8a3d790] window clamp: groups 29-31 would read 4-8 B past the 96-B tile
         win = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(tile + L)));
     }
-#if FT_OPT_FLOAT_EXTRACT
-    const __m256i wm = _mm256_and_si256(_mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[g]))), K.xmask);
+#if FT_OPT_EXP_EXTRACT
+    __m256i mantissa = _mm256_srli_epi32(
+        _mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[ctrl_g]))), 9);
+#if FT_OPT_EXP_EXTRACT == 2
+    mantissa = _mm256_and_si256(mantissa, _mm256_srli_epi32(K.xmask, 9));
+#endif
+    const __m256i bits = _mm256_or_si256(mantissa, K.xexp);
+    const __m256i st = _mm256_and_si256(_mm256_cvttps_epi32(_mm256_castsi256_ps(bits)), K.m16);
+#elif FT_OPT_FLOAT_EXTRACT
+    const __m256i wm = _mm256_and_si256(_mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[ctrl_g]))), K.xmask);
     const __m256i st = _mm256_and_si256(_mm256_cvttps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(wm), K.xscale)), K.m16);
 #else
     const __m256i st = _mm256_and_si256(_mm256_srlv_epi32(
-        _mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[g]))), K.sh), K.m16);
+        _mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[ctrl_g]))), K.sh), K.m16);
 #endif
 #if FT_OPT_BSUM_SHUF
     const __m256i pr = _mm256_mullo_epi32(st, K.mul);
+#if FT_OPT_BSUM_MADD_N
+    if constexpr (((g * FT_OPT_BSUM_MADD_PERM) & 31) < FT_OPT_BSUM_MADD_N)
+        return _mm256_maddubs_epi16(pr, K.one8);
+#endif
     return _mm256_add_epi16(_mm256_and_si256(pr, K.m00ff), _mm256_shuffle_epi8(pr, K.bsctrl));
 #else
     return _mm256_maddubs_epi16(_mm256_mullo_epi32(st, K.mul), K.one8);
@@ -382,6 +437,57 @@ __attribute__((always_inline)) inline void tile_accum_i16(const uint8_t* tile, c
     }
 }
 
+// [bdw-opt] Keep integer accumulators over their complete eight-row scale block.
+// 0 preserves the existing loop; 2/4 choose how many output column groups share
+// an activation load. M>1 keeps the existing schedule. Integer regrouping only:
+// the per-eight-row scale/FMA and final floating reduction remain unchanged.
+#ifndef FT_OPT_I16_REGISTER_TILE
+#define FT_OPT_I16_REGISTER_TILE 0
+#endif
+#if FT_OPT_I16_REGISTER_TILE
+static_assert(FT_OPT_I16_REGISTER_TILE == 2 || FT_OPT_I16_REGISTER_TILE == 4,
+              "FT_OPT_I16_REGISTER_TILE must be 0, 2 or 4");
+template <int C0, int Q, int C = 0>
+__attribute__((always_inline)) inline void register_tile_q(const uint8_t* tile, __m256i x, __m256i* a, const Consts& K)
+{
+    if constexpr (C < FT_OPT_I16_REGISTER_TILE)
+    {
+        a[C] = _mm256_add_epi32(a[C], _mm256_madd_epi16(decode8p<4 * (C0 + C) + Q>(tile, K), x));
+        register_tile_q<C0, Q, C + 1>(tile, x, a, K);
+    }
+}
+
+template <int C0 = 0>
+__attribute__((always_inline)) inline void register_tile_band(const uint8_t* tile, size_t stride,
+    const int32_t* x, float scale, float* accf, const Consts& K)
+{
+    if constexpr (C0 < 8)
+    {
+        __m256i a[FT_OPT_I16_REGISTER_TILE];
+        #pragma GCC unroll 4
+        for (int c = 0; c < FT_OPT_I16_REGISTER_TILE; ++c) a[c] = _mm256_setzero_si256();
+        const uint8_t* p = tile;
+        const int32_t* xp = x;
+        #pragma GCC unroll 1
+        for (int r = 0; r < 8; ++r, p += stride, xp += 32)
+        {
+            register_tile_q<C0, 0>(p, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xp)), a, K);
+            register_tile_q<C0, 1>(p, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xp + 8)), a, K);
+            register_tile_q<C0, 2>(p, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xp + 16)), a, K);
+            register_tile_q<C0, 3>(p, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xp + 24)), a, K);
+        }
+        const __m256 sc = _mm256_set1_ps(scale);
+        #pragma GCC unroll 4
+        for (int c = 0; c < FT_OPT_I16_REGISTER_TILE; ++c)
+        {
+            float* af = accf + (C0 + c) * 8;
+            _mm256_store_ps(af, _mm256_fmadd_ps(_mm256_cvtepi32_ps(a[c]), sc, _mm256_load_ps(af)));
+        }
+        register_tile_band<C0 + FT_OPT_I16_REGISTER_TILE>(tile, stride, x, scale, accf, K);
+    }
+}
+#endif
+
 template <int M, int T0 = 0, int T1 = 8>
 void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out)
 {
@@ -400,6 +506,23 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
     // other half too; a full block prefetches the whole 768-B band row either way). A hint only: no effect on results.
     const bool lean = pf_lean().load(std::memory_order_relaxed);
     const int pl0 = lean ? (t0 * TILE_BYTES) / 64 : 0, pl1 = lean ? (t1 * TILE_BYTES + 63) / 64 : 12;
+#if FT_OPT_I16_REGISTER_TILE
+    if constexpr (M == 1)
+    {
+        for (int tk = 0; tk + 7 < tiles_k; tk += 8, p += 8 * row_stride)
+        {
+            // Same prefetch addresses as eight old row iterations, issued before
+            // the band; only complete blocks contribute in the original loop too.
+            for (int r = 0; r < 8; ++r)
+                for (int l = pl0; l < pl1; ++l)
+                    _mm_prefetch(reinterpret_cast<const char*>(p + (r + PF_DIST) * row_stride) + l * 64, _MM_HINT_T0);
+            for (int t = t0; t < t1; ++t)
+                register_tile_band(p + t * TILE_BYTES, row_stride, xq[0] + size_t(tk) * 32, qs[0][tk >> 3], accf[t], K);
+        }
+    }
+    else
+#endif
+    {
     for (int tk = 0; tk < tiles_k; ++tk, p += row_stride)
     {
         const uint8_t* pf = p + PF_DIST * row_stride;
@@ -420,6 +543,7 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
                         _mm256_store_si256(reinterpret_cast<__m256i*>(ai), _mm256_setzero_si256());
                     }
         }
+    }
     }
     for (int i = 0; i < M; ++i)
         for (int t = t0; t < t1; ++t)
@@ -508,15 +632,42 @@ inline void sockq_assign(int n, const std::vector<int>& cpus)
 // Thread pool (pinned, spinning; master = worker 0)
 // ------------------------------------------------------------------------------------------
 
+// [bdw-opt] Experimental fork/join coherence options, both default off. PAD isolates the generation,
+// completion and dispatch fields; SHARDS=1 routes completion RMWs to socket counters, SHARDS=2 one
+// release-stored completion epoch per worker (no completion RMWs).
+// Neither changes work assignment or arithmetic. Build separately to compare with the live layout.
+#ifndef FT_OPT_POOL_PAD
+#define FT_OPT_POOL_PAD 0
+#endif
+#ifndef FT_OPT_POOL_DONE_SHARDS
+#define FT_OPT_POOL_DONE_SHARDS 0
+#endif
+
 struct Pool
 {
     int n = 1;
     std::vector<std::thread> th;
+#if FT_OPT_POOL_PAD
+    alignas(64)
+#endif
     std::atomic<uint64_t> gen{0};
+#if FT_OPT_POOL_PAD
+    alignas(64)
+#endif
     std::atomic<int> done{0};
+#if FT_OPT_POOL_PAD
+    alignas(64)
+#endif
     void (*fn)(void*, int, int) = nullptr;
     void* ctx = nullptr;
     std::atomic<bool> quit{false};
+#if FT_OPT_POOL_DONE_SHARDS == 1
+    struct alignas(64) Completion { std::atomic<int> count{0}; };
+    Completion done_socket[2];
+#elif FT_OPT_POOL_DONE_SHARDS == 2
+    struct alignas(64) CompletionEpoch { std::atomic<uint64_t> generation{0}; };
+    std::unique_ptr<CompletionEpoch[]> done_epoch;
+#endif
 
     static void pin(int cpu) { cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu, &s); pthread_setaffinity_np(pthread_self(), sizeof(s), &s); }
 
@@ -524,6 +675,9 @@ struct Pool
     {
         n = threads;
         sockq_assign(n, cpus);   // [bdw-opt sockq] cheap; only consulted when GLM53_CT_SOCKQ=1
+#if FT_OPT_POOL_DONE_SHARDS == 2
+        done_epoch.reset(new CompletionEpoch[n]);
+#endif
         pin(cpus[0]);
         for (int w = 1; w < n; ++w)
             th.emplace_back([this, w, cpu = cpus[w % cpus.size()]] {
@@ -541,16 +695,45 @@ struct Pool
                     }
                     seen = g;
                     fn(ctx, w, n);
+#if FT_OPT_POOL_DONE_SHARDS == 1
+                    done_socket[g_wsock[w]].count.fetch_add(1, std::memory_order_acq_rel);
+#elif FT_OPT_POOL_DONE_SHARDS == 2
+                    done_epoch[w].generation.store(seen, std::memory_order_release);
+#else
                     done.fetch_add(1, std::memory_order_acq_rel);
+#endif
                 }
             });
     }
     void run(void (*f)(void*, int, int), void* c)
     {
-        fn = f; ctx = c; done.store(0, std::memory_order_relaxed);
+        fn = f; ctx = c;
+#if FT_OPT_POOL_DONE_SHARDS == 1
+        done_socket[0].count.store(0, std::memory_order_relaxed);
+        done_socket[1].count.store(0, std::memory_order_relaxed);
+#elif FT_OPT_POOL_DONE_SHARDS != 2
+        done.store(0, std::memory_order_relaxed);
+#endif
+#if FT_OPT_POOL_DONE_SHARDS == 2
+        const uint64_t launched = gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+#else
         gen.fetch_add(1, std::memory_order_acq_rel);
+#endif
         f(c, 0, n);
+#if FT_OPT_POOL_DONE_SHARDS == 1
+        // Each acquire observes that socket's release sequence; both are needed before consuming results.
+        const int target0 = g_nsock[0] - (g_wsock[0] == 0);
+        const int target1 = g_nsock[1] - (g_wsock[0] == 1);
+        while (done_socket[0].count.load(std::memory_order_acquire) != target0
+            || done_socket[1].count.load(std::memory_order_acquire) != target1) _mm_pause();
+#elif FT_OPT_POOL_DONE_SHARDS == 2
+        // A unique epoch avoids reset races. Acquire every worker's publication before reusing its results
+        // or updating dispatch state; checking only the last finisher would not join the other workers.
+        for (int w = 1; w < n; ++w)
+            while (done_epoch[w].generation.load(std::memory_order_acquire) != launched) _mm_pause();
+#else
         while (done.load(std::memory_order_acquire) != n - 1) _mm_pause();
+#endif
     }
     void stop() { quit = true; for (auto& t : th) t.join(); }
 };
@@ -718,16 +901,35 @@ inline int next_unit(Fwd& F, int w)
     return u < mid ? u : -1;
 }
 
+// [bdw-opt] Short independent prep/activation/sum units can avoid the shared queue RMW.
+// GEMV units retain dynamic scheduling; default off to preserve the deployed policy.
+inline std::atomic<int>& g_light_static()
+{
+    static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_LIGHT_STATIC"); return e ? std::atoi(e) : 0; }());
+    return v;
+}
+
 void fwd_phase(void* vc, int w, int nw)
 {
     Fwd& F = *static_cast<Fwd*>(vc);
     const Layer& L = *F.L;
     const int H = L.H, I = L.I;
     const size_t XH = size_t(H) * 2, XI = size_t(I) * 2;    // permuted activation sizes
+    const bool light_static = (F.phase == 0 || F.phase == 3) && g_light_static().load(std::memory_order_relaxed);
+    int static_u = w;
     while (true)
     {
-        const int u = next_unit(F, w);   // [bdw-opt sockq] (stock: one shared F.next counter)
-        if (u < 0) break;
+        int u;
+        if (light_static)
+        {
+            u = static_u; static_u += nw;
+            if (u >= F.units) break;
+        }
+        else
+        {
+            u = next_unit(F, w);   // [bdw-opt sockq] (stock: one shared F.next counter)
+            if (u < 0) break;
+        }
         if (F.phase == 0)
         {
             // prep gate/up inputs: unit = (job, token slot, g|u), whole 4096 vector
@@ -874,16 +1076,27 @@ inline const float* gu_sums(Fwd& F, int j, int which, int m, float* sx)
     return sx;
 }
 
-void fwd_phase_split1(void* vc, int w, int)
+void fwd_phase_split1(void* vc, int w, int nw)
 {
     Fwd& F = *static_cast<Fwd*>(vc);
     const Layer& L = *F.L;
     const int H = L.H, I = L.I;
     const size_t XH = size_t(H) * 2, XI = size_t(I) * 2;
+    const bool light_static = (F.phase == 10 || F.phase == 2) && g_light_static().load(std::memory_order_relaxed);
+    int static_u = w;
     while (true)
     {
-        const int u = next_unit(F, w);   // [bdw-opt sockq] (stock: one shared F.next counter)
-        if (u < 0) break;
+        int u;
+        if (light_static)
+        {
+            u = static_u; static_u += nw;
+            if (u >= F.units) break;
+        }
+        else
+        {
+            u = next_unit(F, w);   // [bdw-opt sockq] (stock: one shared F.next counter)
+            if (u < 0) break;
+        }
         if (F.phase == 10)
         {
             // [bdw-opt p0blk] unit = (active pair p, gate|up, block b of H/128)
@@ -1005,6 +1218,9 @@ void fwd_phase_split1(void* vc, int w, int)
 // static GEMV split was tried too: slower at every job count — per-call overhead beat the better round packing.)
 inline std::atomic<int>& g_fuse() { static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_FUSE"); return e ? std::atoi(e) : 0; }()); return v; }
 inline std::atomic<int>& g_fuse_maxn() { static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_FUSE_MAXN"); return e ? std::atoi(e) : 1; }()); return v; }
+// [bdw-opt] A one-token reduction has only H/512 (8) short units. Optionally keep it on the coordinator,
+// avoiding a full-pool fork/join; fwd_phase retains the original per-element addition order. Default off.
+inline std::atomic<int>& g_serial_sum() { static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_SERIAL_SUM"); return e ? std::atoi(e) : 0; }()); return v; }
 
 void fwd_fusedA(void* vc, int, int)
 {
@@ -1173,7 +1389,8 @@ void moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std
         {
             const double t0 = pt ? now() : 0;
             F.phase = phv[st]; reset_units(F, su[st]);
-            pool.run(fn[st], &F);
+            if (st == 4 && ntok == 1 && g_serial_sum().load(std::memory_order_relaxed)) fn[st](&F, 0, 1);
+            else pool.run(fn[st], &F);
             if (pt) pt->t[st] += now() - t0;
         }
         return;
@@ -1183,7 +1400,8 @@ void moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std
     {
         const double t0 = pt ? now() : 0;
         F.phase = ph; reset_units(F, units[ph]);
-        pool.run(&fwd_phase, &F);
+        if (ph == 3 && ntok == 1 && g_serial_sum().load(std::memory_order_relaxed)) fwd_phase(&F, 0, 1);
+        else pool.run(&fwd_phase, &F);
         if (pt) pt->t[ph] += now() - t0;
     }
 }

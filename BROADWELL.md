@@ -20,6 +20,7 @@ Every switch added here defaults to off (upstream behaviour). In the table, the 
 | `GLM53_CT_P0BLK` | 0 · **1** | block-parallel input prep (needs `SPLIT1=2`, I16 path) | CPU job −2.5% (bit-identical) |
 | `GLM53_CT_SOCKQ` | 0 · **1** | per-socket work counters with stealing instead of one shared atomic | ≈ 0 (kept, harmless) |
 | `GLM53_CT_CFLAGS` | string | compiler flags for the CPU-tier JIT build; `-DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1` enable Broadwell decode tweaks | CPU time −3% (bit-identical) |
+| `GLM53_CT_CFLAGS` += `-DFT_OPT_EXP_EXTRACT=1 -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1` ("N32CTRL", experimental, off) | flags | cheaper trellis decode: exponent-field bit extraction instead of convert-multiply-convert, `vpmaddubsw` byte sums on all 32 groups, shuffle masks kept in registers. Optional, also off: `GLM53_CT_LIGHT_STATIC=1`, `GLM53_CT_SERIAL_SUM=1` (static short phases, serial reduction) | decode loop 188 → ~160 cycles per 256 weights (uiCA, Broadwell); harness on the test box: 7.4-13.9% less time per decode call, projected +3.5% tok/s. **Not yet measured live.** Output bit-identical in the harness (server flags and `-ffp-contract=off`, both layouts); may set the MXCSR inexact status flag (exception stays masked) |
 | `GLM53_CT_BUILD` | path | separate JIT build dir per flag set, so variants don't overwrite each other | |
 | `GLM53_ZC_THP` | 0 · **1** | pinned expert arena backed by 2 MB pages (mmap + `MADV_HUGEPAGE` before first touch) | prefill +4-5%, decode tie; needs THP `madvise` or `always` |
 | `GLM53_LA` | 0 · **1** | decode lookahead (ported from upstream `1f6d74e`); runtime `GET /la?on=0\|1` | +3.3%; greedy-identical in `exact` mode |
@@ -85,3 +86,19 @@ run-to-run deterministic; see upstream's README and the field note.
 
 MIT, as upstream (see `LICENSE`). Upstream design and code by 0xSero and contributors; the patches on this branch by
 Nathan Keilar.
+
+## Reproducing the decode-kernel A/B
+
+`tools/bench/kernel-ab-harness.cpp` drives the CPU tier on synthetic EXL3 layers (any 96 bytes are a valid trellis
+tile) and dumps raw outputs, or times decode-shaped calls with `HARNESS_TIME=1`. Bit-exactness check for a flag set:
+
+```bash
+SRV="-mavx2 -mfma -mf16c -mtune=znver3 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1"
+N32="-DFT_OPT_EXP_EXTRACT=1 -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1"
+g++ -O3 -std=c++17 $SRV      -pthread -DHAVE_SPLIT1 -I kernels/cpu_avx2 tools/bench/kernel-ab-harness.cpp -o base
+g++ -O3 -std=c++17 $SRV $N32 -pthread -DHAVE_SPLIT1 -I kernels/cpu_avx2 tools/bench/kernel-ab-harness.cpp -o n32
+for swz in 0 1; do HARNESS_SWZ=$swz ./base a$swz.bin; HARNESS_SWZ=$swz ./n32 b$swz.bin; cmp a$swz.bin b$swz.bin; done
+```
+
+Repeat with `-ffp-contract=off` added to both; GCC's default contraction can move last bits after any header edit.
+
