@@ -28,11 +28,38 @@ def _load_json(p):
         return json.load(f)
 
 
+_THP_KEEP = []   # [bdw-opt zc-thp] mmap objects backing THP arenas (must outlive their tensors)
+
+
+def _thp_host_tensor(nbytes):
+    """[bdw-opt zc-thp] 2 MB-aligned anonymous mapping with madvise(MADV_HUGEPAGE) BEFORE first touch, so the faults
+    cudaHostRegister triggers allocate transparent huge pages (host THP mode 'madvise'). Process-local; same bytes.
+    Microbenchmark on the test box (2x Xeon E5-2699 v4, RTX 3090, PCIe 3.0): GPU zero-copy reads from 4 KB-backed registered memory drop to
+    2.6-5.7 GB/s at modest kernel parallelism vs ~9.6-9.9 GB/s THP-backed (PCIe 3.0 x16)."""
+    import ctypes, mmap
+    al = 2 << 20
+    mm = mmap.mmap(-1, nbytes + al, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    base = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+    off = ((base + al - 1) & ~(al - 1)) - base
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    rc = libc.madvise(base + off, nbytes, 14)   # MADV_HUGEPAGE
+    if rc != 0:
+        print(f" -- zc-thp: madvise failed errno={ctypes.get_errno()} (falling back to 4 KB pages)", flush=True)
+    ctypes.memset(base + off, 0, nbytes)   # first touch here (the verified bench path), not inside cudaHostRegister
+    t = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=off)
+    _THP_KEEP.append(mm)
+    return t
+
+
 def pinned_exact(nbytes, dev_idx):
     """Exact-size pinned host buffer (torch's pinned allocator rounds each block up to a power of two: a 2.72 GB layer
     arena would cost 4 GB). Plain host tensor + cudaHostRegister under the GPU's context (pinned_cuda_view checks the
-    pointer's device)."""
-    t = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
+    pointer's device). [bdw-opt] GLM53_ZC_THP=1: THP-backed host memory instead of torch.empty (see _thp_host_tensor)."""
+    if os.environ.get("GLM53_ZC_THP") == "1":
+        t = _thp_host_tensor(nbytes)
+    else:
+        t = torch.empty(nbytes, dtype=torch.uint8, device="cpu")
     with torch.cuda.device(dev_idx):
         r = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 2)   # cudaHostRegisterMapped
     assert int(r) == 0, f"cudaHostRegister failed: {r}"

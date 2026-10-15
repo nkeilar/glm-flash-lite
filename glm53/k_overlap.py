@@ -19,7 +19,8 @@ import os
 import torch
 
 S = {"streams": {}, "overlapped": 0, "fallback": 0, "bc_stripped": 0}
-AFTER = os.environ.get("GLM53_K_OVL_AFTER", "0") == "1"   # launch the shared expert after the miss path is enqueued
+S["after"] = os.environ.get("GLM53_K_OVL_AFTER", "0") == "1"   # launch the shared expert after the miss path is enqueued
+# [bdw-opt] runtime switch (/ct_policy?ovl_after=): read per call, so the order can be A/B'd without a restart
 
 
 def install():
@@ -65,14 +66,15 @@ def attach(model):
             main = torch.cuda.current_stream(_m.device)
             side = _stream(_m.device)
             ev = torch.cuda.Event(); ev.record(main)       # MoE input ready
-            r = _inner(bsz, cfg, z, params) if AFTER else None   # AFTER: ft_split / ec_step / ec_copy enqueued first
+            after = S["after"]
+            r = _inner(bsz, cfg, z, params) if after else None   # AFTER: ft_split / ec_step / ec_copy enqueued first
             side.wait_event(ev)
             with torch.cuda.stream(side):
                 y = _f(z.view(bsz, 1, -1), params)
                 done = torch.cuda.Event(); done.record(side)
             y.record_stream(main)
             _se._k_pending = (y, done)
-            return r if AFTER else _inner(bsz, cfg, z, params)
+            return r if after else _inner(bsz, cfg, z, params)
 
         def sh_forward(x, params, *args, _se=se, _f=orig_fwd, **kw):
             p = _se._k_pending
@@ -90,6 +92,13 @@ def attach(model):
     print(f" -- k_overlap (K103): {len(mods)} MoE layers, shared expert on a side stream "
           f"(BCs stripped {S['bc_stripped']}, ec_copy grid {os.environ.get('GLM53_EC_COPY_GRID', 'stock')})", flush=True)
     return len(mods)
+
+
+def set_after(on=None):
+    """[bdw-opt] shared expert after (True) or before (False) the routed miss path; returns the current setting."""
+    if on is not None:
+        S["after"] = bool(on)
+    return S["after"]
 
 
 def summary():

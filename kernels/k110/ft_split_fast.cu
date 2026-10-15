@@ -5,6 +5,9 @@
 // scanning E; each miss's position in the (score asc, expert id asc) order computed in parallel (= the stock stable
 // insertion sort, strict >); the tiny cost-model loop stays serial with the same float expressions; the published
 // pick list is built in pick order by a warp ballot prefix (same order as the stock serial loop).
+// [E4] Three-target split (p[8] on while the remote 3090 tier is attached): misses the 3090s hold (rres) are ranked in
+// their own class and costed on their own lane, exactly as the stock kernel (ft_tier_cu.cu) does; outputs identical
+// to the stock kernel for both models (tests/ft_split_e4_test.py compares fast vs stock vs a float32 reference).
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -15,7 +18,7 @@
 __global__ void ft_split_fast_k(const int64_t* __restrict__ sel, const __half* __restrict__ w, const __half* __restrict__ z,
     int n, int bsz, int topk, int H, int E, int first, const int* __restrict__ slotof, const float* __restrict__ score,
     const float* __restrict__ p, volatile long long* ctrl, __half* hx, int* hpicks, long long seq, int li, int keep_ids,
-    int64_t* sel_out, __half* w_out, long long* dflag, long long* stats)
+    int64_t* sel_out, __half* w_out, long long* dflag, long long* stats, const int* __restrict__ rres)
 {
     __shared__ int cnt[1024];
     __shared__ unsigned char cpu[1024];
@@ -24,11 +27,12 @@ __global__ void ft_split_fast_k(const int64_t* __restrict__ sel, const __half* _
     __shared__ int u_e[MAXP], nu;             // unique local experts (first occurrence order)
     __shared__ int u_hit[MAXP];
     __shared__ float u_sc[MAXP];
-    __shared__ int miss[MAXP], nm_s, nh_s, best_s, publish, npk;
-    __shared__ float pol[8];
+    __shared__ int u_cls[MAXP];
+    __shared__ int miss[MAXP], rmiss[MAXP], nm_s, nr_s, nh_s, best_s, publish, npk;
+    __shared__ float pol[20];
     const int t = threadIdx.x;
     for (int e = t; e < E; e += blockDim.x) { cnt[e] = 0; cpu[e] = 0; }
-    if (t < 8) pol[t] = p[t];
+    if (t < 20) pol[t] = p[t];
     if (t == 0) nu = 0;
     for (int s = t; s < n; s += blockDim.x) { s_e[s] = sel[s]; s_w[s] = __half2float(w[s]); }
     __syncthreads();
@@ -46,56 +50,82 @@ __global__ void ft_split_fast_k(const int64_t* __restrict__ sel, const __half* _
     }
     __syncthreads();
     const int U = nu;
+    const bool tri = pol[8] > 0.5f && rres != nullptr && (int) pol[6] < 0;
+    const bool lut = pol[12] > 0.0f;   // [bdw-opt] measured CPU-lane cost table (see ft_tier_cu.cu)
     if (t < U)
     {
         const int e = u_e[t];
         u_hit[t] = slotof[e] >= 0;
         u_sc[t] = score[e];
+        u_cls[t] = (tri && rres[e]) ? 1 : 0;      // [E4] 1 = held by the 3090 tier: its own (coldest-first) list
     }
     __syncthreads();
     if (t < U && !u_hit[t])
     {
-        // rank in the stock order: ascending score, ties by ascending expert id (stable insertion over e ascending)
+        // rank in the stock order within the miss's class: ascending score, ties by ascending expert id
         const int e = u_e[t];
         const float sc = u_sc[t];
+        const int cl = u_cls[t];
         int r = 0;
         for (int j = 0; j < U; ++j)
         {
-            if (u_hit[j]) continue;
+            if (u_hit[j] || u_cls[j] != cl) continue;
             const int e2 = u_e[j];
             const float s2 = u_sc[j];
             if (s2 < sc || (s2 == sc && e2 < e)) ++r;
         }
-        miss[r] = e;
+        if (cl) rmiss[r] = e; else miss[r] = e;
     }
     if (t == 0)
     {
-        int nh = 0;
-        for (int j = 0; j < U; ++j) nh += u_hit[j];
-        nh_s = nh; nm_s = U - nh;
+        int nh = 0, nr = 0;
+        for (int j = 0; j < U; ++j) { nh += u_hit[j]; nr += !u_hit[j] && u_cls[j]; }
+        nh_s = nh; nr_s = nr; nm_s = U - nh - nr;
     }
     __syncthreads();
     if (t == 0)
     {
-        const int nm = nm_s, nh = nh_s;
-        int best = 0;
+        const int nm = nm_s, nh = nh_s, nr = nr_s;
+        int best = 0, bestr = 0;
         const int force = (int) pol[6], maxc = min((int) pol[5], nm);
         if (force >= 0) best = min(force, nm);
+        else if (tri)
+        {
+            // [E4] same search and float expressions as ft_tier_cu.cu's three-target branch
+            float bt = 1e30f, cr = 0.0f;
+            for (int kr = 0; kr <= nr; ++kr)
+            {
+                if (kr) cr += pol[10] * (1.0f + pol[4] * (cnt[rmiss[kr - 1]] - 1));
+                const float rem = kr ? pol[9] + cr : 0.0f;
+                float c = 0.0f, cx = 0.0f;
+                for (int k = 0; k <= maxc; ++k)
+                {
+                    if (k) { c += pol[3] * (1.0f + pol[4] * (cnt[miss[k - 1]] - 1)); cx += pol[3] * pol[4] * (cnt[miss[k - 1]] - 1); }
+                    const int zz = nm - k + nr - kr;
+                    const float gpu = pol[1] * (nh + zz) + pol[0] * zz;
+                    const float loc = k ? (lut ? pol[11 + (k < 8 ? k : 8)] + (k > 8 ? pol[3] * (k - 8) : 0.0f) + cx : pol[2] + c) : 0.0f;
+                    const float tt = fmaxf(gpu, fmaxf(loc, rem));
+                    if (tt < bt - 1e-6f) { bt = tt; best = k; bestr = kr; }
+                }
+            }
+            for (int k = 0; k < bestr; ++k) cpu[rmiss[k]] = 1;
+        }
         else
         {
-            float bt = 1e30f, c = 0.0f;
+            float bt = 1e30f, c = 0.0f, cx = 0.0f;
             for (int k = 0; k <= maxc; ++k)
             {
-                if (k) c += pol[3] * (1.0f + pol[4] * (cnt[miss[k - 1]] - 1));
+                if (k) { c += pol[3] * (1.0f + pol[4] * (cnt[miss[k - 1]] - 1)); cx += pol[3] * pol[4] * (cnt[miss[k - 1]] - 1); }
                 const float gpu = pol[1] * (nh + nm - k) + pol[0] * (nm - k);
-                const float tt = fmaxf(gpu, k ? pol[2] + c : 0.0f);
+                const float loc = k ? (lut ? pol[11 + (k < 8 ? k : 8)] + (k > 8 ? pol[3] * (k - 8) : 0.0f) + cx : pol[2] + c) : 0.0f;
+                const float tt = fmaxf(gpu, loc);
                 if (tt < bt - 1e-6f) { bt = tt; best = k; }
             }
         }
         for (int k = 0; k < best; ++k) cpu[miss[k]] = 1;
-        best_s = best;
-        publish = best > 0 || pol[7] > 0.5f;
-        stats[0] += nh; stats[1] += nm; stats[2] += best; stats[3] += 1;
+        best_s = best + bestr;
+        publish = best + bestr > 0 || pol[7] > 0.5f;
+        stats[0] += nh; stats[1] += nm + nr; stats[2] += best + bestr; stats[3] += 1;
     }
     __syncthreads();
     // published picks in pick order: warp 0 ballot prefix over s
@@ -148,9 +178,11 @@ __global__ void ft_split_fast_k(const int64_t* __restrict__ sel, const __half* _
 
 void ft_split(torch::Tensor sel, torch::Tensor w, torch::Tensor z, int64_t E, int64_t first, torch::Tensor slotof, torch::Tensor score,
               torch::Tensor pol, int64_t ctrl, int64_t hx, int64_t hpicks, int64_t seq, int64_t li, int64_t keep_ids,
-              torch::Tensor sel_out, torch::Tensor w_out, torch::Tensor dflag, torch::Tensor stats)
+              torch::Tensor sel_out, torch::Tensor w_out, torch::Tensor dflag, torch::Tensor stats, torch::Tensor rres)
 {
     c10::cuda::CUDAGuard g(sel.device());
+    TORCH_CHECK(pol.numel() >= 20, "ft_split_fast: policy needs 20 entries");
+    TORCH_CHECK(rres.numel() == 0 || (rres.dtype() == at::kInt && rres.numel() >= E), "ft_split_fast: rres int32 [E] or empty");
     auto st = at::cuda::getCurrentCUDAStream(sel.device().index());
     TORCH_CHECK(sel.dtype() == at::kLong && w.dtype() == at::kHalf && z.dtype() == at::kHalf && z.is_contiguous(), "dtypes");
     const int bsz = (int) z.size(0), H = (int) z.size(1), n = (int) sel.numel(), topk = n / bsz;
@@ -159,7 +191,8 @@ void ft_split(torch::Tensor sel, torch::Tensor w, torch::Tensor z, int64_t E, in
     ft_split_fast_k<<<1, 256, 0, st>>>(sel.data_ptr<int64_t>(), (const __half*) w.data_ptr(), (const __half*) z.data_ptr(), n, bsz, topk, H,
         (int) E, (int) first, slotof.data_ptr<int>(), score.data_ptr<float>(), pol.data_ptr<float>(), (volatile long long*) ctrl,
         (__half*) hx, (int*) hpicks, seq, (int) li, (int) keep_ids, sel_out.data_ptr<int64_t>(), (__half*) w_out.data_ptr(),
-        (long long*) dflag.data_ptr<int64_t>(), (long long*) stats.data_ptr<int64_t>());
+        (long long*) dflag.data_ptr<int64_t>(), (long long*) stats.data_ptr<int64_t>(),
+        rres.numel() ? rres.data_ptr<int>() : nullptr);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)

@@ -22,6 +22,11 @@ home afterwards. Buffer overflow -> the rest stays zero-copy. Cached set read on
 
 Env: GLM53_EC=1 (serve.py), GLM53_EC_RESERVE_GB (per GPU, default 2.5), GLM53_EC_ADMIT_MAX (default 64 picks),
      GLM53_EC_WARM (optional JSON {layer_key: [score x E]}: initial fill by score), GLM53_EC_MAX_SLOTS (per GPU cap)
+[E3] Background admission (T-19, see the comment above ec_step_k): GLM53_EC_BG=1 (loader thread + ring), GLM53_EC_BG_ON (1),
+     GLM53_EC_BG_QMAX (2 experts copying at once), GLM53_EC_BG_PER_CALL (1 per layer call), GLM53_EC_BG_GATE (1: the
+     candidate's decayed pick count must beat the victim's), GLM53_EC_BG_DECAY (0.99 per call of the layer),
+     GLM53_EC_BG_RING (1024), GLM53_EC_BG_CPU (-1 = unpinned). Candidates are CPU-lane picks (cpu_tier sets m._ct_orig).
+     GLM53_EC_BG_SKIP_REMOTE (1, E3b): while the 3090 tier is attached, skip the experts it holds (cpu_tier: m._rt_res).
 """
 import json, os, time
 import torch
@@ -30,35 +35,95 @@ _SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <pthread.h>
+#include <sched.h>
+
+// [E3] background admission (T-19). A CPU-lane miss (picked by the router, masked out of `sel` by ft_split) can be
+// admitted OFF the critical path: ec_step takes a CLOCK victim (rows -> home, exactly as a normal admission), marks the
+// slot LOADING (pin = -2: never a victim, never a hit; the key keeps its home rows and slotof -1, so ft_split keeps
+// routing it to the CPU tier / zero-copy) and logs {key, slot, gen} to a mapped host ring. A host thread (BgLoader)
+// copies the expert home -> slot on a low-priority copy stream (copy engine) and then marks landed[slot] = gen. A later
+// ec_step of the same layer commits it (rows -> slot, slotof = slot): the row flip is the only publish, and it happens
+// only after the bytes have landed. Stream order on the one compute stream guarantees no earlier kernel still reads the
+// victim slot when the DMA starts (the host sees the log only after ec_step ran; later kernels read the victim from home).
+// bgp: 0 on, 1 qmax (DMAs in flight), 2 per_call, 3 gate (cand freq must beat the victim's), 4 ring entries,
+//      5 skip (E3b: while the 3090 tier is attached, keys it holds (bgskip) are never candidates and count as freq 0
+//      when they are the victim -- their picks are hidden under the local CPU work, so caching them buys nothing)
+// bgf: 0 freq decay per call of the layer. bgc: 0 admitted (ever), 1 landed (ever; land kernel). hc: 0 head (device), 1 tail (host)
+// stats: 0 hits 1 misses 2 admitted 3 no_victim 4 evictions | 5 bg_admit 6 - 7 bg_commit 8 bg_gate_reject 9 bg_ring_full
+//        10 bg_no_victim 11 bg_qmax 12 bg_abort 13 bg_cands 14 loading_picks
+__device__ __forceinline__ void ec_rows(const int64_t* tabs, int l, int e, int64_t g, int64_t u, int64_t d)
+{
+    int64_t* pg = (int64_t*) tabs[l * 4 + 0]; int64_t* pu = (int64_t*) tabs[l * 4 + 1];
+    int64_t* pd = (int64_t*) tabs[l * 4 + 2]; int64_t* gu = (int64_t*) tabs[l * 4 + 3];
+    pg[e] = g; pu[e] = u; pd[e] = d;
+    if (gu) { gu[2 * e] = g; gu[2 * e + 1] = u; }
+}
 
 __global__ void ec_step_k(const int64_t* __restrict__ sel, int n_picks, int first, int li, int E, int S, int admit,
     int* slotof_all, const int64_t* home_all, const int64_t* tabs, int* owner, int* refb, int* pin, int* ctl,
     int* jobs, int maxj, unsigned long long* stats, const long long* __restrict__ cbase, int spc, long long rec,
-    long long off_u, long long off_d)
+    long long off_u, long long off_d,
+    const int64_t* __restrict__ osel, int bg, int* pend_all, int* lgen, const int* landed, float* freq_all,
+    const int* __restrict__ bgp, const float* __restrict__ bgf, unsigned long long* bgc, int* ring, long long* hc, int* bgctl,
+    const int* __restrict__ bgskip)
 {
-    __shared__ unsigned mask[32];
+    __shared__ unsigned mask[32], omask[32];
     __shared__ int misses[1024];
-    __shared__ int nmiss, nhit, epoch;
+    __shared__ int cand[64];
+    __shared__ float candf[64];
+    __shared__ int nmiss, nhit, epoch, ncand, nload;
     int t = threadIdx.x;
-    if (t < 32) mask[t] = 0;
-    if (t == 0) { nmiss = 0; nhit = 0; epoch = ctl[1] + 1; ctl[1] = epoch; ctl[2] = 0; }
+    if (t < 32) { mask[t] = 0; omask[t] = 0; }
+    if (t == 0) { nmiss = 0; nhit = 0; ncand = 0; nload = 0; epoch = ctl[1] + 1; ctl[1] = epoch; ctl[2] = 0; }
     __syncthreads();
     for (int i = t; i < n_picks; i += blockDim.x) {
         long long e = sel[i] - first;
         if (e >= 0 && e < E) atomicOr(&mask[e >> 5], 1u << (e & 31));
+        if (bg) { long long o = osel[i] - first; if (o >= 0 && o < E) atomicOr(&omask[o >> 5], 1u << (o & 31)); }
     }
     __syncthreads();
     int* slotof = slotof_all + (long long) li * E;
+    int* pend = pend_all + (long long) li * E;
+    if (bg) {   // [E3] commit pass: this layer's landed background loads become resident before the hit pass
+        for (int e = t; e < E; e += blockDim.x) {
+            int s = pend[e];
+            if (s >= 0 && ((volatile const int*) landed)[s] == lgen[s]) {
+                long long a = cbase[s / spc] + (long long) (s % spc) * rec;
+                ec_rows(tabs, li, e, a, a + off_u, a + off_d);
+                slotof[e] = s; pin[s] = 0; refb[s] = 1; pend[e] = -1;
+                atomicAdd(&stats[7], 1ull);
+            }
+        }
+        __syncthreads();
+    }
+    float decay = bg ? bgf[0] : 1.0f;
+    int skip = bg ? bgp[5] : 0;
     for (int e = t; e < E; e += blockDim.x) {
-        if (mask[e >> 5] & (1u << (e & 31))) {
+        bool in = mask[e >> 5] & (1u << (e & 31));
+        if (in) {
             int s = slotof[e];
             if (s >= 0) { refb[s] = 1; pin[s] = epoch; atomicAdd(&nhit, 1); }
+            else if (bg && pend[e] >= 0) atomicAdd(&nload, 1);   // loading: stays zero-copy, never admitted twice
             else { int k = atomicAdd(&nmiss, 1); misses[k] = e; }
+        }
+        if (bg) {   // [E3] decayed pick frequency (all router picks, CPU lane included) + background candidates
+            bool picked = omask[e >> 5] & (1u << (e & 31));
+            float f = freq_all[(long long) li * E + e] * decay + (picked ? 1.0f : 0.0f);
+            freq_all[(long long) li * E + e] = f;
+            if (picked && !in && slotof[e] < 0 && pend[e] < 0 && !(skip && bgskip[(long long) li * E + e])) {
+                int k = atomicAdd(&ncand, 1);
+                if (k < 64) { cand[k] = e; candf[k] = f; }
+            }
         }
     }
     __syncthreads();
     if (t != 0) return;
-    stats[0] += nhit; stats[1] += nmiss;
+    stats[0] += nhit; stats[1] += nmiss + nload; stats[14] += nload; stats[13] += ncand;
     if (!admit || S == 0) return;
     int hand = ctl[0], nj = 0;
     int64_t* pg = (int64_t*) tabs[li * 4 + 0]; int64_t* pu = (int64_t*) tabs[li * 4 + 1];
@@ -90,7 +155,74 @@ __global__ void ec_step_k(const int64_t* __restrict__ sel, int n_picks, int firs
         jobs[2 * nj] = e; jobs[2 * nj + 1] = s; nj++;
         stats[2]++;
     }
+    // [E3] background admission of the warmest CPU-lane misses (never blocks: any limit -> skip, counted)
+    int nc = ncand < 64 ? ncand : 64;
+    if (bg && bgp[0] && nc > 0) {
+        int qmax = bgp[1], per = bgp[2], gate = bgp[3], R = bgp[4], done = 0;
+        long long head = hc[0];
+        while (done < per) {
+            int bi = -1; float bf = -1.0f;
+            for (int k = 0; k < nc; k++) if (cand[k] >= 0 && candf[k] > bf) { bf = candf[k]; bi = k; }
+            if (bi < 0) break;
+            int e = cand[bi]; cand[bi] = -1;
+            if ((long long) (bgc[0] - ((volatile unsigned long long*) bgc)[1]) >= qmax) { stats[11]++; break; }
+            if (head - ((volatile long long*) hc)[1] >= R) { stats[9]++; break; }
+            int found = -1;
+            for (int step = 0; step < 2 * S; step++) {
+                int s = hand; hand = (hand + 1 == S) ? 0 : hand + 1;
+                if (pin[s] == epoch || pin[s] < 0) continue;
+                if (refb[s]) { refb[s] = 0; continue; }
+                found = s; break;
+            }
+            if (found < 0) { stats[10]++; break; }
+            int s = found, old = owner[s];
+            if (gate && old >= 0 && !(skip && bgskip[old]) && freq_all[old] >= bf) { stats[8]++; break; }
+            if (old >= 0) {
+                int ol = old / E, oe = old % E;
+                slotof_all[(long long) ol * E + oe] = -1;
+                const int64_t* h = home_all + ((long long) ol * E + oe) * 3;
+                ec_rows(tabs, ol, oe, h[0], h[1], h[2]);
+                stats[4]++;
+            }
+            int g = ++bgctl[0];
+            owner[s] = li * E + e; pin[s] = -2; refb[s] = 1; lgen[s] = g; pend[e] = s;
+            int* r = ring + (head % R) * 4;
+            r[0] = li * E + e; r[1] = s; r[2] = g; r[3] = 0;
+            head++; done++; bgc[0]++; stats[5]++;
+        }
+        if (done) { __threadfence_system(); ((volatile long long*) hc)[0] = head; }
+    }
     ctl[0] = hand; ctl[2] = nj;
+}
+
+__global__ void ec_land_k(int* landed, int s, int gen, unsigned long long* bgc)
+{
+    // [E3] stream-ordered after the slot's 3 copies on the background stream
+    __threadfence();
+    ((volatile int*) landed)[s] = gen;
+    atomicAdd(&bgc[1], 1ull);
+}
+
+__global__ void ec_bg_commit_k(int L, int E, int* pend_all, const int* lgen, const int* landed, int* slotof_all,
+    const int64_t* tabs, int* owner, int* pin, int* refb, const long long* __restrict__ cbase, int spc, long long rec,
+    long long off_u, long long off_d, unsigned long long* stats)
+{
+    // [E3] quiesce (no copy outstanding): landed loads -> resident, anything else aborted (rows already home)
+    long long g = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (long long) L * E) return;
+    int s = pend_all[g];
+    if (s < 0) return;
+    int l = g / E, e = g % E;
+    if (((volatile const int*) landed)[s] == lgen[s]) {
+        long long a = cbase[s / spc] + (long long) (s % spc) * rec;
+        ec_rows(tabs, l, e, a, a + off_u, a + off_d);
+        slotof_all[g] = s; pin[s] = 0; refb[s] = 1;
+        atomicAdd(&stats[7], 1ull);
+    } else {
+        owner[s] = -1; pin[s] = 0; refb[s] = 0;
+        atomicAdd(&stats[12], 1ull);
+    }
+    pend_all[g] = -1;
 }
 
 __global__ void ec_copy_k(const int* __restrict__ ctl, const int* __restrict__ jobs, int li, int E,
@@ -124,16 +256,128 @@ __global__ void ec_copy_k(const int* __restrict__ ctl, const int* __restrict__ j
 
 void ec_step(at::Tensor sel, int64_t first, int64_t li, int64_t E, int64_t S, int64_t admit, at::Tensor slotof, at::Tensor home,
              at::Tensor tabs, at::Tensor owner, at::Tensor refb, at::Tensor pin, at::Tensor ctl, at::Tensor jobs,
-             at::Tensor stats, int64_t arena, int64_t spc, int64_t rec, int64_t off_u, int64_t off_d)
+             at::Tensor stats, int64_t arena, int64_t spc, int64_t rec, int64_t off_u, int64_t off_d,
+             at::Tensor osel, int64_t bg, at::Tensor pend, at::Tensor lgen, at::Tensor landed, at::Tensor freq,
+             at::Tensor bgp, at::Tensor bgf, at::Tensor bgc, int64_t ring, int64_t hc, at::Tensor bgctl, at::Tensor bgskip)
 {
     c10::cuda::CUDAGuard g(sel.device());
     auto st = at::cuda::getCurrentCUDAStream(sel.device().index());
     TORCH_CHECK(sel.dtype() == at::kLong && sel.is_contiguous(), "sel int64 contiguous");
+    TORCH_CHECK(osel.dtype() == at::kLong && osel.is_contiguous() && osel.numel() == sel.numel(), "osel int64, same picks");
     TORCH_CHECK(E <= 1024, "E <= 1024");
+    TORCH_CHECK(stats.numel() >= 16, "stats >= 16");
     ec_step_k<<<1, 512, 0, st>>>(sel.data_ptr<int64_t>(), (int) sel.numel(), (int) first, (int) li, (int) E, (int) S, (int) admit,
         slotof.data_ptr<int>(), home.data_ptr<int64_t>(), tabs.data_ptr<int64_t>(), owner.data_ptr<int>(),
         refb.data_ptr<int>(), pin.data_ptr<int>(), ctl.data_ptr<int>(), jobs.data_ptr<int>(), (int) (jobs.numel() / 2),
-        (unsigned long long*) stats.data_ptr<int64_t>(), (const long long*) arena, (int) spc, rec, off_u, off_d);
+        (unsigned long long*) stats.data_ptr<int64_t>(), (const long long*) arena, (int) spc, rec, off_u, off_d,
+        osel.data_ptr<int64_t>(), (int) bg, pend.data_ptr<int>(), lgen.data_ptr<int>(), landed.data_ptr<int>(),
+        freq.data_ptr<float>(), bgp.data_ptr<int>(), bgf.data_ptr<float>(), (unsigned long long*) bgc.data_ptr<int64_t>(),
+        (int*) ring, (long long*) hc, bgctl.data_ptr<int>(), bgskip.data_ptr<int>());
+}
+
+void ec_bg_commit(int64_t L, int64_t E, at::Tensor pend, at::Tensor lgen, at::Tensor landed, at::Tensor slotof, at::Tensor tabs,
+                  at::Tensor owner, at::Tensor pin, at::Tensor refb, int64_t arena, int64_t spc, int64_t rec, int64_t off_u,
+                  int64_t off_d, at::Tensor stats)
+{
+    c10::cuda::CUDAGuard g(pend.device());
+    auto st = at::cuda::getCurrentCUDAStream(pend.device().index());
+    long long n = L * E;
+    ec_bg_commit_k<<<(int) ((n + 255) / 256), 256, 0, st>>>((int) L, (int) E, pend.data_ptr<int>(), lgen.data_ptr<int>(),
+        landed.data_ptr<int>(), slotof.data_ptr<int>(), tabs.data_ptr<int64_t>(), owner.data_ptr<int>(), pin.data_ptr<int>(),
+        refb.data_ptr<int>(), (const long long*) arena, (int) spc, rec, off_u, off_d, (unsigned long long*) stats.data_ptr<int64_t>());
+}
+
+// [E3] BgLoader: one host thread per pool. Polls the mapped ring (head written by ec_step), issues each logged expert's
+// 3 copies home -> slot on its own non-blocking lowest-priority stream, then ec_land_k. Only cudaMemcpyAsync + kernel
+// launches: no allocation, no sync, so the GPU's ft_combine spin-wait can never deadlock against it. If it stops,
+// LOADING keys simply never commit: qmax fills and background admission stops (never a wrong row).
+struct BgLoader {
+    int dev = 0, R = 0, E = 0, spc = 0, cpu = -1;
+    long long rec = 0, off_u = 0, off_d = 0, sg = 0, su = 0, sd = 0;
+    volatile int* ring = nullptr; volatile long long* hc = nullptr;
+    const int64_t* home = nullptr; at::Tensor home_keep;
+    std::vector<long long> cbase;
+    int* landed = nullptr; unsigned long long* bgc = nullptr;
+    cudaStream_t st = nullptr;
+    std::atomic<long long> issued{0}, bytes{0}, wakes{0};
+    std::atomic<int> err{0};
+    std::thread th;
+
+    void run() {
+        cudaSetDevice(dev);
+        if (cpu >= 0) { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu, &cs); pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs); }
+        long long tail = hc[1];
+        for (;;) {
+            long long head = hc[0];
+            if (head == tail || err.load()) { std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            wakes++;
+            for (; tail < head; tail++) {
+                volatile int* r = ring + (tail % R) * 4;
+                int key = r[0], s = r[1], gen = r[2];
+                const int64_t* h = home + (long long) key * 3;
+                char* d = (char*) (cbase[s / spc] + (long long) (s % spc) * rec);
+                cudaMemcpyAsync(d, (const void*) h[0], (size_t) sg, cudaMemcpyDefault, st);
+                cudaMemcpyAsync(d + off_u, (const void*) h[1], (size_t) su, cudaMemcpyDefault, st);
+                cudaMemcpyAsync(d + off_d, (const void*) h[2], (size_t) sd, cudaMemcpyDefault, st);
+                ec_land_k<<<1, 1, 0, st>>>(landed, s, gen, bgc);
+                cudaError_t e = cudaGetLastError();
+                if (e != cudaSuccess) { err = (int) e; fprintf(stderr, " !! expert_cache bg: %s (background admission stops)\n", cudaGetErrorString(e)); break; }
+                issued++; bytes += sg + su + sd;
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            hc[1] = tail;
+        }
+    }
+};
+static std::vector<BgLoader*> BG;   // never freed: the detached threads outlive static destruction at exit
+
+int64_t bg_start(int64_t ring, int64_t hc, int64_t R, at::Tensor home_cpu, std::vector<int64_t> cbase, int64_t spc, int64_t rec,
+                 int64_t off_u, int64_t off_d, int64_t sg, int64_t su, int64_t sd, int64_t E, at::Tensor landed, at::Tensor bgc,
+                 int64_t device, int64_t cpu)
+{
+    TORCH_CHECK(home_cpu.device().is_cpu() && home_cpu.dtype() == at::kLong && home_cpu.is_contiguous(), "home_cpu int64 CPU");
+    auto* b = new BgLoader();
+    b->dev = (int) device; b->R = (int) R; b->E = (int) E; b->spc = (int) spc; b->cpu = (int) cpu;
+    b->rec = rec; b->off_u = off_u; b->off_d = off_d; b->sg = sg; b->su = su; b->sd = sd;
+    b->ring = (volatile int*) ring; b->hc = (volatile long long*) hc;
+    b->home_keep = home_cpu; b->home = home_cpu.data_ptr<int64_t>();
+    b->cbase.assign(cbase.begin(), cbase.end());
+    b->landed = landed.data_ptr<int>(); b->bgc = (unsigned long long*) bgc.data_ptr<int64_t>();
+    c10::cuda::CUDAGuard g((c10::DeviceIndex) device);
+    int lo = 0, hi = 0;
+    cudaDeviceGetStreamPriorityRange(&lo, &hi);
+    TORCH_CHECK(cudaStreamCreateWithPriority(&b->st, cudaStreamNonBlocking, lo) == cudaSuccess, "bg stream");
+    b->th = std::thread([b] { b->run(); });
+    b->th.detach();
+    BG.push_back(b);
+    return (int64_t) BG.size() - 1;
+}
+
+bool bg_drain(int64_t h, int64_t timeout_ms)
+{
+    // caller has synchronized the compute stream (every ec_step that could log has run); wait until the thread has
+    // issued everything logged, then for the background stream
+    auto* b = BG.at(h);
+    auto t0 = std::chrono::steady_clock::now();
+    while (b->hc[1] != b->hc[0]) {
+        if (b->err.load() || std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(timeout_ms)) return false;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return cudaStreamSynchronize(b->st) == cudaSuccess;
+}
+
+void bg_set_cbase(int64_t h, std::vector<int64_t> cbase)
+{
+    // only while drained and paused (elastic exit re-points flex chunks)
+    auto* b = BG.at(h);
+    b->cbase.assign(cbase.begin(), cbase.end());
+}
+
+std::vector<int64_t> bg_stats(int64_t h)
+{
+    auto* b = BG.at(h);
+    return {b->issued.load(), b->bytes.load(), b->wakes.load(), (int64_t) b->err.load(), b->hc[0], b->hc[1]};
 }
 
 void ec_copy(at::Tensor ctl, at::Tensor jobs, int64_t li, int64_t E, at::Tensor home, int64_t arena, int64_t spc, int64_t rec,
@@ -246,6 +490,11 @@ void memcpy_runs(at::Tensor runs, int64_t stream, int64_t device)
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("ec_bg_commit", &ec_bg_commit);
+    m.def("bg_start", &bg_start);
+    m.def("bg_drain", &bg_drain);
+    m.def("bg_set_cbase", &bg_set_cbase);
+    m.def("bg_stats", &bg_stats);
     m.def("ec_step", &ec_step);
     m.def("ec_copy", &ec_copy);
     m.def("memcpy_runs", &memcpy_runs);
@@ -347,7 +596,7 @@ class Pool:
         self.pin = torch.zeros((max(S, 1),), **i32)
         self.ctl = torch.zeros((4,), **i32)
         self.jobs = torch.zeros((2 * 1024,), **i32)
-        self.stats = torch.zeros((8,), dtype=torch.int64, device=device)
+        self.stats = torch.zeros((16,), dtype=torch.int64, device=device)
         home, tabs = [], []
         self.keep = []
         for m in mods:
@@ -383,6 +632,96 @@ class Pool:
             self.stage_stats = {"forwards": 0, "layers": 0, "experts": 0, "overflow": 0}
         for li, m in enumerate(mods):
             m._ec = (self, li)
+        self._bg_init()
+
+    # ---- [E3] background admission (T-19) --------------------------------------------------------------------
+    def _bg_init(self):
+        """Device state is always allocated (small) so ec_step has one signature; the loader thread only with GLM53_EC_BG=1."""
+        L, E, dev = len(self.mods), self.E, self.device
+        i32 = dict(dtype=torch.int32, device=dev)
+        self.pend = torch.full((L, E), -1, **i32)
+        self.lgen = torch.zeros((max(self.S, 1),), **i32)
+        self.landed = torch.zeros((max(self.S, 1),), **i32)
+        self.freq = torch.zeros((L, E), dtype=torch.float32, device=dev)
+        self.bgctl = torch.zeros((4,), **i32)
+        self.bgc = torch.zeros((4,), dtype=torch.int64, device=dev)
+        self.bgp = torch.zeros((8,), **i32)
+        self.bgf = torch.ones((2,), dtype=torch.float32, device=dev)
+        self.bgskip = torch.zeros((L, E), **i32)        # E3b: 1 = held by the remote 3090 tier (cpu_tier sets m._rt_res)
+        self.rt_attached = False; self.bg_dirty = False
+        self.bg = None
+        self.bg_paused = False
+        self.bg_state = {"pauses": 0, "drain_fail": 0, "broken": False}
+        self.ring_ptr = self.hc_ptr = 0
+        if os.environ.get("GLM53_EC_BG") != "1" or self.S == 0:
+            return
+        self.bg_R = int(os.environ.get("GLM53_EC_BG_RING", "1024"))
+        self.ring = torch.zeros((self.bg_R * 4,), dtype=torch.int32).pin_memory()
+        self.hc = torch.zeros((4,), dtype=torch.int64).pin_memory()
+        self.ring_ptr, self.hc_ptr = self.ring.data_ptr(), self.hc.data_ptr()
+        self.bg_cfg = {"on": int(os.environ.get("GLM53_EC_BG_ON", "1")), "qmax": int(os.environ.get("GLM53_EC_BG_QMAX", "2")),
+                       "per_call": int(os.environ.get("GLM53_EC_BG_PER_CALL", "1")), "gate": int(os.environ.get("GLM53_EC_BG_GATE", "1")),
+                       "decay": float(os.environ.get("GLM53_EC_BG_DECAY", "0.99")),
+                       "skip_remote": int(os.environ.get("GLM53_EC_BG_SKIP_REMOTE", "1"))}
+        self._bg_write(0)                                   # off until attach_modules has warmed the cache
+        self.bg = _ext().bg_start(self.ring_ptr, self.hc_ptr, self.bg_R, self.home_cpu.contiguous(), self._cbase_list(),
+                                  self.spc, self.rec, self.off_u, self.off_d, self.sg, self.su, self.sd, self.E, self.landed,
+                                  self.bgc, self.device.index, int(os.environ.get("GLM53_EC_BG_CPU", "-1")))
+
+    def _cbase_list(self):
+        return [t.data_ptr() if t is not None else 0 for t in self.chunks] or [0]
+
+    def _bg_write(self, on):
+        c = self.bg_cfg
+        skip = int(bool(c["skip_remote"]) and self.rt_attached)
+        self.bgp.copy_(torch.tensor([on, c["qmax"], c["per_call"], c["gate"], self.bg_R, skip, 0, 0], dtype=torch.int32))
+        self.bgf.copy_(torch.tensor([c["decay"], 0.0], dtype=torch.float32))
+
+    def bg_set(self, **kw):
+        if self.bg is None:
+            return None
+        for k, v in kw.items():
+            if v is not None:
+                self.bg_cfg[k] = type(self.bg_cfg[k])(v)
+        if not self.bg_paused:
+            self._bg_write(self.bg_cfg["on"])
+        return dict(self.bg_cfg)
+
+    def set_rt(self, attached=None):
+        """E3b: rebuild the remote-residency mask from the modules (main thread) and/or note the attach state (any
+        thread: the device write happens in the next step() on the main thread)."""
+        if attached is None:
+            for li, m in enumerate(self.mods):
+                r = getattr(m, "_rt_res", None)
+                if r is not None:
+                    self.bgskip[li].copy_(r.to(torch.int32))
+        elif bool(attached) != self.rt_attached:
+            self.rt_attached = bool(attached); self.bg_dirty = True
+
+    def _bg_pause(self):
+        """Quiesce: no new admissions, every logged copy issued and finished, landed -> resident, rest aborted. After it
+        no slot is LOADING, so elastic eviction, staging snapshots and ec_verify see a plain cache."""
+        if self.bg is None or self.bg_paused:
+            return not self.bg_state["broken"]
+        self._bg_write(0)                                   # stream-ordered: later ec_steps admit nothing
+        torch.cuda.synchronize(self.device)                 # every ec_step that could have logged has run
+        self.bg_paused = True
+        if not _ext().bg_drain(self.bg, 5000):
+            self.bg_state["drain_fail"] += 1; self.bg_state["broken"] = True
+            print(" !! expert_cache bg: drain failed -- background admission stays off (LOADING slots stay pinned)", flush=True)
+            return False
+        _ext().ec_bg_commit(len(self.mods), self.E, self.pend, self.lgen, self.landed, self.slotof, self.tabs, self.owner,
+                            self.pin, self.refb, self.cbase.data_ptr(), self.spc, self.rec, self.off_u, self.off_d, self.stats)
+        torch.cuda.synchronize(self.device)
+        self.bg_state["pauses"] += 1
+        return True
+
+    def _bg_resume(self):
+        if self.bg is None or not self.bg_paused or self.bg_state["broken"]:
+            return
+        _ext().bg_set_cbase(self.bg, self._cbase_list())
+        self._bg_write(self.bg_cfg["on"])
+        self.bg_paused = False
 
     # ---- prefill staging -------------------------------------------------------------------------------------
     def _restore(self, li):
@@ -432,8 +771,11 @@ class Pool:
             if self.in_prefill:
                 self._elastic_exit()
             return
+        if self.elastic and self.bg_state["broken"]:
+            return                                      # [bdw-opt] reclaim was skipped: no staging buffers, prefill reads zero-copy
         cur = torch.cuda.current_stream(self.device)
         if self.last_li is None or li <= self.last_li:  # new forward pass on this device
+            self._bg_pause()                            # [E3] before the slotof snapshot / elastic eviction
             if self.timing:
                 self._timing_collect()
             if self.elastic and not self.in_prefill:
@@ -464,6 +806,10 @@ class Pool:
     def _elastic_enter(self):
         """Prefill: evict + disable the flex chunks' slots, hand their memory back to torch (activations of big
         chunks), allocate the staging buffers from it."""
+        if not self._bg_pause():                        # [E3] no copy may land in a chunk handed back to torch
+            # [bdw-opt] a copy may still be in flight into a flex chunk: never hand it back (prefill runs without it)
+            print(" !! expert_cache: background copies not drained -- elastic reclaim skipped", flush=True)
+            return
         e = _ext()
         for c in self.flex:
             e.ec_evict(c * self.spc, (c + 1) * self.spc, 1, self.E, self.owner, self.slotof, self.home, self.tabs,
@@ -515,12 +861,27 @@ class Pool:
         self.size_hist[b] = self.size_hist.get(b, 0) + 1
         if self.stage_n:
             self._stage_hook(li, sel.numel())
+        if admit and self.bg_paused:
+            self._bg_resume()
+        elif self.bg_dirty and not self.bg_paused and self.bg is not None:
+            self.bg_dirty = False
+            self._bg_write(self.bg_cfg["on"])
         e = _ext()
         sel = sel.reshape(-1)
         if sel.dtype != torch.long or not sel.is_contiguous():
             sel = sel.long().contiguous()
+        osel = sel
+        if self.bg is not None:                         # [E3] the router's picks before ft_split masked the CPU lane
+            m = self.mods[li]
+            o = getattr(m, "_ct_orig", None)
+            if o is not None and getattr(m, "_ct_pending", False) and o.numel() == sel.numel():
+                osel = o.reshape(-1)
+                if osel.dtype != torch.long or not osel.is_contiguous():
+                    osel = osel.long().contiguous()
         e.ec_step(sel, self.first, li, self.E, self.S, int(admit), self.slotof, self.home, self.tabs, self.owner, self.refb, self.pin,
-                  self.ctl, self.jobs, self.stats, self.cbase.data_ptr(), self.spc, self.rec, self.off_u, self.off_d)
+                  self.ctl, self.jobs, self.stats, self.cbase.data_ptr(), self.spc, self.rec, self.off_u, self.off_d,
+                  osel, int(self.bg is not None), self.pend, self.lgen, self.landed, self.freq, self.bgp, self.bgf, self.bgc,
+                  self.ring_ptr, self.hc_ptr, self.bgctl, self.bgskip)
         if admit:
             e.ec_copy(self.ctl, self.jobs, li, self.E, self.home, self.cbase.data_ptr(), self.spc, self.rec, self.sg, self.su,
                       self.sd, self.off_u, self.off_d, self.grid)
@@ -548,10 +909,19 @@ class Pool:
 
     def verify(self):
         """Full consistency check (reads every owned slot and its home copy over PCIe): bytes and pointer tables."""
+        was = self.bg is not None and not self.bg_paused
+        self._bg_pause()                                # [E3] commit/abort every background load: the check is exact
         torch.cuda.synchronize(self.device)
         o = _ext().ec_verify(self.owner, self.slotof, self.home, self.tabs, self.cbase.data_ptr(), self.spc, self.rec, self.sg,
                              self.su, self.sd, self.off_u, self.off_d, self.S, self.E, len(self.mods)).tolist()
-        return {"device": str(self.device), "bad_slots": o[0], "bad_tables": o[1], "owned": o[2]}
+        r = {"device": str(self.device), "bad_slots": o[0], "bad_tables": o[1], "owned": o[2]}
+        if self.bg is not None:
+            own = self.owner[self.owner >= 0]
+            r.update(loading=int((self.pin == -2).sum()), pending=int((self.pend >= 0).sum()),
+                     dup_owner=int(own.numel() - torch.unique(own).numel()))
+            if was:
+                self._bg_resume()
+        return r
 
     def summary(self):
         s = self.stats.tolist()
@@ -563,8 +933,18 @@ class Pool:
                 "no_victim": s[3], "evictions": s[4],
                 "hit_rate": round(s[0] / max(1, s[0] + s[1]), 4),
                 "stage": dict(self.stage_stats, per_buffer=self.stage_n) if self.stage_n else None,
+                "bg": self._bg_summary(s),
                 "picks_hist": dict(sorted(self.size_hist.items())),
                 "stage_timing_last_forward": getattr(self, "last_timing", None)}
+
+
+    def _bg_summary(self, s):
+        if self.bg is None:
+            return None
+        c = self.bgc.tolist(); h = _ext().bg_stats(self.bg)
+        return dict(self.bg_cfg, paused=self.bg_paused, rt_attached=self.rt_attached, skip_keys=int(self.bgskip.sum()), **self.bg_state, admitted=s[5], committed=s[7], gate_reject=s[8],
+                    ring_full=s[9], no_victim=s[10], qmax_block=s[11], aborted=s[12], candidates=s[13], loading_picks=s[14],
+                    in_flight=c[0] - c[1], landed=c[1], issued=h[0], gb=round(h[1] / 1e9, 2), wakes=h[2], err=h[3])
 
 
 def find_moe(modules):
@@ -625,6 +1005,9 @@ def attach_modules(mods):
         POOLS.append(p)
         if scores:
             p.warm(scores)
+        if p.bg is not None:                            # [E3] background admission on after the warm fill
+            p.freq.zero_()
+            p._bg_write(p.bg_cfg["on"])
         for m in ms:
             orig = m.routing_fn
 
@@ -648,3 +1031,14 @@ def summary():
 
 def verify():
     return [p.verify() for p in POOLS]
+
+
+def bg_set(**kw):
+    """[E3] runtime knobs: on, qmax, per_call, gate, decay, skip_remote (None = unchanged)."""
+    return [p.bg_set(**kw) for p in POOLS]
+
+
+def set_rt(attached=None):
+    """[E3b] cpu_tier: attached=None after setting m._rt_res (rebuild the mask), True/False on attach/detach."""
+    for p in POOLS:
+        p.set_rt(attached)

@@ -9,6 +9,8 @@ Offload stack (each piece is a monkeypatch around stock exllamav3, enabled by en
   k_hcfuse.py      GLM53_K_HCFUSE=1     fused hyper-connection decode sites (bit-exact)
   k_ftsplit.py     GLM53_K_FTSPLIT=1    faster CPU-tier split kernel (bit-identical)
   k_overlap.py     GLM53_K_OVL=1        shared expert on a side stream in decode (not bitwise: ~2e-3 rel per layer)
+  k_lookahead.py   GLM53_LA=1           C1 decode lookahead: next step enqueued on the device token (bit-exact)
+                                        [ported from upstream glm-flash-lite 1f6d74e]
 
 Endpoints
   GET  /health, /v1/models, /server_info, /stats
@@ -62,6 +64,9 @@ def load():
 
     t_load = time.time()
     model, config, cache, tok, draft_model, _draft_config, draft_cache = model_init.init(args)
+    if os.environ.get("GLM53_LA") == "1":   # N136: embedding table host-mapped (device-side lookup for lookahead)
+        import k_lookahead
+        k_lookahead.prep_model(model)
     if os.environ.get("GLM53_ZC_VRAM"):
         print(f" -- zero-copy tier summary: {exl3_tiers.summary()}", flush=True)
     if os.environ.get("GLM53_CPU_TIER") == "1":   # routers wrapped BEFORE the cache attaches
@@ -79,6 +84,9 @@ def load():
     if os.environ.get("GLM53_K_HCFUSE") == "1":   # fused hyper-connection sites, bit-exact (k_hcfuse.py)
         import k_hcfuse
         k_hcfuse.install(model)
+    if os.environ.get("GLM53_LA") == "1":   # N136: decode lookahead (next forward enqueued before the token is read)
+        k_lookahead.install(model)
+        k_lookahead.set_enabled(os.environ.get("GLM53_LA_ON", "1") == "1")
     t_load = time.time() - t_load
     print(f" -- loaded in {t_load:.1f} s", flush=True)
 
@@ -485,7 +493,89 @@ async def stats():
     if os.environ.get("GLM53_K_HCFUSE") == "1":
         import k_hcfuse
         st["k_hcfuse"] = dict(k_hcfuse.STATS)
+    if os.environ.get("GLM53_LA") == "1":
+        import k_lookahead
+        st["k_lookahead"] = k_lookahead.summary()
     return JSONResponse(st)
+
+
+@app.get("/ct_policy")
+async def ct_policy(b: float | None = None, tzc: float | None = None, a: float | None = None, maxn: float | None = None,
+                    rt: int | None = None, check: int | None = None, b_rt: float | None = None, auto_b: int | None = None,
+                    e4: int | None = None, ra: float | None = None, rb: float | None = None, fuse: int | None = None,
+                    fuse_maxn: int | None = None, pf_lean: int | None = None, lut: str | None = None,
+                    ovl_after: int | None = None):
+    """[rt] T-18: runtime CPU-tier split knobs + remote tier on/off + numerics-check period (cpu_tier.set_policy)."""
+    import cpu_tier
+    return JSONResponse(cpu_tier.set_policy(b=b, tzc=tzc, a=a, maxn=maxn, rt=None if rt is None else bool(rt), check=check,
+                                            b_rt=b_rt, auto_b=None if auto_b is None else bool(auto_b),
+                                            e4=None if e4 is None else bool(e4), ra=ra, rb=rb, fuse=fuse,
+                                            fuse_maxn=fuse_maxn, pf_lean=pf_lean, lut=lut, ovl_after=ovl_after))
+
+
+@app.get("/ec_bg")
+async def ec_bg(on: int | None = None, qmax: int | None = None, per_call: int | None = None, gate: int | None = None,
+                decay: float | None = None, skip_remote: int | None = None):
+    """[E3] T-19: runtime knobs of the expert cache's background admission (runs between generator iterations)."""
+    import expert_cache
+    return JSONResponse({"bg": expert_cache.bg_set(on=on, qmax=qmax, per_call=per_call, gate=gate, decay=decay,
+                                                   skip_remote=skip_remote),
+                         "stats": [p["bg"] for p in expert_cache.summary()]})
+
+
+@app.get("/ec_verify")
+async def ec_verify():
+    """[E3] exact cache consistency check (pauses background admission, commits landed loads, compares every owned
+    slot's bytes with its home copy and every pointer-table row with slotof). Reads the whole cache over PCIe (~1 s)."""
+    import expert_cache
+    t0 = time.time()
+    r = expert_cache.verify()
+    return JSONResponse({"verify": r, "seconds": round(time.time() - t0, 2)})
+
+
+@app.get("/ct_trace")
+async def ct_trace(path: str | None = None):
+    """[E5 prep] start (path=...) or stop (no path) the decode routing trace: rows [layer, 8 picks, 8 post-split
+    (-1 = CPU lane), 8 local-cache hit flags] — read by make_plan.py and the E5 reuse analysis."""
+    import cpu_tier
+    return JSONResponse(cpu_tier.set_trace(path))
+
+
+@app.get("/prof")
+async def prof(seconds: float = 4.0, tag: str = "prof"):
+    """[E7] torch.profiler (CUDA kernels on every stream + CPU ops) over the next `seconds` of serving — run it while
+    a decode load is going. Writes $GLM53_PROF_DIR (default ./traces)/<tag>.json (chrome trace) + <tag>.txt (top
+    kernels by GPU time); ops/prof-timeline.py splits the trace into per-token buckets."""
+    import asyncio
+    from torch.profiler import profile, ProfilerActivity
+    d = os.environ.get("GLM53_PROF_DIR", "traces")
+    os.makedirs(d, exist_ok=True)
+    import cpu_tier
+    calls0 = cpu_tier.summary()["calls"]
+    p = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+    p.__enter__()
+    t0 = time.time()
+    try:
+        await asyncio.sleep(seconds)
+    finally:
+        p.__exit__(None, None, None)
+    dt = time.time() - t0
+    calls = cpu_tier.summary()["calls"] - calls0
+    p.export_chrome_trace(os.path.join(d, tag + ".json"))
+    table = p.key_averages().table(sort_by="cuda_time_total", row_limit=60)
+    with open(os.path.join(d, tag + ".txt"), "w") as f:
+        f.write(f"window {dt:.2f} s, CPU-tier calls {calls} (~{calls / 42:.0f} decode tokens)\n{table}\n")
+    return JSONResponse({"seconds": round(dt, 2), "tokens_approx": round(calls / 42), "trace": os.path.join(d, tag + ".json")})
+
+
+@app.get("/la")
+async def la(on: int = 1):
+    """N136: runtime lookahead switch for same-server A/B (takes effect at the next decode step). [bdw-opt] Refused while
+    a job is running: switching off mid-sequence discards a pending lookahead forward and can advance KDA state twice."""
+    import k_lookahead
+    if len(G["gen"].jobs):
+        return JSONResponse({"error": "busy: toggle /la only while no job is running", "enabled": k_lookahead.summary().get("enabled")}, status_code=409)
+    return JSONResponse({"enabled": k_lookahead.set_enabled(bool(on)), "stats": k_lookahead.summary()})
 
 
 @app.get("/health")

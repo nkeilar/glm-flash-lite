@@ -121,6 +121,15 @@ inline void permute_rows(const float* xt16, float* xp32)   // one tile row: 16 i
 }
 
 inline float silu(float g) { return g / (1.0f + std::exp(-g)); }
+// [rt T-27] SwiGLU limit, exllamav3 act_mul semantics (activation_kernels.cuh): up clamped to [-L, L], activated gate
+// capped at L. 0 = off (the default; identical arithmetic to before). Set once at startup (tier_set_act_limit).
+float ACT_LIMIT = 0.0f;
+inline float act_mul(float g, float u)
+{
+    float x = silu(g);
+    if (ACT_LIMIT != 0.0f) { u = std::fmin(std::fmax(u, -ACT_LIMIT), ACT_LIMIT); x = std::fmin(x, ACT_LIMIT); }
+    return x * u;
+}
 
 // ------------------------------------------------------------------------------------------
 // Fast AVX2 kernel
@@ -129,18 +138,35 @@ inline float silu(float g) { return g / (1.0f + std::exp(-g)); }
 alignas(32) uint8_t CTRL[32][32];
 int WOFF[32];
 alignas(32) int32_t SHV[8];
+// [bdw-opt bdw] compile-time Broadwell decode options (default off = stock). Enable via GLM53_CT_CFLAGS, e.g.
+//   "-mavx2 -mfma -mf16c -mtune=znver3 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1" + a separate GLM53_CT_BUILD.
+// Both are integer-exact rewrites of decode8p (the I16 decode path; decode8 / AFFINE / EXACT untouched), proposed by
+// a Codex GPT-6.1-sol review (2026-10-03, exhaustively checked over all 65,536 states x 8 shifts) to cut Broadwell
+// port-0 pressure (stock: 6 p0 uops / 8 weights): FLOAT_EXTRACT replaces vpsrlvd (2xp0+p5) with mask -> cvtdq2ps ->
+// mulps 2^-sh -> cvttps2dq (exact: the masked window has <= 16 significant bits; sh=16 goes negative and the final
+// & 0xffff restores it); BSUM_SHUF replaces vpmaddubsw(prod, 1) (p0) with (prod & 0x00ff00ff) + pshufb(prod,[1,z,3,z])
+// (byte pair sums <= 510, no saturation in either form).
+#ifndef FT_OPT_BSUM_SHUF
+#define FT_OPT_BSUM_SHUF 0
+#endif
+#ifndef FT_OPT_FLOAT_EXTRACT
+#define FT_OPT_FLOAT_EXTRACT 0
+#endif
+alignas(32) int32_t XMASK[8];   // [bdw-opt bdw] 0xffff << SHV[j]
+alignas(32) float XSCL[8];      // [bdw-opt bdw] 2^-SHV[j]
 
 inline int mem_of_stream(int q) { q = ((q % 96) + 96) % 96; return 4 * (q / 4) + 3 - q % 4; }
 
 void init_tables()
 {
     for (int j = 0; j < 8; ++j) SHV[j] = 16 - (3 + 3 * j) % 8;
+    for (int j = 0; j < 8; ++j) { XMASK[j] = int32_t(uint32_t(0xffffu) << SHV[j]); XSCL[j] = std::ldexp(1.0f, -SHV[j]); }
     for (int g = 0; g < 32; ++g)
     {
         const int q0 = 3 * g - 2;
         int win[16];                 // window byte -> mem byte
         if (g == 0) { for (int b = 0; b < 4; ++b) win[b] = 92 + b; for (int b = 4; b < 16; ++b) win[b] = b - 4; WOFF[g] = -1; }
-        else { const int L = 4 * (q0 / 4); for (int b = 0; b < 16; ++b) win[b] = L + b; WOFF[g] = L; }
+        else { const int L = std::min(4 * (q0 / 4), 80); /* [upstream 8a3d790] window clamp: never read past the 96-byte tile */ for (int b = 0; b < 16; ++b) win[b] = L + b; WOFF[g] = L; }
         auto wpos = [&](int q) -> int {
             if (q >= 96) return -1;  // only ever the unused third byte of g=31 lane 7
             const int m = mem_of_stream(q);
@@ -164,13 +190,18 @@ struct Consts
 {
     __m256i m16, mul, one8, one16, sh, expm, magic;
     __m256 kinv, caff;
+    __m256i m00ff, bsctrl, xmask; __m256 xscale;   // [bdw-opt bdw] (after kinv/caff: matches consts() init order)
 };
 
 inline Consts consts()
 {
     return { _mm256_set1_epi32(0xffff), _mm256_set1_epi32(int(MUL1)), _mm256_set1_epi8(1), _mm256_set1_epi16(1),
              _mm256_load_si256(reinterpret_cast<const __m256i*>(SHV)), _mm256_set1_epi32(0x7F800000), _mm256_set1_epi32(0x06C00000),
-             _mm256_set1_ps(KINV), _mm256_set1_ps(CAFF) };
+             _mm256_set1_ps(KINV), _mm256_set1_ps(CAFF),
+             _mm256_set1_epi32(0x00FF00FF),
+             _mm256_setr_epi8(1, -128, 3, -128, 5, -128, 7, -128, 9, -128, 11, -128, 13, -128, 15, -128,
+                              1, -128, 3, -128, 5, -128, 7, -128, 9, -128, 11, -128, 13, -128, 15, -128),
+             _mm256_load_si256(reinterpret_cast<const __m256i*>(XMASK)), _mm256_load_ps(XSCL) };
 }
 
 template <int g>
@@ -185,7 +216,7 @@ __attribute__((always_inline)) inline __m256 decode8(const uint8_t* tile, const 
     }
     else
     {
-        constexpr int L = 4 * ((3 * g - 2) / 4);
+        constexpr int L = 4 * ((3 * g - 2) / 4) < 80 ? 4 * ((3 * g - 2) / 4) : 80;   // [upstream 8a3d790] window clamp: groups 29-31 would read 4-8 B past the 96-B tile
         win = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(tile + L)));
     }
     const __m256i st = _mm256_and_si256(_mm256_srlv_epi32(
@@ -206,12 +237,22 @@ __attribute__((always_inline)) inline __m256i decode8p(const uint8_t* tile, cons
     }
     else
     {
-        constexpr int L = 4 * ((3 * g - 2) / 4);
+        constexpr int L = 4 * ((3 * g - 2) / 4) < 80 ? 4 * ((3 * g - 2) / 4) : 80;   // [upstream 8a3d790] window clamp: groups 29-31 would read 4-8 B past the 96-B tile
         win = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(tile + L)));
     }
+#if FT_OPT_FLOAT_EXTRACT
+    const __m256i wm = _mm256_and_si256(_mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[g]))), K.xmask);
+    const __m256i st = _mm256_and_si256(_mm256_cvttps_epi32(_mm256_mul_ps(_mm256_cvtepi32_ps(wm), K.xscale)), K.m16);
+#else
     const __m256i st = _mm256_and_si256(_mm256_srlv_epi32(
         _mm256_shuffle_epi8(win, _mm256_load_si256(reinterpret_cast<const __m256i*>(CTRL[g]))), K.sh), K.m16);
+#endif
+#if FT_OPT_BSUM_SHUF
+    const __m256i pr = _mm256_mullo_epi32(st, K.mul);
+    return _mm256_add_epi16(_mm256_and_si256(pr, K.m00ff), _mm256_shuffle_epi8(pr, K.bsctrl));
+#else
     return _mm256_maddubs_epi16(_mm256_mullo_epi32(st, K.mul), K.one8);
+#endif
 }
 
 // acc layout per tile: [c 8][m][8 lanes]; X per token: [q 4][8] for this tile row
@@ -252,12 +293,16 @@ __attribute__((always_inline)) inline void tile_accum(const uint8_t* tile, const
 struct Mat { const uint8_t* tr; const uint16_t* suh; const uint16_t* svh; int k, n; int swz = 0; };
 
 int PF_DIST = 6;
+inline std::atomic<int>& pf_lean() { static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_PF_LEAN"); return e ? std::atoi(e) : 0; }()); return v; }
 
 // One 128-output block (8 tiles) of `mat` for M tokens. xp[i]: permuted activations of token i
 // ([k/16][32]); sumx[i]: sum of token i's transformed activations (AFFINE fixup). out[i*128 + ..]
-template <int M, bool EXACT>
+template <int M, bool EXACT, int T0 = 0, int T1 = 8>
 void gemv_block(const Mat& mat, int blk, const float* const* xp, const float* sumx, float* out)
 {
+    // [bdw-opt split2] tiles [T0, T1) of the 128-col block only (columns are independent: identical per-column
+    // results). COMPILE-TIME bounds: the default <0,8> instantiation compiles like upstream's constant-8 loops
+    constexpr int t0 = T0, t1 = T1;
     alignas(64) float acc[8][8 * M * 8];
     std::memset(acc, 0, sizeof(acc));
     const Consts K = consts();
@@ -272,10 +317,10 @@ void gemv_block(const Mat& mat, int blk, const float* const* xp, const float* su
         for (int l = 0; l < 12; ++l) _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
         for (int i = 0; i < M; ++i) X[i] = xp[i] + size_t(tk) * 32;
         #pragma GCC unroll 1
-        for (int t = 0; t < 8; ++t) tile_accum<M, EXACT>(p + t * TILE_BYTES, X, acc[t], K);
+        for (int t = t0; t < t1; ++t) tile_accum<M, EXACT>(p + t * TILE_BYTES, X, acc[t], K);
     }
     for (int i = 0; i < M; ++i)
-        for (int t = 0; t < 8; ++t)
+        for (int t = t0; t < t1; ++t)
             for (int c = 0; c < 8; ++c)
             {
                 const float* v = acc[t] + (c * M + i) * 8;
@@ -286,20 +331,29 @@ void gemv_block(const Mat& mat, int blk, const float* const* xp, const float* su
             }
 }
 
-template <bool EXACT>
-void gemv_block_m(int m, const Mat& mat, int blk, const float* const* xp, const float* sumx, float* out)
+template <bool EXACT, int T0, int T1>
+void gemv_block_m_r(int m, const Mat& mat, int blk, const float* const* xp, const float* sumx, float* out)
 {
     switch (m)
     {
-        case 1: gemv_block<1, EXACT>(mat, blk, xp, sumx, out); break;
-        case 2: gemv_block<2, EXACT>(mat, blk, xp, sumx, out); break;
-        case 3: gemv_block<3, EXACT>(mat, blk, xp, sumx, out); break;
-        case 4: gemv_block<4, EXACT>(mat, blk, xp, sumx, out); break;
-        case 5: gemv_block<5, EXACT>(mat, blk, xp, sumx, out); break;
-        case 6: gemv_block<6, EXACT>(mat, blk, xp, sumx, out); break;
-        case 7: gemv_block<7, EXACT>(mat, blk, xp, sumx, out); break;
-        default: gemv_block<8, EXACT>(mat, blk, xp, sumx, out); break;
+        case 1: gemv_block<1, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        case 2: gemv_block<2, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        case 3: gemv_block<3, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        case 4: gemv_block<4, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        case 5: gemv_block<5, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        case 6: gemv_block<6, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        case 7: gemv_block<7, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
+        default: gemv_block<8, EXACT, T0, T1>(mat, blk, xp, sumx, out); break;
     }
+}
+
+// [bdw-opt split2] (t0, t1) in {(0,8) full, (0,4), (4,8)} -> compile-time instantiations
+template <bool EXACT>
+void gemv_block_m(int m, const Mat& mat, int blk, const float* const* xp, const float* sumx, float* out, int t0 = 0, int t1 = 8)
+{
+    if (t0 == 0 && t1 == 8) gemv_block_m_r<EXACT, 0, 8>(m, mat, blk, xp, sumx, out);
+    else if (t0 == 0) gemv_block_m_r<EXACT, 0, 4>(m, mat, blk, xp, sumx, out);
+    else gemv_block_m_r<EXACT, 4, 8>(m, mat, blk, xp, sumx, out);
 }
 
 // I16 mode: activations as int16 (one scale per 128-row block, |x| <= 16383 so an i32 block sum of
@@ -328,9 +382,11 @@ __attribute__((always_inline)) inline void tile_accum_i16(const uint8_t* tile, c
     }
 }
 
-template <int M>
+template <int M, int T0 = 0, int T1 = 8>
 void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out)
 {
+    // [bdw-opt split2] tiles [T0, T1) only (per-column independent); COMPILE-TIME bounds (default <0,8> = upstream)
+    constexpr int t0 = T0, t1 = T1;
     alignas(64) int32_t acc[8][8 * M * 8];
     alignas(64) float accf[8][8 * M * 8];
     std::memset(acc, 0, sizeof(acc));
@@ -340,17 +396,21 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
     const size_t row_stride = mat.swz ? size_t(8) * TILE_BYTES : size_t(tiles_n) * TILE_BYTES;
     const uint8_t* p = mat.swz ? mat.tr + size_t(blk) * tiles_k * 8 * TILE_BYTES : mat.tr + size_t(blk) * 8 * TILE_BYTES;
     const int32_t* X[M];
+    // [E6 pf] GLM53_CT_PF_LEAN=1: prefetch only the cache lines of tiles [t0, t1) (a half block otherwise prefetches the
+    // other half too; a full block prefetches the whole 768-B band row either way). A hint only: no effect on results.
+    const bool lean = pf_lean().load(std::memory_order_relaxed);
+    const int pl0 = lean ? (t0 * TILE_BYTES) / 64 : 0, pl1 = lean ? (t1 * TILE_BYTES + 63) / 64 : 12;
     for (int tk = 0; tk < tiles_k; ++tk, p += row_stride)
     {
         const uint8_t* pf = p + PF_DIST * row_stride;
         #pragma GCC unroll 12
-        for (int l = 0; l < 12; ++l) _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
+        for (int l = pl0; l < pl1; ++l) _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
         for (int i = 0; i < M; ++i) X[i] = xq[i] + size_t(tk) * 32;
         #pragma GCC unroll 1
-        for (int t = 0; t < 8; ++t) tile_accum_i16<M>(p + t * TILE_BYTES, X, acc[t], K);
+        for (int t = t0; t < t1; ++t) tile_accum_i16<M>(p + t * TILE_BYTES, X, acc[t], K);
         if ((tk & 7) == 7)
         {
-            for (int t = 0; t < 8; ++t)
+            for (int t = t0; t < t1; ++t)
                 for (int c = 0; c < 8; ++c)
                     for (int i = 0; i < M; ++i)
                     {
@@ -362,7 +422,7 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
         }
     }
     for (int i = 0; i < M; ++i)
-        for (int t = 0; t < 8; ++t)
+        for (int t = t0; t < t1; ++t)
             for (int c = 0; c < 8; ++c)
             {
                 const float* v = accf[t] + (c * M + i) * 8;
@@ -372,20 +432,29 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
             }
 }
 
-void gemv_block_i16_m(int m, const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out)
+template <int T0, int T1>
+void gemv_block_i16_m_r(int m, const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out)
 {
     switch (m)
     {
-        case 1: gemv_block_i16<1>(mat, blk, xq, qs, sumx, out); break;
-        case 2: gemv_block_i16<2>(mat, blk, xq, qs, sumx, out); break;
-        case 3: gemv_block_i16<3>(mat, blk, xq, qs, sumx, out); break;
-        case 4: gemv_block_i16<4>(mat, blk, xq, qs, sumx, out); break;
-        case 5: gemv_block_i16<5>(mat, blk, xq, qs, sumx, out); break;
-        case 6: gemv_block_i16<6>(mat, blk, xq, qs, sumx, out); break;
-        case 7: gemv_block_i16<7>(mat, blk, xq, qs, sumx, out); break;
-        default: gemv_block_i16<8>(mat, blk, xq, qs, sumx, out); break;
+        case 1: gemv_block_i16<1, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        case 2: gemv_block_i16<2, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        case 3: gemv_block_i16<3, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        case 4: gemv_block_i16<4, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        case 5: gemv_block_i16<5, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        case 6: gemv_block_i16<6, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        case 7: gemv_block_i16<7, T0, T1>(mat, blk, xq, qs, sumx, out); break;
+        default: gemv_block_i16<8, T0, T1>(mat, blk, xq, qs, sumx, out); break;
     }
 }
+
+void gemv_block_i16_m(int m, const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out, int t0 = 0, int t1 = 8)
+{
+    if (t0 == 0 && t1 == 8) gemv_block_i16_m_r<0, 8>(m, mat, blk, xq, qs, sumx, out);
+    else if (t0 == 0) gemv_block_i16_m_r<0, 4>(m, mat, blk, xq, qs, sumx, out);
+    else gemv_block_i16_m_r<4, 8>(m, mat, blk, xq, qs, sumx, out);
+}
+
 
 // quantise one transformed 128-block to int16 (dup layout, permuted) -> returns scale; adds sum(x_deq) to *sum
 inline float quant_block_i16(const float* xt, int32_t* xq_blk /* 8 tile rows x 32 */, float* sum)
@@ -402,6 +471,37 @@ inline float quant_block_i16(const float* xt, int32_t* xq_blk /* 8 tile rows x 3
         }
     *sum += float(si) * sc;
     return sc;
+}
+
+// [bdw-opt sockq] Per-socket work queues. Measured on the test box (2x Broadwell E5-2699 v4): the CPU tier is compute-bound and
+// remote DRAM reads cost ~nothing (node-0-only 11.1 vs node-1-only 11.2 core-ms/expert), but ONE pool spanning both
+// sockets costs 13.0 core-ms/expert — the loss is cross-socket synchronisation (42 threads on one F.next atomic).
+// With GLM53_CT_SOCKQ=1 each phase's unit range is split by the sockets' thread counts; a thread draws from its own
+// socket's counter and only touches the other socket's counter to steal once its own range is empty. Units compute
+// identical results whichever thread runs them, so this is bit-exact. GLM53_CT_SOCKQ_FAKE=1 alternates workers
+// between two pretend sockets (lets a single-socket test box exercise the stealing path).
+inline std::vector<int> g_wsock;          // socket index (0/1) of pool worker w
+inline int g_nsock[2] = { 0, 0 };         // workers per socket
+inline bool sockq_enabled()
+{
+    static const bool on = [] { const char* v = std::getenv("GLM53_CT_SOCKQ"); return v && std::atoi(v) == 1; }();
+    return on;
+}
+inline void sockq_assign(int n, const std::vector<int>& cpus)
+{
+    const char* fk = std::getenv("GLM53_CT_SOCKQ_FAKE"); const bool fake = fk && std::atoi(fk) == 1;
+    g_wsock.assign(n, 0); g_nsock[0] = g_nsock[1] = 0;
+    for (int w = 0; w < n; ++w)
+    {
+        int s = 0;
+        if (fake) s = w & 1;
+        else
+        {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpus[w % cpus.size()]) + "/topology/physical_package_id");
+            int pk = 0; f >> pk; s = pk & 1;
+        }
+        g_wsock[w] = s; ++g_nsock[s];
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -423,6 +523,7 @@ struct Pool
     void start(int threads, const std::vector<int>& cpus)
     {
         n = threads;
+        sockq_assign(n, cpus);   // [bdw-opt sockq] cheap; only consulted when GLM53_CT_SOCKQ=1
         pin(cpus[0]);
         for (int w = 1; w < n; ++w)
             th.emplace_back([this, w, cpu = cpus[w % cpus.size()]] {
@@ -570,9 +671,52 @@ struct Fwd
     std::vector<Job> jobs;
     // workspaces
     std::vector<float> xg, xu, xd, sg, su, sd, yd, qg, qu, qd;
+    std::vector<float> ygu;  // [bdw-opt split1] gate|up block outputs after out_block: [job][MAXM][2][I]
+    // [bdw-opt p0blk] block-parallel input prep (I16 + split only): active (job, token) pairs, per-block sum addends
+    std::vector<int> pj, pi, pairbase; std::vector<float> p0part; bool p0blk = false;
     std::atomic<int> next{0};
     int phase = 0, units = 0;
+    // [bdw-opt sockq] per-socket counters on their own cache lines; socket 0 owns [0, mid), socket 1 [mid, units)
+    alignas(64) std::atomic<int> nA{0};
+    alignas(64) std::atomic<int> nB{0};
+    alignas(64) int mid = 0;
+    // [E6 fuse] dependency counters of the fused schedule (sized and zeroed by the coordinator before each run)
+    std::unique_ptr<std::atomic<int>[]> c0, c1; size_t nc0 = 0, nc1 = 0; int u0 = 0;
 };
+
+// [bdw-opt sockq] coordinator-side reset before pool.run (never called by workers)
+inline void reset_units(Fwd& F, int units)
+{
+    F.units = units; F.next.store(0);
+    if (sockq_enabled())
+    {
+        const int a = g_nsock[0], b = g_nsock[1];
+        F.mid = (a + b) > 0 ? int((long long) units * a / (a + b)) : units;
+        F.nA.store(0); F.nB.store(0);
+    }
+}
+
+// [bdw-opt sockq] next unit index for worker w, or -1 when the phase is drained
+inline int next_unit(Fwd& F, int w)
+{
+    if (!sockq_enabled())
+    {
+        const int u = F.next.fetch_add(1, std::memory_order_relaxed);
+        return u < F.units ? u : -1;
+    }
+    const int mid = F.mid, units = F.units;
+    if (g_wsock[w] == 0)
+    {
+        const int u = F.nA.fetch_add(1, std::memory_order_relaxed);
+        if (u < mid) return u;
+        const int v = mid + F.nB.fetch_add(1, std::memory_order_relaxed);
+        return v < units ? v : -1;
+    }
+    const int v = mid + F.nB.fetch_add(1, std::memory_order_relaxed);
+    if (v < units) return v;
+    const int u = F.nA.fetch_add(1, std::memory_order_relaxed);
+    return u < mid ? u : -1;
+}
 
 void fwd_phase(void* vc, int w, int nw)
 {
@@ -582,8 +726,8 @@ void fwd_phase(void* vc, int w, int nw)
     const size_t XH = size_t(H) * 2, XI = size_t(I) * 2;    // permuted activation sizes
     while (true)
     {
-        const int u = F.next.fetch_add(1, std::memory_order_relaxed);
-        if (u >= F.units) break;
+        const int u = next_unit(F, w);   // [bdw-opt sockq] (stock: one shared F.next counter)
+        if (u < 0) break;
         if (F.phase == 0)
         {
             // prep gate/up inputs: unit = (job, token slot, g|u), whole 4096 vector
@@ -631,7 +775,7 @@ void fwd_phase(void* vc, int w, int nw)
                 out_block(g, E.g.svh + blk * 128);
                 out_block(up, E.u.svh + blk * 128);
                 alignas(32) float a[128], xt[128];
-                for (int r = 0; r < 128; ++r) a[r] = r16(silu(g[r]) * up[r]);
+                for (int r = 0; r < 128; ++r) a[r] = r16(act_mul(g[r], up[r]));
                 prep_block(a, E.d.suh + blk * 128, xt);
                 float* xp = F.xd.data() + (size_t(j) * MAXM + i) * XI;
                 float s = 0;
@@ -688,7 +832,292 @@ void fwd_phase(void* vc, int w, int nw)
     }
 }
 
-struct PhaseTimes { double t[4] = {0, 0, 0, 0}; };
+// [bdw-opt split1] Phase 1 of fwd_phase does gate AND up for a 128-block in one unit (16 units/expert); with ~4
+// CPU experts on 42 threads that quantizes to 2 rounds where ~1.5 would do. This variant splits it into
+// p1s = one gate-or-up GEMV block (32 units/expert, result after out_block into F.ygu) and p2s = activation +
+// down-input prep per (job, blk) — the SAME per-element operations in the SAME order as fwd_phase's phase 1
+// (gemv -> out_block -> r16(silu(g)*up) -> prep_block -> quant/permute), so results are bit-identical.
+// Schedule (moe_forward): fwd_phase ph0 | fwd_phase_split1 ph1 gate|up block | fwd_phase_split1 ph2 act+down-prep |
+// fwd_phase ph2 (down) | fwd_phase ph3 (sum). This function only ever sees F.phase 1 or 2; F.phase is set by the
+// coordinator BEFORE pool.run, never by workers (an earlier draft mutated it inside workers = data race).
+// [bdw-opt split2] GLM53_CT_SPLIT1: 0 stock | 1 split (gate|up per 128-col block) | 2 split + 64-col gate|up units.
+// Mode 2 halves each gate|up unit (tiles [0,4) / [4,8) of the 128-col block: per-column results identical), stores
+// the RAW block halves, and moves out_block into the act phase, which needs all 128 columns — same ops, same order.
+// At ~4 CPU experts on 42 threads it turns 4 rounds (3.05 ideal) into 7 half-rounds (6.1 ideal). Bit-exact.
+inline int split_mode()
+{
+    static const int m = [] { const char* v = std::getenv("GLM53_CT_SPLIT1"); const int x = v ? std::atoi(v) : 0; return (x == 1 || x == 2) ? x : 0; }();
+    return m;
+}
+
+// [bdw-opt p0blk] GLM53_CT_P0BLK=1 (with split mode, I16 only): phase 0 becomes one unit per (active token, gate|up,
+// 128-block) instead of one per (job, MAXM slot, gate|up) — ~87% of the old units were empty slots and each live one
+// did all 32 blocks serially. Bit-exact: in I16 each block adds exactly one term float(si)*sc to the running sum, so
+// storing the 32 terms and summing them in block order from +0 (lazily, in phase 1) reproduces the same sequence.
+inline bool p0blk_enabled()
+{
+    static const bool on = [] { const char* v = std::getenv("GLM53_CT_P0BLK"); return v && std::atoi(v) == 1; }();
+    return on;
+}
+
+// per-token sumx for the gate|up GEMVs: stock = written by phase 0; p0blk = summed here from the block terms in order
+inline const float* gu_sums(Fwd& F, int j, int which, int m, float* sx)
+{
+    const float* s = (which ? F.su : F.sg).data() + size_t(j) * MAXM;
+    if (!F.p0blk) return s;
+    for (int i = 0; i < m; ++i)
+    {
+        const float* pp = F.p0part.data() + (size_t(F.pairbase[j] + i) * 2 + which) * 32;
+        float a = 0; for (int b = 0; b < 32; ++b) a += pp[b];
+        sx[i] = a;
+    }
+    return sx;
+}
+
+void fwd_phase_split1(void* vc, int w, int)
+{
+    Fwd& F = *static_cast<Fwd*>(vc);
+    const Layer& L = *F.L;
+    const int H = L.H, I = L.I;
+    const size_t XH = size_t(H) * 2, XI = size_t(I) * 2;
+    while (true)
+    {
+        const int u = next_unit(F, w);   // [bdw-opt sockq] (stock: one shared F.next counter)
+        if (u < 0) break;
+        if (F.phase == 10)
+        {
+            // [bdw-opt p0blk] unit = (active pair p, gate|up, block b of H/128)
+            const int p = u / 64, rem = u % 64, which = rem / 32, b = rem % 32;
+            const int j = F.pj[p], i = F.pi[p];
+            const Job& J = F.jobs[j];
+            const Mat& M = which ? L.ex[J.e].u : L.ex[J.e].g;
+            float* xp = (which ? F.xu : F.xg).data() + (size_t(j) * MAXM + i) * XH;
+            float* qs = (which ? F.qu : F.qg).data() + (size_t(j) * MAXM + i) * 32;
+            alignas(32) float xt[128];
+            prep_block(F.x + size_t(J.tok[i]) * H + b * 128, M.suh + b * 128, xt);
+            float part = 0;
+            qs[b] = quant_block_i16(xt, reinterpret_cast<int32_t*>(xp) + size_t(b) * 256, &part);
+            F.p0part[(size_t(p) * 2 + which) * 32 + b] = part;
+        }
+        else if (F.phase == 1 && split_mode() == 2)
+        {
+            // unit = (job, blk of I/128, gate|up, half): tiles [4*half, 4*half+4) = cols [64*half, 64*half+64); RAW out
+            const int nb = I / 128, j = u / (4 * nb), rem = u % (4 * nb), blk = rem / 4, which = (rem / 2) % 2, half = rem % 2;
+            const int t0 = 4 * half, t1 = t0 + 4;
+            const Job& J = F.jobs[j];
+            const Expert& E = L.ex[J.e];
+            const Mat& M = which ? E.u : E.g;
+            const float* xp[MAXM];
+            for (int i = 0; i < J.m; ++i) xp[i] = (which ? F.xu : F.xg).data() + (size_t(j) * MAXM + i) * XH;
+            float sx[MAXM]; const float* s = gu_sums(F, j, which, J.m, sx);   // [bdw-opt p0blk]
+            alignas(32) float y[MAXM * 128];
+            if (F.mode == 1) gemv_block_m<true>(J.m, M, blk, xp, s, y, t0, t1);
+            else if (F.mode == 0) gemv_block_m<false>(J.m, M, blk, xp, s, y, t0, t1);
+            else
+            {
+                const int32_t* q_[MAXM]; const float* qs_[MAXM];
+                for (int i = 0; i < J.m; ++i)
+                {
+                    q_[i] = reinterpret_cast<const int32_t*>(xp[i]);
+                    qs_[i] = (which ? F.qu : F.qg).data() + (size_t(j) * MAXM + i) * 32;
+                }
+                gemv_block_i16_m(J.m, M, blk, q_, qs_, s, y, t0, t1);
+            }
+            for (int i = 0; i < J.m; ++i)
+                std::memcpy(F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + which) * I + blk * 128 + 64 * half, y + i * 128 + 64 * half, 64 * 4);
+        }
+        else if (F.phase == 1)
+        {
+            // unit = (job, blk of I/128, gate|up)
+            const int nb = I / 128, j = u / (2 * nb), rem = u % (2 * nb), blk = rem / 2, which = rem % 2;
+            const Job& J = F.jobs[j];
+            const Expert& E = L.ex[J.e];
+            const Mat& M = which ? E.u : E.g;
+            const float* xp[MAXM];
+            for (int i = 0; i < J.m; ++i) xp[i] = (which ? F.xu : F.xg).data() + (size_t(j) * MAXM + i) * XH;
+            float sx[MAXM]; const float* s = gu_sums(F, j, which, J.m, sx);   // [bdw-opt p0blk]
+            alignas(32) float y[MAXM * 128];
+            if (F.mode == 1) gemv_block_m<true>(J.m, M, blk, xp, s, y);
+            else if (F.mode == 0) gemv_block_m<false>(J.m, M, blk, xp, s, y);
+            else
+            {
+                const int32_t* q_[MAXM]; const float* qs_[MAXM];
+                for (int i = 0; i < J.m; ++i)
+                {
+                    q_[i] = reinterpret_cast<const int32_t*>(xp[i]);
+                    qs_[i] = (which ? F.qu : F.qg).data() + (size_t(j) * MAXM + i) * 32;
+                }
+                gemv_block_i16_m(J.m, M, blk, q_, qs_, s, y);
+            }
+            for (int i = 0; i < J.m; ++i)
+            {
+                out_block(y + i * 128, M.svh + blk * 128);
+                std::memcpy(F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + which) * I + blk * 128, y + i * 128, 128 * 4);
+            }
+        }
+        else
+        {
+            // phase 2: act + down-input prep. unit = (job, blk of I/128)
+            const int nb = I / 128, j = u / nb, blk = u % nb;
+            const Job& J = F.jobs[j];
+            const Expert& E = L.ex[J.e];
+            for (int i = 0; i < J.m; ++i)
+            {
+                const float* g = F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + 0) * I + blk * 128;
+                const float* up = F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + 1) * I + blk * 128;
+                alignas(32) float gg[128], uu[128];
+                if (split_mode() == 2)
+                {
+                    // mode 2 stored RAW halves: apply the 128-col output transforms here (same order as mode 1: g then up)
+                    std::memcpy(gg, g, 128 * 4); std::memcpy(uu, up, 128 * 4);
+                    out_block(gg, E.g.svh + blk * 128); out_block(uu, E.u.svh + blk * 128);
+                    g = gg; up = uu;
+                }
+                alignas(32) float a[128], xt[128];
+                for (int r = 0; r < 128; ++r) a[r] = r16(act_mul(g[r], up[r]));
+                prep_block(a, E.d.suh + blk * 128, xt);
+                float* xp = F.xd.data() + (size_t(j) * MAXM + i) * XI;
+                float s = 0;
+                if (F.mode == 2) F.qd[(size_t(j) * MAXM + i) * 32 + blk] = quant_block_i16(xt, reinterpret_cast<int32_t*>(xp) + size_t(blk) * 256, &s);
+                else
+                {
+                    for (int r = 0; r < 128; ++r) s += xt[r];
+                    for (int tt = 0; tt < 8; ++tt) permute_rows(xt + tt * 16, xp + (size_t(blk) * 8 + tt) * 32);
+                }
+                F.sd[(size_t(j) * MAXM + i) * 16 + blk] = s;
+            }
+        }
+    }
+}
+
+// [E6 fuse] GLM53_CT_FUSE=1 (runtime: tier_set_e6): a decode job (split mode 2 + p0blk, I16, <= GLM53_CT_FUSE_MAXN
+// expert jobs, default 1) runs in 2 pool runs instead of 5 — each run is a fork/join of all 42 threads over both sockets
+// (~10-20 us of wake + join), which is most of the ~0.2 ms fixed cost of a small job.
+//   A: p0 prep units, then gate|up half-block units (one ordered queue: every prep unit is handed out before any GEMV
+//      unit, so a GEMV unit only waits for prep units already running); each GEMV unit waits on its (job, token,
+//      gate|up) prep counter, and the 4th (last) gate|up unit of a (job, blk) does that block's act + down-input prep.
+//   B: one unit per 128-col block of H: the down block for every job in job order, then the weighted sum into out.
+// Same per-element operations in the same order as the 5-run schedule (copies of fwd_phase_split1 phases 10 / 1(mode
+// 2) / 2 and fwd_phase phases 2 / 3) -> bit-identical (ops/kernel-ab-harness.cpp with the server's compile flags).
+// Measured (ops/kernel-ab-harness.cpp HARNESS_TIME, 42 threads, interleaved, 2026-10-12): -9% at 1 job (with PF_LEAN),
+// slower at 2-4 jobs (B's 32 units leave 10 threads idle where the 5-run schedule streams with all 42; A's single
+// ordered queue and dependency spins cost what the barriers saved) -> serve with GLM53_CT_FUSE_MAXN=1. (A tile-granular
+// static GEMV split was tried too: slower at every job count — per-call overhead beat the better round packing.)
+inline std::atomic<int>& g_fuse() { static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_FUSE"); return e ? std::atoi(e) : 0; }()); return v; }
+inline std::atomic<int>& g_fuse_maxn() { static std::atomic<int> v([] { const char* e = std::getenv("GLM53_CT_FUSE_MAXN"); return e ? std::atoi(e) : 1; }()); return v; }
+
+void fwd_fusedA(void* vc, int, int)
+{
+    Fwd& F = *static_cast<Fwd*>(vc);
+    const Layer& L = *F.L;
+    const int H = L.H, I = L.I, nb = I / 128;
+    const size_t XH = size_t(H) * 2, XI = size_t(I) * 2;
+    while (true)
+    {
+        const int u = F.next.fetch_add(1, std::memory_order_relaxed);
+        if (u >= F.units) break;
+        if (u < F.u0)
+        {
+            // = fwd_phase_split1 phase 10: unit = (active pair p, gate|up, block b of H/128)
+            const int p = u / 64, rem = u % 64, which = rem / 32, b = rem % 32;
+            const int j = F.pj[p], i = F.pi[p];
+            const Job& J = F.jobs[j];
+            const Mat& M = which ? L.ex[J.e].u : L.ex[J.e].g;
+            float* xp = (which ? F.xu : F.xg).data() + (size_t(j) * MAXM + i) * XH;
+            float* qs = (which ? F.qu : F.qg).data() + (size_t(j) * MAXM + i) * 32;
+            alignas(32) float xt[128];
+            prep_block(F.x + size_t(J.tok[i]) * H + b * 128, M.suh + b * 128, xt);
+            float part = 0;
+            qs[b] = quant_block_i16(xt, reinterpret_cast<int32_t*>(xp) + size_t(b) * 256, &part);
+            F.p0part[(size_t(p) * 2 + which) * 32 + b] = part;
+            F.c0[size_t(p) * 2 + which].fetch_add(1, std::memory_order_release);
+            continue;
+        }
+        // = fwd_phase_split1 phase 1, split mode 2: unit = (job, blk of I/128, gate|up, half); RAW half-block out
+        const int v = u - F.u0;
+        const int j = v / (4 * nb), rem = v % (4 * nb), blk = rem / 4, which = (rem / 2) % 2, half = rem % 2;
+        const int t0 = 4 * half, t1 = t0 + 4;
+        const Job& J = F.jobs[j];
+        const Expert& E = L.ex[J.e];
+        const Mat& M = which ? E.u : E.g;
+        for (int i = 0; i < J.m; ++i)
+        {
+            const std::atomic<int>& c = F.c0[size_t(F.pairbase[j] + i) * 2 + which];
+            while (c.load(std::memory_order_acquire) < 32) _mm_pause();
+        }
+        const float* xp[MAXM];
+        for (int i = 0; i < J.m; ++i) xp[i] = (which ? F.xu : F.xg).data() + (size_t(j) * MAXM + i) * XH;
+        float sx[MAXM]; const float* s = gu_sums(F, j, which, J.m, sx);
+        alignas(32) float y[MAXM * 128];
+        const int32_t* q_[MAXM]; const float* qs_[MAXM];
+        for (int i = 0; i < J.m; ++i)
+        {
+            q_[i] = reinterpret_cast<const int32_t*>(xp[i]);
+            qs_[i] = (which ? F.qu : F.qg).data() + (size_t(j) * MAXM + i) * 32;
+        }
+        gemv_block_i16_m(J.m, M, blk, q_, qs_, s, y, t0, t1);
+        for (int i = 0; i < J.m; ++i)
+            std::memcpy(F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + which) * I + blk * 128 + 64 * half, y + i * 128 + 64 * half, 64 * 4);
+        if (F.c1[size_t(j) * nb + blk].fetch_add(1, std::memory_order_acq_rel) != 3) continue;
+        // = fwd_phase_split1 phase 2 (split mode 2): act + down-input prep for (job, blk), by the block's last unit
+        for (int i = 0; i < J.m; ++i)
+        {
+            const float* g = F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + 0) * I + blk * 128;
+            const float* up = F.ygu.data() + ((size_t(j) * MAXM + i) * 2 + 1) * I + blk * 128;
+            alignas(32) float gg[128], uu[128];
+            std::memcpy(gg, g, 128 * 4); std::memcpy(uu, up, 128 * 4);
+            out_block(gg, E.g.svh + blk * 128); out_block(uu, E.u.svh + blk * 128);
+            alignas(32) float a[128], xt[128];
+            for (int r = 0; r < 128; ++r) a[r] = r16(act_mul(gg[r], uu[r]));
+            prep_block(a, E.d.suh + blk * 128, xt);
+            float* xpd = F.xd.data() + (size_t(j) * MAXM + i) * XI;
+            float sq = 0;
+            F.qd[(size_t(j) * MAXM + i) * 32 + blk] = quant_block_i16(xt, reinterpret_cast<int32_t*>(xpd) + size_t(blk) * 256, &sq);
+            F.sd[(size_t(j) * MAXM + i) * 16 + blk] = sq;
+        }
+    }
+}
+
+void fwd_fusedB(void* vc, int, int)
+{
+    Fwd& F = *static_cast<Fwd*>(vc);
+    const Layer& L = *F.L;
+    const int H = L.H;
+    const size_t XI = size_t(L.I) * 2;
+    while (true)
+    {
+        const int blk = F.next.fetch_add(1, std::memory_order_relaxed);
+        if (blk >= F.units) break;
+        // = fwd_phase phase 2 (down block) for every job in job order, then = phase 3 (weighted sum) for these 128
+        // columns: per output element o = 0, then += w * y over (job, slot) in the same order as phase 3
+        for (int t = 0; t < F.ntok; ++t) std::memset(F.out + size_t(t) * H + blk * 128, 0, 128 * 4);
+        for (size_t j = 0; j < F.jobs.size(); ++j)
+        {
+            const Job& J = F.jobs[j];
+            const Expert& E = L.ex[J.e];
+            const float* xpd[MAXM]; float sd[MAXM];
+            for (int i = 0; i < J.m; ++i)
+            {
+                xpd[i] = F.xd.data() + (j * MAXM + i) * XI;
+                float s = 0; for (int b = 0; b < 16; ++b) s += F.sd[(j * MAXM + i) * 16 + b]; sd[i] = s;
+            }
+            alignas(32) float y[MAXM * 128];
+            const int32_t* q_[MAXM]; const float* s_[MAXM];
+            for (int i = 0; i < J.m; ++i) { q_[i] = reinterpret_cast<const int32_t*>(xpd[i]); s_[i] = F.qd.data() + (j * MAXM + i) * 32; }
+            gemv_block_i16_m(J.m, E.d, blk, q_, s_, sd, y);
+            for (int i = 0; i < J.m; ++i)
+            {
+                out_block(y + i * 128, E.d.svh + blk * 128);
+                float* o = F.out + size_t(J.tok[i]) * H + blk * 128; const float wt = J.w[i];
+                for (int c = 0; c < 128; ++c) o[c] += wt * y[i * 128 + c];
+            }
+        }
+    }
+}
+
+struct PhaseTimes { double t[5] = {0, 0, 0, 0, 0}; };   // [bdw-opt] 5 slots (split1 uses all 5; stock uses 0-3)
+
+inline bool split1_enabled() { return split_mode() > 0; }   // [bdw-opt split2] 1 or 2
 
 void moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route,
                  float* out, int mode, PhaseTimes* pt = nullptr)
@@ -706,11 +1135,54 @@ void moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std
     auto grow = [](std::vector<float>& v, size_t n) { if (v.size() < n) v.resize(n); };
     grow(F.xg, nj * MAXM * L.H * 2); grow(F.xu, nj * MAXM * L.H * 2); grow(F.xd, nj * MAXM * L.I * 2);
     grow(F.sg, nj * MAXM); grow(F.su, nj * MAXM); grow(F.qg, nj * MAXM * 32); grow(F.qu, nj * MAXM * 32); grow(F.qd, nj * MAXM * 32); grow(F.sd, nj * MAXM * 16); grow(F.yd, nj * MAXM * L.H);
+    if (split1_enabled())
+    {
+        grow(F.ygu, nj * MAXM * L.I * 2);
+        F.p0blk = p0blk_enabled() && mode == 2 && L.H / 128 == 32;   // [bdw-opt p0blk] I16 decode path only
+        int npairs = 0;
+        if (F.p0blk)
+        {
+            F.pj.clear(); F.pi.clear(); F.pairbase.assign(nj, 0);
+            for (size_t j = 0; j < nj; ++j) { F.pairbase[j] = npairs; for (int i = 0; i < F.jobs[j].m; ++i) { F.pj.push_back(int(j)); F.pi.push_back(i); ++npairs; } }
+            grow(F.p0part, size_t(npairs) * 64);
+        }
+        if (F.p0blk && split_mode() == 2 && g_fuse().load(std::memory_order_relaxed)
+            && int(nj) <= g_fuse_maxn().load(std::memory_order_relaxed))
+        {
+            // [E6 fuse] 2 pool runs instead of 5 (see fwd_fusedA / fwd_fusedB); PhaseTimes: run A -> t[1], run B -> t[3]
+            const int nb = L.I / 128;
+            const size_t n0 = size_t(npairs) * 2, n1 = nj * size_t(nb);
+            if (F.nc0 < n0) { F.c0.reset(new std::atomic<int>[n0]); F.nc0 = n0; }
+            if (F.nc1 < n1) { F.c1.reset(new std::atomic<int>[n1]); F.nc1 = n1; }
+            for (size_t k = 0; k < n0; ++k) F.c0[k].store(0, std::memory_order_relaxed);
+            for (size_t k = 0; k < n1; ++k) F.c1[k].store(0, std::memory_order_relaxed);
+            double t0 = pt ? now() : 0;
+            F.u0 = npairs * 64; F.units = F.u0 + int(nj) * 4 * nb; F.next.store(0);
+            pool.run(&fwd_fusedA, &F);
+            if (pt) { pt->t[1] += now() - t0; t0 = now(); }
+            F.units = L.H / 128; F.next.store(0);
+            pool.run(&fwd_fusedB, &F);
+            if (pt) pt->t[3] += now() - t0;
+            return;
+        }
+        // step -> (function, F.phase value it expects, units)
+        void (*fn[5])(void*, int, int) = { F.p0blk ? &fwd_phase_split1 : &fwd_phase, &fwd_phase_split1, &fwd_phase_split1, &fwd_phase, &fwd_phase };
+        const int phv[5] = { F.p0blk ? 10 : 0, 1, 2, 2, 3 };
+        const int su[5] = { F.p0blk ? npairs * 64 : int(nj) * 2 * MAXM, int(nj) * (split_mode() == 2 ? 4 : 2) * (L.I / 128), int(nj) * (L.I / 128), int(nj) * (L.H / 128), ntok * (L.H / 512) };
+        for (int st = 0; st < 5; ++st)
+        {
+            const double t0 = pt ? now() : 0;
+            F.phase = phv[st]; reset_units(F, su[st]);
+            pool.run(fn[st], &F);
+            if (pt) pt->t[st] += now() - t0;
+        }
+        return;
+    }
     const int units[4] = { int(nj) * 2 * MAXM, int(nj) * (L.I / 128), int(nj) * (L.H / 128), ntok * (L.H / 512) };
     for (int ph = 0; ph < 4; ++ph)
     {
         const double t0 = pt ? now() : 0;
-        F.phase = ph; F.units = units[ph]; F.next.store(0);
+        F.phase = ph; reset_units(F, units[ph]);
         pool.run(&fwd_phase, &F);
         if (pt) pt->t[ph] += now() - t0;
     }
@@ -874,7 +1346,7 @@ void fwd2_phase(void* vc, int, int)
                 }
                 out_block(g, E.g.svh + blk * 128);
                 out_block(up, E.u.svh + blk * 128);
-                for (int r = 0; r < 128; ++r) a[r] = r16(silu(g[r]) * up[r]);
+                for (int r = 0; r < 128; ++r) a[r] = r16(act_mul(g[r], up[r]));
                 prep_block(a, E.d.suh + blk * 128, xt);
                 float* xp = F.xd.data() + (s0 + i) * XI;
                 float sum = 0;
@@ -996,7 +1468,7 @@ void ref_expert(const Expert& E, const std::vector<float>* W, const float* x, fl
     std::vector<float> g(2048), u(2048), a(2048);
     ref_linear(E.g, W[0], x, g.data());
     ref_linear(E.u, W[1], x, u.data());
-    for (int i = 0; i < 2048; ++i) a[i] = r16(silu(g[i]) * u[i]);
+    for (int i = 0; i < 2048; ++i) a[i] = r16(act_mul(g[i], u[i]));
     ref_linear(E.d, W[2], a.data(), y);
 }
 
@@ -1036,7 +1508,7 @@ void int8_expert(const Expert& E, const float* x, float* y)
 {
     std::vector<float> g(2048), u(2048), a(2048);
     int8_linear(E.g, x, g.data()); int8_linear(E.u, x, u.data());
-    for (int i = 0; i < 2048; ++i) a[i] = silu(g[i]) * u[i];
+    for (int i = 0; i < 2048; ++i) a[i] = act_mul(g[i], u[i]);
     int8_linear(E.d, a.data(), y);
 }
 
