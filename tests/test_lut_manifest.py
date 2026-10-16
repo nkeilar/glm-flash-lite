@@ -194,17 +194,185 @@ class ManifestTests(unittest.TestCase):
                     {"GLM53_CT_FORMAT":"lut"}):
             with self.subTest(env=env),self.assertRaises(ValueError):lm.preflight(env)
 
-    def test_lut_preflight_validates_structure_then_refuses_every_quality_value_without_hashing(self):
+    def test_lut_preflight_requires_owner_approved_real_quality_after_full_bank_structure(self):
         for activation in ("i16","q8"):
-            for quality in (None,"PASS.json","PROXY-PASS.json"):
-                env={"GLM53_CT_FORMAT":"lut","GLM53_CT_LUT_ACT":activation,"GLM53_CT_LUT_MANIFEST":"bank.json"}
-                if quality:env["GLM53_CT_LUT_QUALITY"]=quality
-                with mock.patch.object(lm,"load_manifest") as load,mock.patch.object(lm,"verify_bank",side_effect=AssertionError("no full hash to refuse")):
-                    with self.assertRaisesRegex(RuntimeError,"real-activation quality admission is not implemented"):lm.preflight(env)
-                    load.assert_called_once_with(Path("bank.json"))
+            env={"GLM53_CT_FORMAT":"lut","GLM53_CT_LUT_ACT":activation,"GLM53_CT_LUT_MANIFEST":"bank.json"}
+            with mock.patch.object(lm,"load_manifest") as load:
+                with self.assertRaisesRegex(ValueError,"real i16 report path is required"):lm.preflight(env)
+                load.assert_called_once_with(Path("bank.json"))
         with mock.patch.object(lm,"load_manifest",side_effect=ValueError("full bank missing")):
             with self.assertRaisesRegex(ValueError,"full bank missing"):
                 lm.preflight({"GLM53_CT_FORMAT":"lut","GLM53_CT_LUT_MANIFEST":"missing.json"})
+
+
+
+def real_report(bank, activation="i16"):
+    """Fictitious structural data for validator tests; no captured-model claim."""
+    capture = dict(model_revision="332ab457b709b7ba30dd9a448be5de03b80a7ac9", serving_revision="1"*40,
+                   exllamav3_version="1.5.1", **{key:"2"*64 for key in
+                   ("model_ledger_sha256","runtime_ledger_sha256","corpus_sha256","stats_sha256",
+                    "inputs_sha256","routes_sha256","trajectories_sha256")})
+    replay = {key:"3"*64 for key in ("library_sha256","build_receipt_sha256","quality_checkpoint_sha256",
+              "quality_replay_sha256","gguf_sha256","maintenance_guard_sha256")}
+    replay.update(codec_revision="d1b493379387518d20c7bc89dab0ec1ce320f811",
+                  kernels_cpp_sha256="3daf262cf111df1f2ac04fea05840b147e7efdcd0a7bae4666ecfb6f15362244",
+                  kernels_h_sha256="dabec85fd112d544536856e04dc3c722495dd20749c91754cacdd58d9b506669")
+    binding = dict(protocol=lm.REAL_PROTOCOL,bank_manifest_sha256=bank.sha256,source_revision=lm.SOURCE_REVISION,
+                   imatrix_sha256=lm.IMATRIX_SHA256,capture_manifest_sha256="4"*64,capture=capture,replay=replay,
+                   layers={str(row["layer"]):dict(q8_sha256="5"*64,ours_sha256=row["artifact"]["sha256"],unsloth_sha256="6"*64)
+                           for row in bank.value["layers"] if row["layer"] in (3,11)})
+    layers = {}
+    pooled = {"ours":[],"unsloth":[]}
+    for layer in ("3","11"):
+        experts=[dict(expert=expert,routing_count=32,ours_sample_errors=[.01+expert*.00001]*32,
+                      unsloth_sample_errors=[.02+expert*.00001]*32) for expert in range(32)]
+        metrics={arm:lm.quality_metrics([(r[arm+"_sample_errors"],r["routing_count"]) for r in experts]) for arm in pooled}
+        for arm in pooled:pooled[arm].extend((r[arm+"_sample_errors"],r["routing_count"]) for r in experts)
+        layers[layer]=dict(coverage=dict(tokens=128,prompts=4,classes=["code","firmware","prose"],experts=32,
+                                        route_occurrences=1024),experts=experts,**metrics,**{"pass":True},
+                           tp2_full_down_max_relative_l2={"ours":1e-7,"unsloth":1e-7})
+    return dict(schema="e1-real-quality/v1",state="REAL-PASS",complete=True,real_pass=True,synthetic=False,
+                activation=activation,batch=2,act_limit=10,tp2="split-intermediate-gate-up/down-columns-before-quantization",
+                binding=binding,binding_sha256=lm.json_digest(binding),layers=layers,
+                aggregate={**{arm:lm.quality_metrics(values) for arm,values in pooled.items()},"pass":True})
+
+
+class RealAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix="real-admission-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name)
+        self.bank=lm.BankManifest(self.root/"bank.json","f"*64,public_manifest())
+
+    def environment(self, activation="i16", report=None):
+        report=real_report(self.bank) if report is None else report
+        path=self.root/"real-i16.json";path.write_text(json.dumps(report,allow_nan=False))
+        env=dict(GLM53_CT_FORMAT="lut",GLM53_CT_LUT_ACT=activation,GLM53_CT_LUT_MANIFEST=str(self.bank.path),
+                 GLM53_CT_LUT_QUALITY=str(path),GLM53_CT_LUT_QUALITY_SHA256=hashlib.sha256(path.read_bytes()).hexdigest())
+        if activation=="q8":
+            path=self.root/"real-q8.json";path.write_text(json.dumps(real_report(self.bank,"q8")))
+            env.update(GLM53_CT_LUT_Q8_QUALITY=str(path),GLM53_CT_LUT_Q8_QUALITY_SHA256=hashlib.sha256(path.read_bytes()).hexdigest())
+        return env
+
+    def admit(self, env):
+        with mock.patch.object(lm,"load_manifest",return_value=self.bank):
+            return lm.preflight(env,require_production=False)
+
+    def test_real_i16_and_q8_quality_admit_but_production_remains_blocked(self):
+        for activation in ("i16","q8"):
+            env=self.environment(activation)
+            settings=self.admit(env)
+            self.assertIs(settings.admission["real_quality_admitted"],True)
+            self.assertIs(settings.admission["production_ready"],False)
+            self.assertEqual(set(settings.admission["report_sha256"]),{"i16","q8"} if activation=="q8" else {"i16"})
+            with mock.patch.object(lm,"load_manifest",return_value=self.bank):
+                with self.assertRaisesRegex(RuntimeError,"production LUT coordinator startup is unavailable"):
+                    lm.preflight(env)
+
+    def test_owner_approved_digest_is_mandatory_and_same_bytes_are_validated(self):
+        for field,value in (("GLM53_CT_LUT_QUALITY_SHA256",None),("GLM53_CT_LUT_QUALITY_SHA256","A"*64),
+                            ("GLM53_CT_LUT_QUALITY_SHA256","0"*64),("GLM53_CT_LUT_QUALITY",None)):
+            env=self.environment()
+            if value is None:env.pop(field)
+            else:env[field]=value
+            with self.subTest(field=field,value=value),self.assertRaises(ValueError):self.admit(env)
+        env=self.environment();path=Path(env["GLM53_CT_LUT_QUALITY"]);path.write_bytes(path.read_bytes()+b" ")
+        with self.assertRaisesRegex(ValueError,"owner-approved SHA256"):self.admit(env)
+        env=self.environment();path=Path(env["GLM53_CT_LUT_QUALITY"]);link=self.root/"symlink.json";link.symlink_to(path)
+        env["GLM53_CT_LUT_QUALITY"]=str(link)
+        with self.assertRaisesRegex(ValueError,"symlinks"):self.admit(env)
+
+    def test_proxy_incomplete_or_forged_positive_flags_never_admit(self):
+        changes=[lambda v:v.__setitem__("schema","e1-proxy-result/v1"),lambda v:v.__setitem__("state","PROXY-PASS"),
+                 lambda v:v.__setitem__("state","PASS"),lambda v:v.__setitem__("complete",1),
+                 lambda v:v.__setitem__("real_pass",1),lambda v:v.__setitem__("synthetic",True),
+                 lambda v:v.__setitem__("activation","q8"),lambda v:v.__setitem__("batch",True),
+                 lambda v:v.__setitem__("batch",3),lambda v:v.__setitem__("act_limit",0),
+                 lambda v:v.__setitem__("tp2","unsplit"),lambda v:v.__setitem__("proxy_pass",True),
+                 lambda v:v["layers"].pop("11"),lambda v:v["aggregate"].__setitem__("pass",1),
+                 lambda v:v["layers"]["3"].__setitem__("pass",1),
+                 lambda v:v["layers"]["3"]["ours"].__setitem__("median_expert_nmse",0),
+                 lambda v:v["aggregate"]["ours"].__setitem__("median_expert_nmse",0)]
+        for index,change in enumerate(changes):
+            report=real_report(self.bank);change(report)
+            with self.subTest(index=index),self.assertRaises(ValueError):self.admit(self.environment(report=report))
+
+    def test_transitive_binding_pins_and_bank_artifacts_must_match(self):
+        fields=[("bank_manifest_sha256",), ("source_revision",), ("imatrix_sha256",), ("protocol",),
+                ("capture_manifest_sha256",), ("capture","model_revision"), ("capture","serving_revision"),
+                ("capture","exllamav3_version"), ("capture","inputs_sha256"), ("capture","trajectories_sha256"),
+                ("replay","codec_revision"), ("replay","kernels_cpp_sha256"), ("replay","kernels_h_sha256"),
+                ("replay","build_receipt_sha256"), ("layers","3","ours_sha256"), ("layers","11","unsloth_sha256")]
+        for field in fields:
+            report=real_report(self.bank);node=report["binding"]
+            for key in field[:-1]:node=node[key]
+            node[field[-1]]="wrong"
+            report["binding_sha256"]=lm.json_digest(report["binding"])
+            with self.subTest(field=field),self.assertRaises(ValueError):self.admit(self.environment(report=report))
+        report=real_report(self.bank);report["binding"]["capture"]["corpus_sha256"]="7"*64
+        with self.assertRaisesRegex(ValueError,"binding SHA256"):self.admit(self.environment(report=report))
+
+    def test_raw_errors_coverage_and_failed_gates_are_recomputed(self):
+        changes=[lambda r:r["tp2_full_down_max_relative_l2"].__setitem__("ours",1.1e-5),
+                 lambda r:r["tp2_full_down_max_relative_l2"].__setitem__("unsloth",-1),
+                 lambda r:r.pop("tp2_full_down_max_relative_l2"),
+                 lambda r:r["coverage"].__setitem__("tokens",127),lambda r:r["coverage"].__setitem__("prompts",3),
+                 lambda r:r["coverage"].__setitem__("experts",31),lambda r:r["coverage"].__setitem__("route_occurrences",1023),
+                 lambda r:r["coverage"].__setitem__("classes",["prose","code"]),
+                 lambda r:r["coverage"].__setitem__("classes",["prose","code","firmware","prose"]),
+                 lambda r:r["experts"].__setitem__(1,copy.deepcopy(r["experts"][0])),
+                 lambda r:r["experts"][0].__setitem__("expert",288),lambda r:r["experts"][0].__setitem__("routing_count",31),
+                 lambda r:r["experts"][0]["ours_sample_errors"].pop(),
+                 lambda r:r["experts"][0]["ours_sample_errors"].__setitem__(0,-1),
+                 lambda r:r["experts"][0]["ours_sample_errors"].__setitem__(0,True)]
+        for index,change in enumerate(changes):
+            report=real_report(self.bank);change(report["layers"]["3"])
+            with self.subTest(index=index),self.assertRaises(ValueError):self.admit(self.environment(report=report))
+        report=real_report(self.bank)
+        for row in report["layers"].values():
+            for record in row["experts"]:record["ours_sample_errors"]=[.04]*record["routing_count"]
+            row["ours"]=lm.quality_metrics([(r["ours_sample_errors"],r["routing_count"]) for r in row["experts"]])
+        with self.assertRaisesRegex(ValueError,"per-layer quality gate failed"):self.admit(self.environment(report=report))
+
+    def test_q8_needs_both_activations_and_identical_provenance(self):
+        for field in ("GLM53_CT_LUT_QUALITY","GLM53_CT_LUT_QUALITY_SHA256","GLM53_CT_LUT_Q8_QUALITY","GLM53_CT_LUT_Q8_QUALITY_SHA256"):
+            env=self.environment("q8");env.pop(field)
+            with self.subTest(field=field),self.assertRaises(ValueError):self.admit(env)
+        for change in (lambda r:r["binding"]["capture"].__setitem__("inputs_sha256","8"*64),
+                       lambda r:r.__setitem__("act_limit",20),lambda r:r.__setitem__("activation","i16")):
+            env=self.environment("q8");path=Path(env["GLM53_CT_LUT_Q8_QUALITY"]);report=json.loads(path.read_text());change(report)
+            report["binding_sha256"]=lm.json_digest(report["binding"]);path.write_text(json.dumps(report))
+            env["GLM53_CT_LUT_Q8_QUALITY_SHA256"]=hashlib.sha256(path.read_bytes()).hexdigest()
+            with self.assertRaises(ValueError):self.admit(env)
+
+    def test_real_report_parser_rejects_duplicate_nonfinite_oversized_fifo_and_changed_identity(self):
+        env=self.environment();path=Path(env["GLM53_CT_LUT_QUALITY"])
+        for payload in (b'{"schema":1,"schema":2}',b'{"x":NaN}'):
+            path.write_bytes(payload);env["GLM53_CT_LUT_QUALITY_SHA256"]=hashlib.sha256(payload).hexdigest()
+            with self.assertRaises(ValueError):self.admit(env)
+        path.write_bytes(b"x"*128)
+        with mock.patch.object(lm,"REAL_JSON_LIMIT",64),self.assertRaisesRegex(ValueError,"bounded JSON"):self.admit(env)
+        fifo=self.root/"fifo";os.mkfifo(fifo);env["GLM53_CT_LUT_QUALITY"]=str(fifo)
+        with self.assertRaisesRegex(ValueError,"regular files"):self.admit(env)
+        env=self.environment()
+        with mock.patch.object(lm,"unchanged",side_effect=ValueError("changed during validation")):
+            with self.assertRaisesRegex(ValueError,"changed during"):self.admit(env)
+
+    def test_actual_model_limit_must_match_admission_and_can_differ_from_default(self):
+        report=real_report(self.bank);report["act_limit"]=20
+        settings=self.admit(self.environment(report=report))
+        self.assertEqual(lm.validate_model_act_limit(settings,[SimpleNamespace(act_limit=20)]),20)
+        for modules in ([],iter(()),[SimpleNamespace(act_limit=10)],[SimpleNamespace(act_limit=0)],
+                        [SimpleNamespace(act_limit=float("nan"))],[SimpleNamespace()]):
+            with self.subTest(modules=modules),self.assertRaises(ValueError):lm.validate_model_act_limit(settings,modules)
+
+    def test_quality_cli_reports_admission_without_worker_or_framework_imports(self):
+        env=self.environment()
+        with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch("sys.stdout",new_callable=io.StringIO) as output:
+            self.assertEqual(lm.main(["--admit-quality"]),0)
+        result=json.loads(output.getvalue())
+        self.assertTrue(result["real_quality_admitted"])
+        self.assertIs(result["production_ready"],False)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -240,13 +408,30 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(imported,[])
         env={"GLM53_CT_FORMAT":"lut","GLM53_CT_LUT_MANIFEST":"bank.json","GLM53_CT_LUT_QUALITY":"PASS.json"}
         with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(lm,"load_manifest"),mock.patch.object(builtins,"__import__",side_effect=guarded_import):
-            with self.assertRaisesRegex(RuntimeError,"real-activation quality admission is not implemented"):
+            with self.assertRaisesRegex(ValueError,"owner-approved real i16 report"):
                 exec(compile(source,"serve.import","exec"),dict(namespace))
         self.assertEqual(imported,[])
         with mock.patch.dict(os.environ,{},clear=True),mock.patch.object(lm,"load_manifest",side_effect=AssertionError("trellis read bank")),mock.patch.object(builtins,"__import__",side_effect=guarded_import):
             with self.assertRaisesRegex(AssertionError,"framework import reached"):
                 exec(compile(source,"serve.import","exec"),dict(namespace))
         self.assertEqual(imported,["torch"])
+
+    def test_real_admitted_quality_still_blocks_full_serve_import_before_frameworks(self):
+        source=(ROOT/"glm53"/"serve.py").read_text()
+        original_import=builtins.__import__
+        def guarded_import(name,*args,**kwargs):
+            if name.split(".")[0] in ("torch","exllamav3"):
+                raise AssertionError("framework import reached")
+            return original_import(name,*args,**kwargs)
+        with tempfile.TemporaryDirectory(prefix="real-startup-test-") as directory:
+            bank=lm.BankManifest(Path(directory)/"bank.json","f"*64,public_manifest())
+            quality=Path(directory)/"quality.json";quality.write_text(json.dumps(real_report(bank)))
+            env=dict(GLM53_CT_FORMAT="lut",GLM53_CT_LUT_MANIFEST=str(bank.path),GLM53_CT_LUT_QUALITY=str(quality),
+                     GLM53_CT_LUT_QUALITY_SHA256=hashlib.sha256(quality.read_bytes()).hexdigest())
+            namespace={"__name__":"serve_import_fixture","__file__":str(ROOT/"glm53"/"serve.py")}
+            with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(lm,"load_manifest",return_value=bank),mock.patch.object(builtins,"__import__",side_effect=guarded_import):
+                with self.assertRaisesRegex(RuntimeError,"production LUT coordinator startup is unavailable"):
+                    exec(compile(source,"serve.import","exec"),namespace)
 
     def test_cpu_wrap_and_start_cannot_build_or_allocate_before_admission(self):
         spec=importlib.util.spec_from_file_location("cpu_tier_fixture",ROOT/"glm53"/"cpu_tier.py")

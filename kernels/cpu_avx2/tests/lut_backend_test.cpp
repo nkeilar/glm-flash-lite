@@ -4,16 +4,20 @@
 #include <immintrin.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <linux/mempolicy.h>
 #include <limits>
 #include <map>
 #include <sched.h>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,13 +31,13 @@ lutbench::Format fmt(int type) {
 std::vector<int> cpus() {
     cpu_set_t allowed; CPU_ZERO(&allowed); check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "affinity unavailable");
     std::set<std::pair<int, int>> cores; std::vector<int> result;
-    for (int c = 0; c < CPU_SETSIZE && result.size() < 4; ++c) if (CPU_ISSET(c, &allowed)) {
+    for (int c = 0; c < CPU_SETSIZE && result.size() < 5; ++c) if (CPU_ISSET(c, &allowed)) {
         int pkg = -1, core = -1;
         std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/";
         std::ifstream(base + "physical_package_id") >> pkg; std::ifstream(base + "core_id") >> core;
         if (pkg >= 0 && core >= 0 && cores.insert({pkg, core}).second) result.push_back(c);
     }
-    check(result.size() >= 4, "tests need four distinct allowed physical cores"); return result;
+    check(result.size() >= 5, "tests need five distinct allowed physical cores for asymmetric 2/3 groups"); return result;
 }
 struct Temporary {
     std::string path;
@@ -47,7 +51,7 @@ struct Fixture {
     std::array<std::vector<uint8_t>, 3> packed;
     std::array<size_t, 3> stride{};
     int h = 256, i = 512, experts;
-    Fixture(Temporary& temp, int layer, int count) : experts(count) {
+    Fixture(Temporary& temp, int layer, int count, int width = 256, int intermediate = 512) : h(width), i(intermediate), experts(count) {
         input.model_layer = layer; input.internal_li = layer - 3;
         input.path = temp.name("weights-" + std::to_string(layer));
         std::array<int, 3> types{138, 138, 144};
@@ -71,6 +75,55 @@ struct Fixture {
         for (int m = 0; m < 3; ++m) { file.seekp(std::streamoff(input.tensors[m].offset)); file.write(reinterpret_cast<const char*>(packed[m].data()), std::streamsize(packed[m].size())); }
         file.close(); input.identity = ft_lut::file_identity(input.path);
     }
+    // Test/probe reader only. Production descriptors come from the independent
+    // SHA/GGUF validator; this helper never grants artifact or quality admission.
+    Fixture(const std::string& path, int layer) : h(4096), i(2048), experts(2) {
+        input.model_layer = layer; input.internal_li = layer - 3; input.path = path;
+        input.identity = ft_lut::file_identity(path);
+        std::ifstream file(path, std::ios::binary); check(bool(file), "cannot read probe GGUF");
+        auto take = [&](void* p, size_t n) {
+            check(uint64_t(file.tellg()) <= (64ULL << 20) && n <= (64ULL << 20) - uint64_t(file.tellg()), "probe header exceeds 64 MiB");
+            file.read(static_cast<char*>(p), std::streamsize(n)); check(bool(file), "truncated probe GGUF header");
+        };
+        auto u32 = [&] { uint32_t n; take(&n, 4); return n; };
+        auto u64 = [&] { uint64_t n; take(&n, 8); return n; };
+        auto str = [&] { uint64_t n = u64(); check(n <= 1024, "probe GGUF string too long"); std::string s(size_t(n), '\0'); if (n) take(s.data(), size_t(n)); return s; };
+        auto skip = [&](uint64_t n) { check(n <= (64ULL << 20) && uint64_t(file.tellg()) <= (64ULL << 20) - n, "probe metadata too large"); file.seekg(std::streamoff(n), std::ios::cur); check(bool(file), "invalid probe metadata"); };
+        auto scalar_size = [](uint32_t type) -> unsigned { switch(type) { case 0: case 1: case 7: return 1; case 2: case 3: return 2; case 4: case 5: case 6: return 4; case 10: case 11: case 12: return 8; default: return 0; } };
+        char magic[4]; take(magic, 4); check(std::memcmp(magic, "GGUF", 4) == 0 && u32() == 3, "probe needs little-endian GGUF v3");
+        uint64_t nt = u64(), nk = u64(); check(nt == 3 && nk <= 4096, "invalid probe GGUF descriptor counts");
+        uint32_t alignment = 32; bool architecture = false; std::set<std::string> metadata;
+        for (uint64_t k = 0; k < nk; ++k) {
+            std::string name = str(); uint32_t type = u32(); check(metadata.insert(name).second, "duplicate probe metadata");
+            if (name == "general.architecture") { check(type == 8, "invalid probe architecture type"); architecture = str() == "glm5-next"; }
+            else if (name == "general.alignment") { check(type == 4, "invalid probe alignment type"); alignment = u32(); }
+            else if (scalar_size(type)) skip(scalar_size(type));
+            else if (type == 8) skip(u64());
+            else if (type == 9) { uint32_t item = u32(); uint64_t count = u64(); check(count <= 1000000 && item != 9, "invalid probe metadata array");
+                if (scalar_size(item)) skip(count * scalar_size(item));
+                else { check(item == 8, "unknown probe metadata array type"); for (uint64_t q = 0; q < count; ++q) skip(u64()); }
+            } else throw std::runtime_error("unknown probe metadata type");
+        }
+        check(architecture && alignment && alignment <= 65536 && !(alignment & (alignment - 1)), "probe architecture/alignment mismatch");
+        std::set<int> matrices;
+        for (int t = 0; t < 3; ++t) {
+            std::string name = str(); int m = -1;
+            for (int p = 0; p < 3; ++p) if (name == "blk." + std::to_string(layer) + ".ffn_" + std::string(p == 0 ? "gate" : p == 1 ? "up" : "down") + "_exps.weight") m = p;
+            check(m >= 0 && matrices.insert(m).second && u32() == 3, "invalid probe tensor name/rank");
+            uint64_t width = u64(), rows = u64(), count = u64(); uint32_t type = u32(); uint64_t offset = u64();
+            check(width == uint64_t(m == 2 ? i : h) && rows == uint64_t(m == 2 ? h : i) && count == 2, "probe tensor is not production-width E2");
+            check(type == uint32_t(m == 2 ? (layer == 11 ? 14 : 144) : (layer == 11 ? 144 : 138)), "probe tensor recipe mismatch");
+            stride[m] = lutbench::row_bytes(fmt(int(type)), int(width));
+            input.tensors[m] = {offset, stride[m] * rows * count, int(type), int(width), int(rows), int(count)};
+        }
+        uint64_t data_start = (uint64_t(file.tellg()) + alignment - 1) / alignment * alignment;
+        for (int m = 0; m < 3; ++m) {
+            auto& tensor = input.tensors[m]; check(tensor.offset % alignment == 0 && data_start <= input.identity.size && tensor.offset <= input.identity.size - data_start, "probe tensor offset exceeds file");
+            tensor.offset += data_start; check(tensor.nbytes <= input.identity.size - tensor.offset && tensor.nbytes <= (64ULL << 20), "probe tensor payload exceeds bound");
+            packed[m].resize(size_t(tensor.nbytes)); file.seekg(std::streamoff(tensor.offset)); file.read(reinterpret_cast<char*>(packed[m].data()), std::streamsize(packed[m].size())); check(bool(file), "short probe tensor payload");
+        }
+        check(ft_lut::file_identity(path) == input.identity, "probe input changed while reading");
+    }
     const uint8_t* row(int m, int expert, int r) const {
         return packed[m].data() + (size_t(expert) * (m == 2 ? h : i) + r) * stride[m];
     }
@@ -79,7 +132,7 @@ void dot_m(lutbench::Format f, const void* row, const lutbench::Activation* a, i
     if (m == 3) { lutbench::dot_multi(f, row, a, n, 2, y); lutbench::dot_multi(f, row, a + 2, n, 1, y + 2); }
     else lutbench::dot_multi(f, row, a, n, m, y);
 }
-std::vector<float> reference(const Fixture& fixture, const std::vector<float>& x, const ft_lut::Routes& routes, lutbench::Path path) {
+std::vector<float> reference(const Fixture& fixture, const std::vector<float>& x, const ft_lut::Routes& routes, lutbench::Path path, float limit = 10.f) {
     int m = int(routes.size()); std::vector<float> output(size_t(m) * fixture.h, 0);
     for (int expert = 0; expert < fixture.experts; ++expert) {
         int count = 0, token[4]; float weight[4];
@@ -92,7 +145,7 @@ std::vector<float> reference(const Fixture& fixture, const std::vector<float>& x
             float g[4], u[4];
             dot_m(fmt(fixture.input.tensors[0].type_id), fixture.row(0, expert, r), input.data(), fixture.h, count, g);
             dot_m(fmt(fixture.input.tensors[1].type_id), fixture.row(1, expert, r), input.data(), fixture.h, count, u);
-            for (int t = 0; t < count; ++t) hidden[size_t(t) * fixture.i + r] = std::min(g[t] / (1.f + std::exp(-g[t])), 10.f) * std::max(-10.f, std::min(10.f, u[t]));
+            for (int t = 0; t < count; ++t) hidden[size_t(t) * fixture.i + r] = std::min(g[t] / (1.f + std::exp(-g[t])), limit) * std::max(-limit, std::min(limit, u[t]));
         }
         for (int t = 0; t < count; ++t) lutbench::prepare(path, hidden.data() + size_t(t) * fixture.i, fixture.i, hidden_q[t]);
         for (int r = 0; r < fixture.h; ++r) {
@@ -124,7 +177,7 @@ void layout(ft_lut::Backend& backend, const Fixture& f) {
         }
     }
 }
-void numeric(ft_lut::Backend& backend, const Fixture& f, lutbench::Path path, int& cases, double& worst) {
+void numeric(ft_lut::Backend& backend, const Fixture& f, lutbench::Path path, int& cases, double& worst, float limit = 10.f) {
     for (int m = 1; m <= 4; ++m) for (int k = 0; k <= f.experts; ++k) {
         std::vector<float> x(size_t(m) * f.h);
         for (size_t n = 0; n < x.size(); ++n) x[n] = fp16(.7f * std::sin(float(n + 1) * .071f) + .17f * std::cos(float(n) * .021f));
@@ -136,17 +189,83 @@ void numeric(ft_lut::Backend& backend, const Fixture& f, lutbench::Path path, in
             int expert = (j + t) % f.experts;
             routes[t].push_back({expert, .07f + .013f * float(t + j + 1)});
         }
-        auto expected = reference(f, x, routes, path);
+        auto expected = reference(f, x, routes, path, limit);
         std::vector<float> got(expected.size(), 123.f);
         backend.forward(f.input.internal_li, x.data(), m, routes, got.data());
         double error = relative(got, expected); worst = std::max(worst, error);
         check(error <= 1e-5, "TP2 output differs from canonical packed-weight reference"); ++cases;
     }
 }
+void verify_policy_receipts(const ft_lut::Receipt& receipt) {
+    for (const auto& row : receipt.regions) if (row.preferred_policy)
+        check(row.policy_mode == MPOL_PREFERRED && row.policy_nodes == std::vector<int>{row.node}, "weight policy was not read back exactly");
+    for (const auto& row : receipt.controls) {
+        if (row.preferred_policy) check(row.policy_mode == MPOL_PREFERRED && row.policy_nodes == std::vector<int>{row.node}, "control policy was not read back exactly");
+        for (const auto& policy : row.thread_policies) if (policy.verified)
+            check(policy.mode == MPOL_PREFERRED && policy.nodes == std::vector<int>{policy.node}, "thread policy was not read back exactly");
+    }
+}
+void idle_measure(ft_lut::Backend& backend, const Fixture& f) {
+    using Clock = std::chrono::steady_clock;
+    for (int tokens : {1, 4}) {
+        std::vector<float> x(size_t(tokens) * f.h, .25f), out(x.size());
+        ft_lut::Routes route(tokens); for (auto& token : route) token = {{0, .7f}};
+        std::vector<double> warm, after_idle; auto before = backend.receipt().pool_naps;
+        for (int n = 0; n < 8; ++n) {
+            auto begin = Clock::now(); backend.forward(f.input.internal_li, x.data(), tokens, route, out.data());
+            warm.push_back(std::chrono::duration<double, std::micro>(Clock::now() - begin).count());
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            begin = Clock::now(); backend.forward(f.input.internal_li, x.data(), tokens, route, out.data());
+            after_idle.push_back(std::chrono::duration<double, std::micro>(Clock::now() - begin).count());
+        }
+        auto naps = backend.receipt().pool_naps;
+        check(naps[0] > before[0] && naps[1] > before[1], "idle workers did not enter bounded backoff");
+        std::sort(warm.begin(), warm.end()); std::sort(after_idle.begin(), after_idle.end());
+        std::cout << "IDLE_MEASUREMENT scope=real_loader_smoke H=" << f.h << " I=" << f.i
+                  << " M=" << tokens << " selected_experts=1 samples=8 warm_p50_us=" << warm[4] << " after_20ms_p50_us=" << after_idle[4]
+                  << " warm_max_us=" << warm.back() << " after_20ms_max_us=" << after_idle.back() << '\n';
+    }
+}
+void integers(const std::vector<int>& values) { std::cout << '['; for (size_t n = 0; n < values.size(); ++n) { if (n) std::cout << ','; std::cout << values[n]; } std::cout << ']'; }
+int numa_probe(const std::string& cpu_list, const std::string& directory, const std::string& activation) {
+    ft_lut::Options options; options.activation = activation; options.virtual_tp2 = false;
+    size_t start = 0;
+    while (start < cpu_list.size()) { size_t end = cpu_list.find(',', start); std::string item = cpu_list.substr(start, end - start); size_t used = 0; int cpu = std::stoi(item, &used); check(used == item.size(), "invalid probe CPU list"); options.cpus.push_back(cpu); if (end == std::string::npos) break; start = end + 1; }
+    Fixture ordinary(directory + "/blk.03.experts-0-1.lut.gguf", 3), upgrade(directory + "/blk.11.experts-0-1.lut.gguf", 11);
+    auto backend = ft_lut::Backend::offline_fixture(options);
+    backend->add_layer(ordinary.input); backend->add_layer(upgrade.input);
+    auto receipt = backend->receipt(); verify_policy_receipts(receipt);
+    int cases = 0; double worst = 0;
+    for (const Fixture* f : {&ordinary, &upgrade}) { layout(*backend, *f); numeric(*backend, *f, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst); }
+    std::cout << "{\"scope\":\"physical NUMA small-fixture loader probe; no full bank or real quality admission\",\"placement_verified\":"
+              << (receipt.placement_verified ? "true" : "false") << ",\"cases\":" << cases << ",\"worst_relative_l2\":" << worst << ",\"controls\":[";
+    for (size_t i = 0; i < receipt.controls.size(); ++i) { if (i) std::cout << ','; const auto& c = receipt.controls[i];
+        std::cout << "{\"node\":" << c.node << ",\"verified\":" << (c.preferred_policy ? "true" : "false") << ",\"mode\":" << c.policy_mode << ",\"mask_nodes\":"; integers(c.policy_nodes);
+        std::cout << ",\"policy_errno\":" << c.policy_errno << ",\"query_errno\":" << c.query_errno << ",\"observed_node\":" << c.observed_node << ",\"cpus\":"; integers(c.cpus);
+        std::cout << ",\"threads\":[";
+        for (size_t n = 0; n < c.thread_policies.size(); ++n) { if (n) std::cout << ','; const auto& p = c.thread_policies[n]; std::cout << "{\"cpu\":" << p.cpu << ",\"mode\":" << p.mode << ",\"verified\":" << (p.verified ? "true" : "false") << ",\"errno\":" << p.error << ",\"mask_nodes\":"; integers(p.nodes); std::cout << '}'; }
+        std::cout << "]}";
+    }
+    std::cout << "],\"regions\":[";
+    for (size_t n = 0; n < receipt.regions.size(); ++n) { if (n) std::cout << ','; const auto& r = receipt.regions[n];
+        std::cout << "{\"layer\":" << r.model_layer << ",\"group\":" << r.group << ",\"matrix\":" << r.matrix << ",\"node\":" << r.node << ",\"mode\":" << r.policy_mode << ",\"mask_nodes\":"; integers(r.policy_nodes);
+        std::cout << ",\"verified\":" << (r.preferred_policy ? "true" : "false") << ",\"policy_errno\":" << r.policy_errno << ",\"query_errno\":" << r.query_errno << ",\"sampled_pages\":" << r.sampled_pages << ",\"off_node_pages\":" << r.off_node_pages << ",\"page_errors\":" << r.page_errors << '}';
+    }
+    std::cout << "],\"scratch\":[";
+    for (size_t n = 0; n < receipt.scratch.size(); ++n) { if (n) std::cout << ','; const auto& r = receipt.scratch[n]; std::cout << "{\"node\":" << r.node << ",\"query_errno\":" << r.query_errno << ",\"sampled_pages\":" << r.sampled_pages << ",\"off_node_pages\":" << r.off_node_pages << ",\"page_errors\":" << r.page_errors << '}'; }
+    std::cout << "]}\n";
+    idle_measure(*backend, ordinary);
+    return receipt.placement_verified ? 0 : 2;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string(argv[1]) == "--numa-probe") {
+            check(argc == 5, "usage: --numa-probe CPU_CSV FIXTURE_DIRECTORY i16|q8"); return numa_probe(argv[2], argv[3], argv[4]);
+        }
+        std::string real_directory;
+        if (argc > 1) { check(argc == 3 && std::string(argv[1]) == "--fixtures", "usage: [--fixtures FIXTURE_DIRECTORY]"); real_directory = argv[2]; }
         // Full-bank planning is structural only; these descriptors deliberately
         // name no input files and cannot be treated as verified payload evidence.
         std::vector<ft_lut::LayerInput> bank;
@@ -193,6 +312,9 @@ int main() {
         rejects([&] { ft_lut::check_memory_limit(200, 101, 100); });
         rejects([&] { ft_lut::check_memory_limit(200, 201, 0); });
         Temporary temp; auto workers = cpus();
+        ft_lut::Options rejected_bank; rejected_bank.cpus = workers; rejected_bank.virtual_tp2 = true;
+        rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, bank); });
+        rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, broken); });
         Fixture ordinary(temp, 3, 8), upgrade(temp, 11, 8), down6(temp, 12, 8);
         int cases = 0; double worst = 0;
         for (const std::string activation : {"i16", "q8"}) {
@@ -204,6 +326,8 @@ int main() {
                 numeric(*backend, *fixture, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst);
             }
             auto receipt = backend->receipt();
+            verify_policy_receipts(receipt);
+            check(receipt.workers == std::array<int, 2>{2, 3}, "asymmetric 2/3 groups were not exercised");
             check(receipt.offline_fixture && receipt.virtual_tp2 && !receipt.placement_verified, "virtual geometry claimed NUMA placement");
             check(receipt.regions.size() == 18 && receipt.payload_bytes[0] == receipt.payload_bytes[1] && receipt.staging_peak_bytes <= 64 * 1024 * 1024,
                   "loader receipt geometry or bounded staging is incorrect");
@@ -238,6 +362,33 @@ int main() {
             rejects([&] { backend->forward(0, x.data(), 4, route, out.data()); });
             rejects([&] { backend->forward(0, x.data(), 5, route, out.data()); });
             rejects([&] { backend->add_layer(ordinary.input); });
+            std::fill(x.begin(), x.end(), .25f); std::fill(out.begin(), out.end(), 123.f);
+            backend->fixture_set_timeout(5); backend->inject_delay(0, 1, 30);
+            rejects([&] { backend->forward(0, x.data(), 4, route, out.data()); });
+            check(std::all_of(out.begin(), out.end(), [](float v) { return v == 123.f; }), "timeout published a partial result");
+            check(backend->receipt().timed_out_jobs == 1, "timeout was not recorded");
+            backend->inject_delay(-1, 1, 0); backend->fixture_set_timeout(30000);
+            backend->forward(0, x.data(), 4, route, out.data());
+            check(relative(out, reference(ordinary, x, route, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8)) <= 1e-5, "pool did not drain and recover after timeout");
+            std::atomic<bool> stop_stats{false}; std::thread stats([&] { while (!stop_stats.load()) (void)backend->receipt(); });
+            try { for (int n = 0; n < 100; ++n) backend->forward(0, x.data(), 4, route, out.data()); }
+            catch (...) { stop_stats.store(true); stats.join(); throw; }
+            stop_stats.store(true); stats.join();
+        }
+        Temporary production_temp;
+        std::unique_ptr<Fixture> production = real_directory.empty() ? std::make_unique<Fixture>(production_temp, 3, 1, 4096, 2048) : std::make_unique<Fixture>(real_directory + "/blk.03.experts-0-1.lut.gguf", 3);
+        std::unique_ptr<Fixture> real_upgrade;
+        if (!real_directory.empty()) real_upgrade = std::make_unique<Fixture>(real_directory + "/blk.11.experts-0-1.lut.gguf", 11);
+        // Production-width loading copies every arena before deferred THP
+        // advice. Packed bytes must remain identical; advice proves neither
+        // huge-page promotion nor locality (the latter has separate receipts).
+        for (const std::string activation : {"i16", "q8"}) {
+            ft_lut::Options production_options; production_options.cpus = workers; production_options.virtual_tp2 = true; production_options.activation = activation; production_options.act_limit = 1.5f;
+            auto full_width = ft_lut::Backend::offline_fixture(production_options); full_width->add_layer(production->input);
+            layout(*full_width, *production); numeric(*full_width, *production, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst, 1.5f);
+            check(full_width->receipt().act_limit == 1.5f, "model activation limit not recorded");
+            if (real_upgrade) { full_width->add_layer(real_upgrade->input); layout(*full_width, *real_upgrade); numeric(*full_width, *real_upgrade, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst, 1.5f); }
+            if (activation == "i16") idle_measure(*full_width, *production);
         }
         ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true;
         auto backend = ft_lut::Backend::offline_fixture(options);
@@ -262,9 +413,11 @@ int main() {
         rejects([&] { strict->add_layer(ordinary.input); });
         check(!strict->receipt().placement_verified && strict->receipt().regions.empty(), "rejected placement published a loaded layer");
         options.cpus = {workers[0], workers[0]}; rejects([&] { ft_lut::Backend::offline_fixture(options); });
+        options.cpus = workers;
+        for (float limit : {0.f, -1.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) { options.act_limit = limit; rejects([&] { ft_lut::Backend::offline_fixture(options); }); }
         std::cout << "PASS cases=" << cases << " worst_relative_l2=" << worst
                   << " paths=i16,q8 M=1,2,3,4 K=0..8 profiles=ordinary,upgrade,down6"
-                  << " worker_failures=16 placement_claim=none generation_wrap=covered\n";
+                  << " worker_failures=16 timeouts=2 stats_concurrency=200 groups=2/3 production_width=4096/2048 placement_claim=none generation_wrap=covered\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

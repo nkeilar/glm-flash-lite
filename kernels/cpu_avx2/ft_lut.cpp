@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -25,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 
 namespace ft_lut {
@@ -131,27 +133,53 @@ std::string physical_core(int cpu) {
             bool(std::ifstream(base + "core_id") >> core), "cannot discover physical worker core");
     return package + ":" + core;
 }
-bool preferred(void* ptr, size_t bytes, int node, int& error) {
-    require(node >= 0 && node < 1024, "NUMA node exceeds bounded mask");
-    std::array<unsigned long, 1024 / (8 * sizeof(unsigned long))> mask{};
-    mask[size_t(node) / (8 * sizeof(unsigned long))] |= 1UL << (node % (8 * sizeof(unsigned long)));
-    bool ok = syscall(SYS_mbind, ptr, bytes, MPOL_PREFERRED, mask.data(), node + 1, 0) == 0;
-    error = ok ? 0 : errno;
-    return ok;
+constexpr size_t POLICY_NODES = 1024, WORD_BITS = 8 * sizeof(unsigned long);
+// Linux get_nodes() decrements maxnode before reading the mask. Include the
+// sentinel bit and storage for either syscall's rounded mask length.
+constexpr unsigned long POLICY_MAXNODE = POLICY_NODES + 1;
+using NodeMask = std::array<unsigned long, (POLICY_MAXNODE + WORD_BITS - 1) / WORD_BITS>;
+struct Policy {
+    bool verified = false;
+    int mode = -1, error = 0;
+    NodeMask mask{};
+};
+std::vector<int> policy_nodes(const Policy& policy) {
+    std::vector<int> nodes;
+    for (size_t n = 0; n < POLICY_MAXNODE; ++n)
+        if (policy.mask[n / WORD_BITS] & (1UL << (n % WORD_BITS))) nodes.push_back(int(n));
+    return nodes;
 }
-int thread_preferred(int node) {
+Policy read_policy(int node, void* address, bool by_address) {
+    Policy policy;
+    if (syscall(SYS_get_mempolicy, &policy.mode, policy.mask.data(), POLICY_MAXNODE,
+                address, by_address ? MPOL_F_ADDR : 0) < 0) { policy.error = errno; return policy; }
+    NodeMask wanted{}; wanted[size_t(node) / WORD_BITS] = 1UL << (node % WORD_BITS);
+    policy.verified = policy.mode == MPOL_PREFERRED && policy.mask == wanted;
+    if (!policy.verified) policy.error = EPROTO;
+    return policy;
+}
+Policy preferred(void* ptr, size_t bytes, int node) {
     require(node >= 0 && node < 1024, "NUMA node exceeds bounded mask");
-    std::array<unsigned long, 1024 / (8 * sizeof(unsigned long))> mask{};
-    mask[size_t(node) / (8 * sizeof(unsigned long))] |= 1UL << (node % (8 * sizeof(unsigned long)));
+    NodeMask mask{}; mask[size_t(node) / WORD_BITS] = 1UL << (node % WORD_BITS);
+    if (syscall(SYS_mbind, ptr, bytes, MPOL_PREFERRED, mask.data(), POLICY_MAXNODE, 0) < 0) {
+        Policy policy; policy.error = errno; return policy;
+    }
+    return read_policy(node, ptr, true);
+}
+Policy thread_preferred(int node) {
+    require(node >= 0 && node < 1024, "NUMA node exceeds bounded mask");
+    NodeMask mask{}; mask[size_t(node) / WORD_BITS] = 1UL << (node % WORD_BITS);
     // A preferred policy may fall back. Weight/control placement is measured,
     // and failure is reported rather than converted to strict binding.
-    return syscall(SYS_set_mempolicy, MPOL_PREFERRED, mask.data(), node + 1) == 0 ? 0 : errno;
+    if (syscall(SYS_set_mempolicy, MPOL_PREFERRED, mask.data(), POLICY_MAXNODE) < 0) {
+        Policy policy; policy.error = errno; return policy;
+    }
+    return read_policy(node, nullptr, false);
 }
 struct Arena {
     uint8_t* data = nullptr;
     size_t bytes = 0, mapped = 0;
-    bool policy = false;
-    int policy_errno = 0;
+    Policy policy;
     Arena(size_t n, int node) : bytes(n) {
         const size_t page = size_t(sysconf(_SC_PAGESIZE));
         require(n && n <= std::numeric_limits<size_t>::max() - page, "invalid LUT arena size");
@@ -159,8 +187,23 @@ struct Arena {
         void* pointer = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         require(pointer != MAP_FAILED, "LUT arena mmap failed");
         data = static_cast<uint8_t*>(pointer);
-        policy = preferred(data, mapped, node, policy_errno);
-        madvise(data, mapped, MADV_HUGEPAGE);
+        // First touch uses ordinary pages: preferred THP fault allocation can
+        // fall back to a remote node when local high-order blocks are scarce.
+        // Do not change any global THP setting or impose a strict memory bind.
+        if (madvise(data, mapped, MADV_NOHUGEPAGE) != 0) {
+            munmap(data, mapped); data = nullptr;
+            throw std::runtime_error("cannot establish ordinary-page first touch");
+        }
+        policy = preferred(data, mapped, node);
+    }
+    void hint_after_touch(int node) {
+        // All payload pages have already been touched by their owning workers.
+        // This is only a deferred promotion hint, not a page-size or throughput
+        // promise. No forced collapse/migration is requested. Linux khugepaged
+        // selects collapse nodes from the existing pages; residency is still
+        // measured below rather than inferred from advice or policy success.
+        (void)madvise(data, mapped, MADV_HUGEPAGE);
+        policy = read_policy(node, data, true);
     }
     ~Arena() { if (data) munmap(data, mapped); }
     Arena(const Arena&) = delete;
@@ -181,7 +224,8 @@ struct alignas(64) Control {
     std::atomic<uint64_t> epoch;
     alignas(64) std::atomic<uint64_t> completed;
     alignas(64) std::atomic<unsigned> remaining{0};
-    Barrier barrier;
+    alignas(64) Barrier barrier;
+    alignas(64) std::atomic<uint64_t> naps{0};
     Control(unsigned n, uint64_t initial) : epoch(initial), completed(initial), barrier(n) {}
 };
 class Workers {
@@ -193,17 +237,22 @@ class Workers {
     };
     std::array<Group, 2> groups_;
     std::vector<std::thread> threads_;
-    std::vector<int> group_, local_, cpus_, thread_policy_errors_;
+    std::vector<int> group_, local_, cpus_;
+    std::vector<Policy> thread_policies_;
     std::atomic<unsigned> ready_{0};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> abort_{false};
+    std::atomic<uint64_t> timeouts_{0};
     std::mutex error_mutex_;
     std::exception_ptr error_;
     void (*task_)(void*, int, int, int) = nullptr;
     void* context_ = nullptr;
     uint64_t submitted_;
+    uint64_t timeout_ms_;
 public:
     bool virtual_tp2;
-    explicit Workers(const Options& options) : submitted_(options.initial_generation), virtual_tp2(options.virtual_tp2) {
+    explicit Workers(const Options& options) : submitted_(options.initial_generation), timeout_ms_(options.job_timeout_ms), virtual_tp2(options.virtual_tp2) {
+        set_timeout(options.job_timeout_ms);
         require(options.cpus.size() >= 2 && options.cpus.size() <= 128, "LUT needs at least two bounded worker CPUs");
         cpu_set_t allowed; CPU_ZERO(&allowed);
         require(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "cannot read allowed worker CPUs");
@@ -226,7 +275,7 @@ public:
             group_.push_back(g); local_.push_back(groups_[g].count++);
         }
         require(labels.size() == 2 && groups_[0].count && groups_[1].count, "LUT requires exactly two nonempty worker groups");
-        cpus_ = options.cpus; thread_policy_errors_.resize(cpus_.size());
+        cpus_ = options.cpus; thread_policies_.resize(cpus_.size());
         for (auto& group : groups_) group.arena = std::make_unique<Arena>(sizeof(Control), group.node);
         try {
             for (size_t i = 0; i < options.cpus.size(); ++i) threads_.emplace_back([this, i, cpu = options.cpus[i], initial = options.initial_generation] {
@@ -234,7 +283,7 @@ public:
                 try {
                     cpu_set_t affinity; CPU_ZERO(&affinity); CPU_SET(cpu, &affinity);
                     require(pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity) == 0, "LUT worker affinity failed");
-                    thread_policy_errors_[i] = thread_preferred(group.node);
+                    thread_policies_[i] = thread_preferred(group.node);
                 } catch (...) { capture_error(); }
                 if (local_[i] == 0) {
                     group.control = new(group.arena->data) Control(unsigned(group.count), initial);
@@ -244,7 +293,18 @@ public:
                 if (stop_.load(std::memory_order_relaxed)) return;
                 uint64_t seen = initial;
                 while (true) {
-                    while (group.control->epoch.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed)) _mm_pause();
+                    unsigned polls = 0;
+                    const auto spin_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+                    bool napping = false;
+                    while (group.control->epoch.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed)) {
+                        if (!napping) {
+                            _mm_pause();
+                            if ((++polls & 255U) == 0) napping = std::chrono::steady_clock::now() >= spin_end;
+                        } else {
+                            group.control->naps.fetch_add(1, std::memory_order_relaxed);
+                            std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        }
+                    }
                     if (stop_.load(std::memory_order_relaxed)) return;
                     seen = group.control->epoch.load(std::memory_order_relaxed);
                     try { task_(context_, group_[i], local_[i], group.count); } catch (...) { capture_error(); }
@@ -260,14 +320,29 @@ public:
     void capture_error() { std::lock_guard<std::mutex> lock(error_mutex_); if (!error_) error_ = std::current_exception(); }
     void rethrow() { std::exception_ptr error; { std::lock_guard<std::mutex> lock(error_mutex_); error = error_; error_ = nullptr; } if (error) std::rethrow_exception(error); }
     void run(void (*fn)(void*, int, int, int), void* context) {
+        abort_.store(false, std::memory_order_release);
         task_ = fn; context_ = context; ++submitted_;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
         for (auto& g : groups_) {
             g.control->remaining.store(unsigned(g.count), std::memory_order_relaxed);
             g.control->epoch.store(submitted_, std::memory_order_release);
         }
-        for (auto& g : groups_) while (g.control->completed.load(std::memory_order_acquire) != submitted_) _mm_pause();
+        bool expired = false; unsigned polls = 0;
+        for (auto& g : groups_) while (g.control->completed.load(std::memory_order_acquire) != submitted_) {
+            if (!expired && (++polls & 255U) == 0 && (stop_.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= deadline)) {
+                expired = true; abort_.store(true, std::memory_order_release);
+            }
+            _mm_pause();
+        }
+        // Contexts and buffers remain owned by the caller until BOTH groups have
+        // drained. Never detach a worker or return while it can reference them.
+        if (expired) { timeouts_.fetch_add(1, std::memory_order_relaxed); rethrow(); throw std::runtime_error("LUT job deadline expired; both pools drained"); }
         rethrow();
     }
+    void set_timeout(uint64_t milliseconds) { require(milliseconds >= 1 && milliseconds <= 3600000, "LUT job timeout must be 1..3600000 milliseconds"); timeout_ms_ = milliseconds; }
+    bool aborted() const { return abort_.load(std::memory_order_acquire); }
+    uint64_t timeouts() const { return timeouts_.load(std::memory_order_relaxed); }
+    std::array<uint64_t, 2> naps() const { return {groups_[0].control->naps.load(std::memory_order_relaxed), groups_[1].control->naps.load(std::memory_order_relaxed)}; }
     void barrier(int g) { groups_[g].control->barrier.wait(); }
     int node(int g) const { return groups_[g].node; }
     int count(int g) const { return groups_[g].count; }
@@ -275,10 +350,13 @@ public:
         std::vector<ControlReceipt> result;
         for (int index = 0; index < 2; ++index) {
             const auto& g = groups_[index]; ControlReceipt receipt;
-            receipt.group = index; receipt.node = g.node; receipt.preferred_policy = g.arena->policy; receipt.policy_errno = g.arena->policy_errno;
+            receipt.group = index; receipt.node = g.node; receipt.preferred_policy = g.arena->policy.verified; receipt.policy_errno = g.arena->policy.error;
+            receipt.policy_mode = g.arena->policy.mode; receipt.policy_nodes = policy_nodes(g.arena->policy);
             for (size_t id = 0; id < cpus_.size(); ++id) if (group_[id] == index) {
                 receipt.cpus.push_back(cpus_[id]);
-                receipt.worker_policy_failures += thread_policy_errors_[id] != 0;
+                const auto& policy = thread_policies_[id];
+                receipt.worker_policy_failures += !policy.verified;
+                receipt.thread_policies.push_back({cpus_[id], g.node, policy.mode, policy.error, policy.verified, policy_nodes(policy)});
                 if (!local_[id]) receipt.owner_cpu = cpus_[id];
             }
             void* address = g.arena->data;
@@ -373,7 +451,7 @@ FileIdentity file_identity(const std::string& path) { File f(path); return ident
 struct Backend::Impl {
     Options options;
     Path path;
-    mutable std::mutex mutex;
+    mutable std::mutex mutex, report_mutex;
     std::map<int, std::unique_ptr<Layer>> layers;
     std::array<Scratch, 2> scratch;
     Receipt report;
@@ -382,6 +460,8 @@ struct Backend::Impl {
     std::mutex failure_mutex;
     std::exception_ptr failure;
     int injected_phase = -1, injected_group = -1;
+    int delayed_phase = -1, delayed_group = -1;
+    unsigned delay_ms = 0;
     Layer* active = nullptr;
     const float* x = nullptr;
     int ntok = 0, njobs = 0;
@@ -389,8 +469,8 @@ struct Backend::Impl {
     std::array<uint64_t, 2> pending_mapped{};
     explicit Impl(const Options& o, bool fixture) : options(o), path(o.activation == "i16" ? Path::I16 : Path::Q8), workers(o) {
         require(o.activation == "i16" || o.activation == "q8", "LUT activation must be i16 or q8");
-        require(o.act_limit == 10.0f, "LUT SwiGLU limit must match the reviewed model limit");
-        report.activation = o.activation; report.virtual_tp2 = o.virtual_tp2;
+        require(std::isfinite(o.act_limit) && o.act_limit > 0, "LUT SwiGLU limit must be finite and positive");
+        report.activation = o.activation; report.act_limit = o.act_limit; report.virtual_tp2 = o.virtual_tp2;
         report.offline_fixture = fixture;
         report.controls = workers.controls();
         for (int g = 0; g < 2; ++g) { report.nodes[g] = workers.node(g); report.workers[g] = workers.count(g); }
@@ -402,8 +482,10 @@ struct Backend::Impl {
     }
     template<class F> void phase(int number, int group, int local, F fn) noexcept {
         try {
+            if (number == delayed_phase && group == delayed_group && local == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             if (number == injected_phase && group == injected_group && local == 0) throw std::runtime_error("injected offline LUT worker failure");
-            if (!failed.load(std::memory_order_acquire)) fn();
+            if (!failed.load(std::memory_order_acquire) && !workers.aborted()) fn();
         } catch (...) {
             std::lock_guard<std::mutex> lock(failure_mutex);
             if (!failure) failure = std::current_exception();
@@ -430,6 +512,7 @@ struct Backend::Impl {
             }
             const int blocks = l.h / block;
             for (int task = local; task < count * blocks; task += nworkers) {
+                if (self.workers.aborted()) break;
                 auto in = inputs[task / blocks]; int begin = (task % blocks) * block;
                 lutbench::prepare_range(self.path, in.source, l.h, begin, begin + block, *in.destination);
             }
@@ -437,6 +520,7 @@ struct Backend::Impl {
         self.workers.barrier(group);
         self.phase(1, group, local, [&] {
             for (int task = local; task < self.njobs * half; task += nworkers) {
+                if (self.workers.aborted()) break;
                 int j = task / half, r = task % half; const Job& job = self.jobs[j];
                 const Activation* input = &s.input[job.tokens[0]];
                 if (job.m >= 2 && job.tokens[1] != job.tokens[0] + 1) input = s.pairs[pair_index(job.tokens[0], job.tokens[1])].data();
@@ -461,6 +545,7 @@ struct Backend::Impl {
         self.phase(2, group, local, [&] {
             const int blocks = half / block;
             for (int task = local; task < self.njobs * 4 * blocks; task += nworkers) {
+                if (self.workers.aborted()) break;
                 int b = task % blocks, slot = task / blocks, j = slot / 4, t = slot % 4;
                 if (t >= self.jobs[j].m) continue;
                 lutbench::prepare_range(self.path, s.hidden.data() + size_t(slot) * half, half, b * block, (b + 1) * block, s.hidden_q[j][t]);
@@ -469,6 +554,7 @@ struct Backend::Impl {
         self.workers.barrier(group);
         self.phase(3, group, local, [&] {
             for (int r = local; r < l.h; r += nworkers) {
+                if (self.workers.aborted()) break;
                 for (int t = 0; t < self.ntok; ++t) s.partial[size_t(t) * l.h + r] = 0;
                 for (int j = 0; j < self.njobs; ++j) {
                     const Job& job = self.jobs[j]; float values[4];
@@ -554,6 +640,7 @@ Backend::~Backend() = default;
 
 void Backend::add_layer(const LayerInput& in) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::mutex> report_lock(impl_->report_mutex);
     require(in.model_layer >= 3 && in.model_layer <= 44 && in.internal_li == in.model_layer - 3, "LUT model/internal layer mapping mismatch");
     require(!impl_->layers.count(in.internal_li), "LUT layer already loaded");
     int h = in.tensors[0].width, i = in.tensors[0].rows, e = in.tensors[0].experts;
@@ -601,7 +688,7 @@ void Backend::add_layer(const LayerInput& in) {
             auto& node = layer->nodes[g]; node.strides[m] = lutbench::row_bytes(layer->formats[m], m == 2 ? i / 2 : h);
             node.expert_bytes[m] = mul(node.strides[m], size_t(m == 2 ? h : i / 2));
             node.arenas[m] = std::make_unique<Arena>(mul(node.expert_bytes[m], size_t(e)), impl_->workers.node(g));
-            require(impl_->report.offline_fixture || node.arenas[m]->policy, "full LUT bank preferred placement policy unavailable");
+            require(impl_->report.offline_fixture || node.arenas[m]->policy.verified, "full LUT bank preferred placement policy unavailable or read-back mismatch");
         }
     }
     struct Copy {
@@ -634,12 +721,17 @@ void Backend::add_layer(const LayerInput& in) {
         }
     }
     require(identity(file.fd) == in.identity && file_identity(in.path) == in.identity, "LUT source/path changed while streaming rows");
+    for (int g = 0; g < 2; ++g) for (int m = 0; m < 3; ++m)
+        layer->nodes[g].arenas[m]->hint_after_touch(impl_->workers.node(g));
+    // Policy read-back and move_pages sampling occur after the hint. A preferred
+    // policy permits fallback; only the observed samples can verify locality.
     for (int g = 0; g < 2; ++g) for (int m = 0; m < 3; ++m) {
         const auto& node = layer->nodes[g]; const auto& arena = *node.arenas[m];
         RegionReceipt receipt;
         receipt.model_layer = in.model_layer; receipt.group = g; receipt.node = impl_->workers.node(g); receipt.matrix = m;
         receipt.payload_bytes = arena.bytes; receipt.mapped_bytes = arena.mapped;
-        receipt.preferred_policy = arena.policy; receipt.policy_errno = arena.policy_errno;
+        receipt.preferred_policy = arena.policy.verified; receipt.policy_errno = arena.policy.error;
+        receipt.policy_mode = arena.policy.mode; receipt.policy_nodes = policy_nodes(arena.policy);
         std::vector<void*> addresses;
         const size_t page = size_t(sysconf(_SC_PAGESIZE));
         for (int expert = 0; expert < e; ++expert) for (int sample = 0; sample < 4; ++sample) {
@@ -727,11 +819,25 @@ void Backend::forward(int li, const float* x, int ntok, const Routes& routes, fl
     for (int n = 0; n < ntok * layer.h; ++n) output[n] = impl_->scratch[0].partial[n] + impl_->scratch[1].partial[n];
 }
 
-Receipt Backend::receipt() const { std::lock_guard<std::mutex> lock(impl_->mutex); return impl_->report; }
+Receipt Backend::receipt() const {
+    std::lock_guard<std::mutex> lock(impl_->report_mutex);
+    Receipt report = impl_->report; report.pool_naps = impl_->workers.naps(); report.timed_out_jobs = impl_->workers.timeouts(); return report;
+}
 void Backend::inject_failure(int phase, int group) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     require(impl_->report.offline_fixture && phase >= -1 && phase <= 3 && group >= 0 && group < 2, "invalid fixture failure phase");
     impl_->injected_phase = phase; impl_->injected_group = group;
+}
+void Backend::inject_delay(int phase, int group, unsigned milliseconds) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->report.offline_fixture && phase >= -1 && phase <= 3 && group >= 0 && group < 2 && milliseconds <= 10000,
+            "invalid fixture delay");
+    impl_->delayed_phase = phase; impl_->delayed_group = group; impl_->delay_ms = milliseconds;
+}
+void Backend::fixture_set_timeout(uint64_t milliseconds) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->report.offline_fixture, "timeout override is an offline fixture API only");
+    impl_->workers.set_timeout(milliseconds);
 }
 std::vector<uint8_t> Backend::fixture_slice(int li, int group, int expert, int matrix) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);

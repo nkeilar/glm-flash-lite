@@ -75,10 +75,23 @@ class TorchExtensionTests(unittest.TestCase):
         for mode in ('lut','lut_exact'):
             module = self.modules[mode]
             with self.subTest(mode=mode):
-                module.tier_init_lut_fixture(selected, 'i16', 256, 512, 2, True)
+                for bad_limit in (0.0, -1.0, float('nan'), float('inf')):
+                    with self.assertRaisesRegex(RuntimeError, 'activation limit'):
+                        module.tier_init_lut_fixture(selected, 'i16', 256, 512, 2, True, bad_limit)
+                module.tier_init_lut_fixture(selected, 'i16', 256, 512, 2, True, act_limit=20.0)
                 try:
                     stats = module.tier_lut_fixture_stats()
                     self.assertEqual(stats['swz_bytes'], 0)
+                    self.assertEqual(stats['act_limit'], 20.0)
+                    self.assertEqual(len(stats['pool_naps']), 2)
+                    self.assertEqual(stats['timed_out_jobs'], 0)
+                    self.assertEqual(len(stats['controls']), 2)
+                    for control in stats['controls']:
+                        self.assertIn('policy_mode', control)
+                        self.assertIn('policy_nodes', control)
+                        self.assertEqual(len(control['thread_policies']), len(control['cpus']))
+                        for policy in control['thread_policies']:
+                            self.assertEqual(set(policy), {'cpu','node','mode','error','verified','nodes'})
                     self.assertIs(stats['virtual_tp2'], True)
                     self.assertIs(stats['placement_verified'], False)
                     with self.assertRaisesRegex(RuntimeError, 'startup is unavailable'):
@@ -88,6 +101,11 @@ class TorchExtensionTests(unittest.TestCase):
                     weights = torch.empty((1,0), dtype=torch.float32, device='cpu')
                     with self.assertRaises(RuntimeError):
                         module.tier_forward(0, x, selection, weights, -1)
+                finally:
+                    module.tier_lut_fixture_reset()
+                module.tier_init_lut_fixture(selected, 'i16', 256, 512, 2, True)
+                try:
+                    self.assertEqual(module.tier_lut_fixture_stats()['act_limit'], 10.0)
                 finally:
                     module.tier_lut_fixture_reset()
         self.assertFalse(vars(torch.cuda).get('_initialized'))

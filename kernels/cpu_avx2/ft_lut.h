@@ -34,13 +34,23 @@ struct RegionReceipt {
     uint64_t payload_bytes = 0, mapped_bytes = 0;
     bool preferred_policy = false;
     int policy_errno = 0, query_errno = 0;
+    int policy_mode = -1;
+    std::vector<int> policy_nodes;
     uint64_t sampled_pages = 0, off_node_pages = 0, page_errors = 0;
+};
+struct ThreadPolicyReceipt {
+    int cpu = -1, node = -1, mode = -1, error = 0;
+    bool verified = false;
+    std::vector<int> nodes;
 };
 struct ControlReceipt {
     int group = -1, node = -1, owner_cpu = -1, query_errno = 0, observed_node = -1;
     bool preferred_policy = false;
     int policy_errno = 0, worker_policy_failures = 0;
+    int policy_mode = -1;
+    std::vector<int> policy_nodes;
     std::vector<int> cpus;
+    std::vector<ThreadPolicyReceipt> thread_policies;
 };
 struct ScratchReceipt {
     int group = -1, node = -1, query_errno = 0;
@@ -50,10 +60,13 @@ struct Receipt {
     bool offline_fixture = true, virtual_tp2 = false, placement_verified = false;
     bool bank_complete = false;
     std::string activation;
+    float act_limit = 10.0f;
     std::array<int, 2> nodes{}, workers{};
     std::array<uint64_t, 2> payload_bytes{}, mapped_bytes{};
     std::array<uint64_t, 2> scratch_bytes{};
     uint64_t staging_peak_bytes = 0;
+    std::array<uint64_t, 2> pool_naps{};
+    uint64_t timed_out_jobs = 0;
     std::vector<ControlReceipt> controls;
     std::vector<ScratchReceipt> scratch;
     std::vector<RegionReceipt> regions;
@@ -64,6 +77,10 @@ struct Options {
     bool virtual_tp2 = false; // explicit offline geometry test, never NUMA evidence
     bool require_verified_placement = false;
     float act_limit = 10.0f;
+    // Cooperative deadline: abort further phase work, then drain both pools
+    // before returning an error. A permanently stuck thread requires external
+    // process supervision; its referenced storage must never be freed early.
+    uint64_t job_timeout_ms = 30000;
     uint64_t initial_generation = 0; // offline wrap/reuse tests
 };
 struct BankPlan {
@@ -98,6 +115,8 @@ public:
     Receipt receipt() const;
     // Fixture-only controls: error propagation and exact packed-layout checks.
     void inject_failure(int phase, int group = 1);
+    void inject_delay(int phase, int group, unsigned milliseconds);
+    void fixture_set_timeout(uint64_t milliseconds);
     std::vector<uint8_t> fixture_slice(int internal_li, int group, int expert, int matrix) const;
 private:
     struct Impl;

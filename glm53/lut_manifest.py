@@ -1,8 +1,8 @@
-"""Offline LUT bank validation and a deliberately closed serving admission gate.
+"""LUT bank validation and SHA-bound real-activation quality admission.
 
-The public bank manifest records conversion provenance. Its PROXY-PASS permits
-conversion only. Server startup remains disabled until reviewed real-activation
-quality admission is implemented. This module imports neither Torch nor CUDA.
+PROXY-PASS authorizes conversion only. Owner-approved real reports may admit
+quality; production coordinator startup remains unavailable. No Torch or CUDA
+is imported by this module.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import stat
+import statistics
 import struct
 
 SOURCE_REVISION = "a38483c8cd5df544f53d70fb281afe97369d5ab6"
@@ -31,10 +32,11 @@ OFFSET_CONVENTION = "tensor offset is relative to artifact.data_start; row_strid
 # ggml type id: (name, values per block, bytes per block, extra bytes per row).
 TYPES = {138: ("IQ3_K", 256, 110, 0), 144: ("IQ4_KS", 256, 136, 4), 14: ("Q6_K", 256, 210, 0)}
 SCALAR_BYTES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+REAL_JSON_LIMIT = 32 * 2**20
+REAL_PROTOCOL = "real-routed-activations/v1"
 REAL_ADMISSION_MESSAGE = (
-    "LUT server startup is disabled: reviewed real-activation quality admission "
-    "is not implemented. PROXY-PASS authorizes conversion only; "
-    "GLM53_CT_LUT_QUALITY cannot enable startup."
+    "Real LUT quality is admitted, but production LUT coordinator startup is unavailable; "
+    "restore the default trellis path until production integration is reviewed."
 )
 
 
@@ -88,7 +90,7 @@ def open_regular(path):
 
 def unchanged(path, stream, before):
     require(identity(os.fstat(stream.fileno())) == before and
-            identity(Path(path).stat(follow_symlinks=False)) == before,
+            identity(no_symlinks(path).stat(follow_symlinks=False)) == before,
             "manifest or artifact changed during validation")
 
 
@@ -197,14 +199,20 @@ class BankManifest:
     value: dict
 
 
-def load_manifest(path, check_files=True):
+def read_json(path, limit, label):
     path = no_symlinks(path)
     with open_regular(path) as (stream, before):
-        payload = stream.read(JSON_LIMIT + 1)
-        require(len(payload) <= JSON_LIMIT, "public manifest exceeds bounded JSON size")
+        payload = stream.read(limit + 1)
+        require(len(payload) <= limit, f"{label} exceeds bounded JSON size")
         value = json.loads(payload, object_pairs_hook=unique_pairs, parse_constant=finite_constant)
-        validate_structure(value)
         unchanged(path, stream, before)
+    return value, hashlib.sha256(payload).hexdigest()
+
+
+def load_manifest(path, check_files=True):
+    path = no_symlinks(path)
+    value, sha256 = read_json(path, JSON_LIMIT, "public manifest")
+    validate_structure(value)
     if check_files:
         for row in value["layers"]:
             artifact = row["artifact"]
@@ -212,7 +220,7 @@ def load_manifest(path, check_files=True):
             st = file.stat(follow_symlinks=False)
             require(stat.S_ISREG(st.st_mode) and st.st_size == artifact["bytes"],
                     f"artifact missing, nonregular or wrong size: {artifact['path']}")
-    return BankManifest(path=path, sha256=hashlib.sha256(payload).hexdigest(), value=value)
+    return BankManifest(path=path, sha256=sha256, value=value)
 
 
 def read_gguf_header(stream, size):
@@ -335,12 +343,177 @@ def verify_bank(path, tick=lambda: None):
                 layers=descriptors)
 
 
+def json_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def real_number(value, label, positive=False):
+    require(type(value) in (int, float), f"invalid real number: {label}")
+    try:
+        valid = math.isfinite(value) and (value > 0 if positive else value >= 0)
+    except OverflowError:
+        valid = False
+    require(valid, f"nonfinite or out-of-range real number: {label}")
+    return value
+
+
+def quality_metrics(values):
+    means = [statistics.mean(errors) for errors, count in values]
+    result = dict(median_expert_nmse=statistics.median(means),
+                  routing_frequency_weighted_mean_nmse=math.fsum(mean * count for mean, (_, count) in zip(means, values)) /
+                  sum(count for _, count in values))
+    for key, value in result.items():
+        real_number(value, key)
+    return result
+
+
+def compare_metrics(ours, unsloth):
+    return all(ours[key] <= unsloth[key] for key in ours)
+
+
+def check_reported_metrics(saved, expected):
+    keys(saved, expected, "quality metrics")
+    for key, value in expected.items():
+        got = real_number(saved[key], key)
+        require(math.isclose(got, value, rel_tol=1e-12, abs_tol=1e-15), "reported quality metrics differ from raw errors")
+
+
+def validate_real_report(value, bank, activation):
+    """Recompute real gates; an operator-approved file SHA supplies acceptance."""
+    keys(value, ("schema", "state", "complete", "real_pass", "synthetic", "activation", "batch", "act_limit",
+                 "tp2", "binding", "binding_sha256", "layers", "aggregate"), "real quality report")
+    require(value["schema"] == "e1-real-quality/v1" and value["state"] == "REAL-PASS" and
+            value["complete"] is True and value["real_pass"] is True and value["synthetic"] is False,
+            "complete REAL-PASS required; proxy and synthetic results cannot admit quality")
+    require(value["activation"] == activation and activation in ("i16", "q8"), "real quality activation mismatch")
+    require(integer(value["batch"], "real replay batch", 1, 4) in (1, 2, 4), "unsupported real replay batch")
+    real_number(value["act_limit"], "model activation limit", positive=True)
+    require(value["tp2"] == "split-intermediate-gate-up/down-columns-before-quantization", "real replay TP2 protocol mismatch")
+    binding = value["binding"]
+    keys(binding, ("protocol", "bank_manifest_sha256", "source_revision", "imatrix_sha256", "capture_manifest_sha256",
+                   "capture", "replay", "layers"), "real quality binding")
+    require(digest(value["binding_sha256"], "quality binding") == json_digest(binding), "real quality binding SHA256 mismatch")
+    require(binding["protocol"] == REAL_PROTOCOL and binding["source_revision"] == SOURCE_REVISION and
+            binding["imatrix_sha256"] == IMATRIX_SHA256, "real quality source/imatrix/protocol mismatch")
+    require(digest(binding["bank_manifest_sha256"], "quality bank manifest") == bank.sha256,
+            "real quality report belongs to another bank manifest")
+    digest(binding["capture_manifest_sha256"], "capture manifest")
+    capture = binding["capture"]
+    capture_hashes = ("model_ledger_sha256", "runtime_ledger_sha256", "corpus_sha256", "stats_sha256", "inputs_sha256",
+                      "routes_sha256", "trajectories_sha256")
+    keys(capture, ("model_revision", "serving_revision", "exllamav3_version", *capture_hashes), "real capture provenance")
+    require(capture["model_revision"] == "332ab457b709b7ba30dd9a448be5de03b80a7ac9" and
+            capture["exllamav3_version"] == "1.5.1", "real capture model/runtime revision mismatch")
+    require(isinstance(capture["serving_revision"], str) and len(capture["serving_revision"]) == 40 and
+            all(c in "0123456789abcdef" for c in capture["serving_revision"]), "invalid capture serving revision")
+    for key in capture_hashes:
+        digest(capture[key], key)
+    replay = binding["replay"]
+    replay_hashes = ("library_sha256", "build_receipt_sha256", "quality_checkpoint_sha256", "quality_replay_sha256",
+                     "gguf_sha256", "maintenance_guard_sha256", "kernels_cpp_sha256", "kernels_h_sha256")
+    keys(replay, (*replay_hashes, "codec_revision"), "real replay provenance")
+    for key in replay_hashes:
+        digest(replay[key], key)
+    require(replay["codec_revision"] == "d1b493379387518d20c7bc89dab0ec1ce320f811" and
+            replay["kernels_cpp_sha256"] == "3daf262cf111df1f2ac04fea05840b147e7efdcd0a7bae4666ecfb6f15362244" and
+            replay["kernels_h_sha256"] == "dabec85fd112d544536856e04dc3c722495dd20749c91754cacdd58d9b506669",
+            "real replay codec provenance mismatch")
+    keys(binding["layers"], ("3", "11"), "real weight bindings")
+    by_layer = {row["layer"]: row for row in bank.value["layers"]}
+    for layer in (3, 11):
+        weights = binding["layers"][str(layer)]
+        keys(weights, ("q8_sha256", "ours_sha256", "unsloth_sha256"), "real weight binding")
+        for key in weights:
+            digest(weights[key], key)
+        require(weights["ours_sha256"] == by_layer[layer]["artifact"]["sha256"], "real replay LUT weight hash differs from bank")
+    keys(value["layers"], ("3", "11"), "real quality layers")
+    pooled = {"ours": [], "unsloth": []}
+    coverage_identity = None
+    for layer in ("3", "11"):
+        row = value["layers"][layer]
+        keys(row, ("coverage", "experts", "ours", "unsloth", "pass", "tp2_full_down_max_relative_l2"), "real quality layer")
+        drift = row["tp2_full_down_max_relative_l2"]
+        keys(drift, ("ours", "unsloth"), "real TP2/full-down drift")
+        for arm, error in drift.items():
+            require(real_number(error, "real TP2/full-down drift") <= 1e-5, "real TP2/full-down drift exceeds 1e-5")
+        coverage = row["coverage"]
+        keys(coverage, ("tokens", "prompts", "classes", "experts", "route_occurrences"), "real sample coverage")
+        tokens = integer(coverage["tokens"], "decode tokens", 128, 65536)
+        prompts = integer(coverage["prompts"], "capture prompts", 4, tokens // 16)
+        experts = integer(coverage["experts"], "routed experts", 32, 288)
+        require(integer(coverage["route_occurrences"], "route occurrences") == 8 * tokens, "real top-8 route count mismatch")
+        classes = coverage["classes"]
+        require(isinstance(classes, list) and 3 <= len(classes) <= 32 and
+                all(isinstance(item, str) and 0 < len(item) <= 64 for item in classes) and len(set(classes)) == len(classes) and
+                {"prose", "code", "firmware"} <= set(classes), "real capture prompt classes missing or malformed")
+        current_identity = (tokens, prompts, sorted(classes))
+        require(coverage_identity is None or coverage_identity == current_identity, "real layer capture coverage differs")
+        coverage_identity = current_identity
+        records = row["experts"]
+        require(isinstance(records, list) and len(records) == experts, "real routed expert coverage mismatch")
+        seen, total, samples = set(), 0, {"ours": [], "unsloth": []}
+        for record in records:
+            keys(record, ("expert", "routing_count", "ours_sample_errors", "unsloth_sample_errors"), "real expert error record")
+            expert = integer(record["expert"], "real routed expert", 0, 287)
+            require(expert not in seen, "duplicate real expert error record")
+            seen.add(expert)
+            count = integer(record["routing_count"], "real expert routing count", 1, tokens)
+            total += count
+            for arm in samples:
+                errors = record[arm + "_sample_errors"]
+                require(isinstance(errors, list) and len(errors) == count, "raw real errors/routing count mismatch")
+                for error in errors:
+                    real_number(error, "raw real sample error")
+                samples[arm].append((errors, count))
+        require(total == 8 * tokens, "expert routing counts differ from captured top-8 occurrences")
+        expected = {arm: quality_metrics(records) for arm, records in samples.items()}
+        for arm in samples:
+            check_reported_metrics(row[arm], expected[arm])
+            pooled[arm].extend(samples[arm])
+        passed = compare_metrics(expected["ours"], expected["unsloth"])
+        require(row["pass"] is passed and passed, "real per-layer quality gate failed")
+    expected = {arm: quality_metrics(records) for arm, records in pooled.items()}
+    aggregate = value["aggregate"]
+    keys(aggregate, ("ours", "unsloth", "pass"), "real aggregate")
+    for arm in expected:
+        check_reported_metrics(aggregate[arm], expected[arm])
+    passed = compare_metrics(expected["ours"], expected["unsloth"])
+    require(aggregate["pass"] is passed and passed, "real pooled quality gate failed")
+    return value
+
+
+def load_real_report(path, expected_sha256, bank, activation):
+    require(path is not None, f"owner-approved real {activation} report path is required")
+    digest(expected_sha256, f"owner-approved real {activation} report")
+    value, actual = read_json(path, REAL_JSON_LIMIT, "real quality report")
+    require(actual == expected_sha256, "real quality report does not match the owner-approved SHA256")
+    validate_real_report(value, bank, activation)
+    return value
+
+
+def validate_model_act_limit(settings, modules):
+    """Future production initialization must match the actual model to admission."""
+    require(settings.format == "lut" and settings.admission is not None, "real LUT admission required")
+    expected = settings.admission["act_limit"]
+    modules = tuple(modules)
+    require(bool(modules), "model MoE modules required for activation-limit validation")
+    for module in modules:
+        actual = getattr(module, "act_limit", None)
+        real_number(actual, "actual model activation limit", positive=True)
+        require(actual == expected, "actual model activation limit differs from real quality admission")
+    return expected
+
+
 @dataclass(frozen=True)
 class TierSettings:
     format: str
     activation: str
     manifest: Path | None
     quality: Path | None
+    quality_sha256: str | None = None
+    q8_quality: Path | None = None
+    q8_quality_sha256: str | None = None
+    admission: dict | None = None
 
 
 def parse_env(environ=None):
@@ -350,23 +523,49 @@ def parse_env(environ=None):
     require(activation in ("i16", "q8"), "GLM53_CT_LUT_ACT must be i16 or q8")
     manifest, quality = env.get("GLM53_CT_LUT_MANIFEST"), env.get("GLM53_CT_LUT_QUALITY")
     require(fmt != "lut" or bool(manifest), "GLM53_CT_LUT_MANIFEST is required for LUT format")
-    return TierSettings(fmt, activation, Path(manifest) if manifest else None, Path(quality) if quality else None)
+    q8_quality = env.get("GLM53_CT_LUT_Q8_QUALITY")
+    return TierSettings(fmt, activation, Path(manifest) if manifest else None, Path(quality) if quality else None,
+                        env.get("GLM53_CT_LUT_QUALITY_SHA256"), Path(q8_quality) if q8_quality else None,
+                        env.get("GLM53_CT_LUT_Q8_QUALITY_SHA256"))
 
 
-def preflight(environ=None):
-    """Run before model allocation, extension builds, or worker startup."""
+def preflight(environ=None, *, require_production=True):
+    """Check quality before allocations; production startup remains blocked."""
     settings = parse_env(environ)
     if settings.format == "trellis":
         return settings
-    load_manifest(settings.manifest)  # Structure and cheap stat checks only.
-    raise RuntimeError(REAL_ADMISSION_MESSAGE)
+    bank = load_manifest(settings.manifest)  # Complete inventory and cheap file checks.
+    i16 = load_real_report(settings.quality, settings.quality_sha256, bank, "i16")
+    reports = {"i16": settings.quality_sha256}
+    if settings.activation == "q8":
+        q8 = load_real_report(settings.q8_quality, settings.q8_quality_sha256, bank, "q8")
+        require(q8["binding"] == i16["binding"] and q8["act_limit"] == i16["act_limit"],
+                "I16 and Q8 real reports must bind identical capture, weights, replay and model limit")
+        reports["q8"] = settings.q8_quality_sha256
+    admission = dict(schema="e1-real-admission/v1", real_quality_admitted=True, production_ready=False,
+                     bank_manifest_sha256=bank.sha256, report_sha256=reports,
+                     capture_manifest_sha256=i16["binding"]["capture_manifest_sha256"], act_limit=i16["act_limit"])
+    if require_production:
+        raise RuntimeError(REAL_ADMISSION_MESSAGE)
+    return TierSettings(settings.format, settings.activation, settings.manifest, settings.quality,
+                        settings.quality_sha256, settings.q8_quality, settings.q8_quality_sha256, admission)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--manifest")
+    parser.add_argument("--admit-quality", action="store_true", help="validate owner-approved real report environment; never start workers")
     parser.add_argument("--verify-files", action="store_true", help="stream and hash every bank file; explicit offline operation")
     args = parser.parse_args(argv)
+    if args.admit_quality:
+        require(not args.verify_files, "quality admission and full bank hashing are separate operations")
+        env = dict(os.environ)
+        env["GLM53_CT_FORMAT"] = "lut"
+        if args.manifest:
+            env["GLM53_CT_LUT_MANIFEST"] = args.manifest
+        print(json.dumps(preflight(env, require_production=False).admission, sort_keys=True))
+        return 0
+    require(bool(args.manifest), "--manifest is required")
     if args.verify_files:
         value = verify_bank(args.manifest)
         print(json.dumps(value, sort_keys=True))

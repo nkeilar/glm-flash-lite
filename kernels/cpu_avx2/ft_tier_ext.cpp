@@ -18,6 +18,7 @@
 #include "ft_core.h"
 #ifdef FT_ENABLE_LUT
 #include "ft_lut.h"
+#include <limits>
 #endif
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -628,12 +629,15 @@ std::vector<int64_t> tier_stats()
 #ifdef FT_ENABLE_LUT
 // Explicit bounded offline API: it owns neither ingress buffers nor a GPU
 // coordinator, and cannot be selected to bypass production startup admission.
-void tier_init_lut_fixture(std::vector<int64_t> cpus, std::string activation, int64_t H, int64_t I, int64_t E, bool virtual_tp2)
+void tier_init_lut_fixture(std::vector<int64_t> cpus, std::string activation, int64_t H, int64_t I, int64_t E, bool virtual_tp2, double act_limit)
 {
     TORCH_CHECK(T == nullptr, "tier already initialised");
     TORCH_CHECK(H >= 256 && H <= 4096 && H % 256 == 0 && I >= 512 && I <= 2048 && I % 512 == 0 && E >= 1 && E <= 8,
                 "LUT offline fixture exceeds bounded geometry");
     ft_lut::Options options; options.cpus.assign(cpus.begin(), cpus.end()); options.activation = activation; options.virtual_tp2 = virtual_tp2;
+    TORCH_CHECK(std::isfinite(act_limit) && act_limit > 0.0 && act_limit <= std::numeric_limits<float>::max(),
+                "LUT activation limit must be finite and positive");
+    options.act_limit = float(act_limit);
     auto runtime = ft_lut::Backend::offline_fixture(options);
     auto tier = std::make_unique<Tier>();
     tier->lut = std::move(runtime); tier->lut_fixture = true; tier->H = int(H); tier->I = int(I); tier->swz = 0;
@@ -665,23 +669,32 @@ pybind11::dict tier_lut_fixture_stats()
     TORCH_CHECK(T && T->lut_fixture && T->lut, "offline LUT fixture init required");
     const auto receipt = T->lut->receipt(); pybind11::dict result;
     result["scope"] = "offline fixture only; no serving or promotion admission";
-    result["format"] = "lut"; result["activation"] = receipt.activation; result["swz_bytes"] = T->swz_bytes;
+    result["format"] = "lut"; result["activation"] = receipt.activation; result["act_limit"] = receipt.act_limit; result["swz_bytes"] = T->swz_bytes;
     result["placement_verified"] = receipt.placement_verified; result["virtual_tp2"] = receipt.virtual_tp2;
     result["payload_bytes"] = receipt.payload_bytes; result["mapped_bytes"] = receipt.mapped_bytes; result["scratch_bytes"] = receipt.scratch_bytes;
     result["nodes"] = receipt.nodes; result["workers"] = receipt.workers; result["staging_peak_bytes"] = receipt.staging_peak_bytes;
+    result["pool_naps"] = receipt.pool_naps; result["timed_out_jobs"] = receipt.timed_out_jobs;
     result["placement_scope"] = "sampled weight slices, pool controls and activation/scratch payloads; metadata not placed";
     pybind11::list regions, controls, scratch;
     for (const auto& row : receipt.regions) {
         pybind11::dict record;
         record["model_layer"] = row.model_layer; record["group"] = row.group; record["node"] = row.node; record["matrix"] = row.matrix;
         record["payload_bytes"] = row.payload_bytes; record["mapped_bytes"] = row.mapped_bytes; record["preferred_policy"] = row.preferred_policy;
-        record["policy_errno"] = row.policy_errno; record["query_errno"] = row.query_errno; record["sampled_pages"] = row.sampled_pages;
+        record["policy_errno"] = row.policy_errno; record["policy_mode"] = row.policy_mode; record["policy_nodes"] = row.policy_nodes;
+        record["query_errno"] = row.query_errno; record["sampled_pages"] = row.sampled_pages;
         record["off_node_pages"] = row.off_node_pages; record["page_errors"] = row.page_errors; regions.append(record);
     }
     for (const auto& row : receipt.controls) {
         pybind11::dict record;
         record["group"] = row.group; record["node"] = row.node; record["owner_cpu"] = row.owner_cpu; record["cpus"] = row.cpus;
         record["preferred_policy"] = row.preferred_policy; record["policy_errno"] = row.policy_errno;
+        record["policy_mode"] = row.policy_mode; record["policy_nodes"] = row.policy_nodes;
+        pybind11::list policies;
+        for (const auto& policy : row.thread_policies) {
+            pybind11::dict item; item["cpu"] = policy.cpu; item["node"] = policy.node; item["mode"] = policy.mode;
+            item["error"] = policy.error; item["verified"] = policy.verified; item["nodes"] = policy.nodes; policies.append(item);
+        }
+        record["thread_policies"] = policies;
         record["worker_policy_failures"] = row.worker_policy_failures; record["query_errno"] = row.query_errno; record["observed_node"] = row.observed_node;
         controls.append(record);
     }
@@ -711,7 +724,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tier_forward", &ft::tier_forward);
     m.def("tier_stats", &ft::tier_stats);
 #ifdef FT_ENABLE_LUT
-    m.def("tier_init_lut_fixture", &ft::tier_init_lut_fixture);
+    m.def("tier_init_lut_fixture", &ft::tier_init_lut_fixture,
+          pybind11::arg("cpus"), pybind11::arg("activation"), pybind11::arg("H"), pybind11::arg("I"),
+          pybind11::arg("E"), pybind11::arg("virtual_tp2"), pybind11::arg("act_limit") = 10.0);
     m.def("tier_lut_fixture_add_layer", &ft::tier_lut_fixture_add_layer);
     m.def("tier_lut_fixture_stats", &ft::tier_lut_fixture_stats);
     m.def("tier_lut_fixture_reset", &ft::tier_lut_fixture_reset);

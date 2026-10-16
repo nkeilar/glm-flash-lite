@@ -21,7 +21,7 @@ Two modes, one switch (`GLM53_MODE`):
 | `fast` (default) | GPU expert cache + zero-copy misses + **AVX2 CPU tier** for cold decode misses, batched decode (`-ambs 4`), fused decode kernels | prefill exact; decode **not exact** (see Quality) | ~218 GiB (234 GB) |
 | `exact` (`-e GLM53_MODE=exact`) | GPU expert cache + zero-copy misses, nothing else | bit-exact (panel top-1 1.0000, KL 0) | ~111 GiB (119 GB) |
 
-### Experimental LUT bank validation
+### Experimental LUT bank and real quality admission
 
 `GLM53_CT_FORMAT=trellis` remains the default and uses the existing CPU tier.
 `GLM53_CT_FORMAT=lut` selects the experimental bank contract, with
@@ -30,18 +30,36 @@ Two modes, one switch (`GLM53_MODE`):
 42 per-layer GGUF files. `GLM53_CT_LUT` retains its existing meaning as the CPU
 cost table; it does not select the weight format.
 
-**LUT server startup is deliberately disabled.** Early preflight checks the full
-42-layer, 126-tensor recipe, provenance, byte ledger, relative filenames and file
-sizes, then refuses startup before importing Torch/exllamav3, allocating model
-weights or building extensions.
-`PROXY-PASS` permits conversion only. Real-activation quality admission is still
-unimplemented, and no `GLM53_CT_LUT_QUALITY` value can enable serving. The public
-conversion manifest must keep `real_pass=false`.
+Real quality admission is separate from production readiness. Early preflight
+requires the complete 42-layer, 126-tensor bank and owner-approved real-capture
+reports bound by SHA-256 to that exact manifest, capture provenance, reference
+weights and replay build. It recomputes the per-layer and pooled median and
+routing-frequency-weighted mean errors against the publisher baseline.
+`PROXY-PASS` permits conversion only and can never admit real quality. The public
+conversion manifest keeps `real_pass=false`; admission belongs to the separate
+real report. Reports cover routed layers 3 and 11. A full-model quality panel
+and live comparisons remain separate requirements.
+
+Set `GLM53_CT_LUT_QUALITY` to the I16 report and
+`GLM53_CT_LUT_QUALITY_SHA256` to its independently reviewed SHA-256.
+`GLM53_CT_LUT_ACT=q8` additionally requires `GLM53_CT_LUT_Q8_QUALITY` and
+`GLM53_CT_LUT_Q8_QUALITY_SHA256`, with the same bank and capture provenance.
+A digest supplied by the operator is the acceptance trust root, not a signature:
+the real replay must validate the capture and its transitive artifacts before
+its report is reviewed. Startup does not repeat the full reference-model hash.
+
+**Production LUT startup remains disabled.** A valid real report admits quality
+only. The GPU coordinator, request-error propagation, complete bank placement
+validation and target timing still need production integration and review.
+Default preflight refuses before Torch/exllamav3 imports, model allocations or
+extension builds. It never falls back silently to trellis.
 
 Offline validation is available without Torch or CUDA:
 
 ```bash
 python3 glm53/lut_manifest.py --manifest /models/lut/e1-lut-bank.json
+# Read the explicit environment above and check quality without starting a server:
+python3 glm53/lut_manifest.py --admit-quality
 python3 -B -m unittest discover -s tests -p test_lut_manifest.py -v
 ```
 
@@ -67,13 +85,16 @@ keeps 100 GiB host and 8 GiB per-node reserves, additional working overhead, and
 checks visible cgroup memory limits. This full-bank factory is not exposed through
 Python and has not yet been exercised on a complete bank.
 
-Two spinning pools publish one job and join both completions before merging
-outputs. Scratch is preallocated; M=3 uses the verified M=2 plus M=1 kernels.
-Worker errors drain both groups before propagating, without publishing partial
+Two pools spin briefly, then take short idle naps until work arrives. They publish
+one job and join both completions before merging outputs. Scratch is preallocated;
+M=3 uses the verified M=2 plus M=1 kernels. A cooperative request deadline stops
+further phase work and drains both groups before returning an error; a stuck
+thread still requires process supervision. Worker errors never publish partial
 outputs. Callers must quiesce before destroying a backend. Placement receipts
-cover sampled weight slices, pool control pages and activation/scratch payload
-pages; they do not prove all-page or metadata locality. Virtual TP2 tests always
-report placement as unverified.
+include NUMA policy mode/mask readback for weights, controls and every worker;
+successful setters alone do not establish placement. Sampled page checks cover
+weight slices, pool controls and activation/scratch payload pages, without proving
+all-page or metadata locality. Virtual TP2 tests report placement as unverified.
 
 Run the standalone CPU correctness and failure-recovery tests from the repository
 root (no Torch or CUDA required):
@@ -89,8 +110,10 @@ g++ -std=c++17 -O3 -Wall -Wextra -Werror -mavx2 -mfma -mf16c \
 Repeat with `-ffp-contract=off` and a separate output binary. These tests compare
 LUT TP2 outputs against a canonical packed-weight replay; LUT arithmetic changes
 CPU-tier numerics and is not claimed bit-identical to trellis. The vendored codec
-sources are unchanged from the verified benchmark revision and retain their MIT
-attribution in `kernels/cpu_avx2/lut/LICENSE`.
+sources come from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), with
+work by the [ggml](https://github.com/ggml-org/ggml) and
+[llama.cpp](https://github.com/ggml-org/llama.cpp) authors. Their MIT notices are
+preserved in `kernels/cpu_avx2/lut/LICENSE`.
 
 An additional opt-in test builds the default host extension and both LUT compiler
 modes with an installed PyTorch. It blocks CUDA entrypoints, limits builds to two
@@ -101,9 +124,13 @@ RUN_LUT_TORCH_EXTENSION_TESTS=1 python3 -B -m unittest discover \
   -s tests -p test_lut_torch_extension.py -v
 ```
 
-Real-activation admission, production coordinator error/deadline handling,
-full-bank placement validation and target-machine timing remain required before
-LUT serving can be enabled.
+The offline fixture initializer accepts an explicit `act_limit` keyword, which
+must be finite and positive; its default is 10 for compatibility. Use the actual
+model's limit and validate it against the real report before any future
+production initialization. The limit is included in fixture statistics.
+
+Production coordinator error/deadline handling, full-bank placement validation
+and target-machine timing remain required before LUT serving can be enabled.
 
 ## Measured
 
