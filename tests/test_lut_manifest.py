@@ -258,15 +258,16 @@ class RealAdmissionTests(unittest.TestCase):
         with mock.patch.object(lm,"load_manifest",return_value=self.bank):
             return lm.preflight(env,require_production=False)
 
-    def test_real_i16_and_q8_quality_admit_but_production_remains_blocked(self):
+    def test_real_quality_admits_but_measured_cost_gate_remains_separate(self):
         for activation in ("i16","q8"):
             env=self.environment(activation)
             settings=self.admit(env)
             self.assertIs(settings.admission["real_quality_admitted"],True)
             self.assertIs(settings.admission["production_ready"],False)
             self.assertEqual(set(settings.admission["report_sha256"]),{"i16","q8"} if activation=="q8" else {"i16"})
+            env.update(GLM53_CPU_TIER="1",GLM53_EC="1",GLM53_ZC_VRAM="0")
             with mock.patch.object(lm,"load_manifest",return_value=self.bank):
-                with self.assertRaisesRegex(RuntimeError,"production LUT coordinator startup is unavailable"):
+                with self.assertRaisesRegex(ValueError,"measured LUT costs are a separate startup gate"):
                     lm.preflight(env)
 
     def test_owner_approved_digest_is_mandatory_and_same_bytes_are_validated(self):
@@ -375,6 +376,324 @@ class RealAdmissionTests(unittest.TestCase):
         self.assertIs(result["production_ready"],False)
 
 
+def measured_costs(bank, activation="i16"):
+    """Fictitious structural timing data; no performance measurement claim."""
+    profiles = {}
+    for index, (name, types) in enumerate(lm.COST_PROFILES.items()):
+        profiles[name] = dict(types=types, fixture_sha256="7"*64, source_artifact_sha256="a"*64,
+                             rows={str(m):{str(k):dict(median_ms=(index+1)*m+k*.1,
+                             samples=3,raw_ms=[(index+1)*m+k*.1]*3) for k in range(9)} for m in range(1,5)})
+    cpus=list(range(2,44))
+    hardware=dict(cpus=cpus,topology={str(cpu):dict(package=str(int(cpu>=22)),core=str(cpu)) for cpu in cpus})
+    return dict(schema="e1-lut-cost/v1",complete=True,activation=activation,bank_manifest_sha256=bank.sha256,
+                measurement=dict(kind="hardware",treatment="clflush-owned-weights-before-each-call",act_limit=10,coordinator_cpu=0,hardware_sha256=lm.json_digest(hardware),hardware=hardware,cpus=cpus,build_sha256="9"*64,
+                                 placement_verified=True,clock="perf_counter_ns",samples_per_cell=3),profiles=profiles)
+
+
+class StartupTests(unittest.TestCase):
+    environment = RealAdmissionTests.environment
+
+    def setUp(self):
+        RealAdmissionTests.setUp(self)
+        lm._STARTUP_CACHE.clear()
+        self.addCleanup(lm._STARTUP_CACHE.clear)
+
+    def startup_environment(self, activation="i16"):
+        env = self.environment(activation)
+        path=self.root/"cost.json";path.write_text(json.dumps(measured_costs(self.bank,activation)))
+        env.update(GLM53_CPU_TIER="1",GLM53_EC="1",GLM53_ZC_VRAM="0",GLM53_CT_LUT_COST=str(path),
+                   GLM53_CT_LUT_COST_SHA256=hashlib.sha256(path.read_bytes()).hexdigest())
+        return env
+
+    def precompiled(self, build_sha="9"*64):
+        return dict(modules={"ft_tier_host.so":dict(sha256=build_sha)})
+
+    def stage(self):
+        path=self.root/"fixture.gguf";row,_=small_gguf(path)
+        return dict(manifest_sha256=self.bank.sha256,layers=[lm.verify_artifact(path,row)])
+
+    def test_complete_measured_grid_and_profile_map(self):
+        self.assertEqual([lm.cost_profile(layer) for layer in (3,11,12,13,44)],
+                         ["ordinary","upgraded_gate","upgraded_down","ordinary","upgraded_down"])
+        for activation in ("i16","q8"):
+            self.assertIs(lm.validate_cost_table(measured_costs(self.bank,activation),self.bank,activation)["complete"],True)
+        changes=[lambda v:v.__setitem__("complete",False),lambda v:v.__setitem__("activation","q8"),
+                 lambda v:v.__setitem__("bank_manifest_sha256","0"*64),lambda v:v["profiles"].pop("upgraded_down"),
+                 lambda v:v["measurement"].__setitem__("placement_verified",False),
+                 lambda v:v["measurement"].__setitem__("kind","projection"),
+                 lambda v:v["measurement"].pop("treatment"),
+                 lambda v:v["measurement"].__setitem__("treatment","warm-repeated-fixture"),
+                 lambda v:v["measurement"].__setitem__("treatment","clflush-after-timed-call"),
+                 lambda v:v["measurement"].__setitem__("samples_per_cell",2),
+                 lambda v:v["profiles"]["ordinary"]["rows"]["4"].pop("8"),
+                 lambda v:v["profiles"]["ordinary"].__setitem__("source_artifact_sha256","0"*64),
+                 lambda v:v["profiles"]["ordinary"]["rows"]["1"]["1"].__setitem__("median_ms",.1),
+                 lambda v:v["profiles"]["ordinary"]["rows"]["1"]["1"]["raw_ms"].pop(),
+                 lambda v:v["profiles"]["ordinary"]["rows"]["1"]["1"]["raw_ms"].__setitem__(0,float("nan"))]
+        for index,change in enumerate(changes):
+            value=measured_costs(self.bank);change(value)
+            with self.subTest(index=index),self.assertRaises(ValueError):lm.validate_cost_table(value,self.bank,"i16")
+
+    def test_cost_hardware_hash_and_exact_worker_topology_are_required(self):
+        value=measured_costs(self.bank);cpus=value["measurement"]["cpus"]
+        topology=value["measurement"]["hardware"]["topology"]
+        def read(path):
+            cpu=path.parent.parent.name[3:]
+            row=topology.get(cpu,{"package":"0","core":"0"})
+            return row["package" if path.name=="physical_package_id" else "core"]+"\n"
+        with mock.patch.object(Path,"read_text",read):
+            lm.validate_cost_hardware(value,cpus)
+            with self.assertRaisesRegex(ValueError,"worker CPUs differ"):lm.validate_cost_hardware(value,cpus[::-1])
+            with self.assertRaisesRegex(ValueError,"coordinator CPU differs"):lm.validate_cost_hardware(value,cpus,1)
+        with mock.patch.object(Path,"read_text",return_value="999"):
+            with self.assertRaisesRegex(ValueError,"topology differs"):lm.validate_cost_hardware(value,cpus)
+        def shared_core(path):
+            cpu=path.parent.parent.name[3:]
+            row=topology["2"] if cpu=="0" else topology[cpu]
+            return row["package" if path.name=="physical_package_id" else "core"]+"\n"
+        with mock.patch.object(Path,"read_text",shared_core):
+            with self.assertRaisesRegex(ValueError,"separate physical core"):lm.validate_cost_hardware(value,cpus,0)
+        for coordinator in (True,-1,1024,2):
+            broken=copy.deepcopy(value);broken["measurement"]["coordinator_cpu"]=coordinator
+            with self.subTest(coordinator=coordinator),self.assertRaises(ValueError):lm.validate_cost_table(broken,self.bank,"i16")
+        for change in (lambda v:v["measurement"].__setitem__("hardware_sha256","0"*64),
+                       lambda v:v["measurement"].__setitem__("cpus",cpus[::-1]),
+                       lambda v:v["measurement"]["hardware"]["topology"].pop("2")):
+            broken=copy.deepcopy(value);change(broken)
+            with self.assertRaises(ValueError):lm.validate_cost_table(broken,self.bank,"i16")
+
+    def test_startup_hashes_once_then_rechecks_files_without_allocating_weights(self):
+        env=self.startup_environment();stage=self.stage()
+        with mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank",return_value=stage) as verify,mock.patch.object(lm,"load_precompiled",return_value=self.precompiled()):
+            first=lm.preflight(env);second=lm.preflight(env)
+            self.assertEqual(first,second);self.assertIs(first.staged_bank,stage)
+            self.assertTrue(first.admission["full_bank_verified"]);self.assertFalse(first.admission["production_ready"])
+            verify.assert_called_once_with(self.bank.path)
+            path=Path(stage["layers"][0]["path"])
+            path.write_bytes(path.read_bytes()+b"x")
+            with self.assertRaisesRegex(ValueError,"changed before native initialization"):lm.preflight(env)
+
+    def test_measured_activation_limit_must_match_admitted_real_model_limit(self):
+        env=self.startup_environment();path=Path(env["GLM53_CT_LUT_COST"])
+        value=json.loads(path.read_text());value["measurement"]["act_limit"]=20
+        path.write_text(json.dumps(value));env["GLM53_CT_LUT_COST_SHA256"]=hashlib.sha256(path.read_bytes()).hexdigest()
+        with mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank") as verify:
+            with self.assertRaisesRegex(ValueError,"cost activation limit differs"):lm.preflight(env)
+            verify.assert_not_called()
+        for limit in (0,-1,True,float("inf")):
+            value=measured_costs(self.bank);value["measurement"]["act_limit"]=limit
+            with self.subTest(limit=limit),self.assertRaises(ValueError):lm.validate_cost_table(value,self.bank,"i16")
+
+    def test_valid_startup_finishes_bank_and_cost_checks_before_framework_import(self):
+        env=self.startup_environment();stage=self.stage()
+        source=(ROOT/"glm53"/"serve.py").read_text()
+        original_import=builtins.__import__;events=[]
+        def guarded(name,*args,**kw):
+            if name.split(".")[0] in ("torch","exllamav3"):
+                events.append("framework");raise RuntimeError("framework reached after admission")
+            return original_import(name,*args,**kw)
+        def verify(path):events.append("bank_verified");return stage
+        with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"load_precompiled",return_value=self.precompiled()),mock.patch.object(lm,"verify_bank",side_effect=verify),mock.patch.object(builtins,"__import__",side_effect=guarded):
+            with self.assertRaisesRegex(RuntimeError,"framework reached after admission"):
+                exec(compile(source,"serve.valid-import","exec"),{"__name__":"serve_fixture","__file__":str(ROOT/"glm53"/"serve.py")})
+        self.assertEqual(events,["bank_verified","framework"])
+
+    def test_startup_rejects_changed_bank_report_cost_and_unsupported_runtime_before_hashing(self):
+        env=self.startup_environment()
+        mutations=[("GLM53_CPU_TIER","0"),("GLM53_EC","0"),("GLM53_ZC_VRAM",""),
+                   ("GLM53_K_FTSPLIT","1"),("GLM53_LA","1"),("GLM53_K_HCFUSE","1"),("GLM53_K_OVL","1"),
+                   ("GLM53_CT_VALIDATE","1"),("GLM53_CT_LUT",".1,.2"),("GLM53_CT_MAXBSZ","5"),
+                   ("GLM53_CT_MAXN","9"),("GLM53_CT_FORCE_N","9"),("GLM53_CT_TIMEOUT_S","inf"),("GLM53_CT_TIMEOUT_S","0"),
+                   ("GLM53_CT_MAXN","7.5"),("GLM53_CT_B","nan"),("GLM53_CT_B","-1"),
+                   ("GLM53_CT_LUT_COST_SHA256","0"*64)]
+        for key,value in mutations:
+            changed=dict(env);changed[key]=value
+            with self.subTest(key=key),mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank") as verify:
+                with self.assertRaises(ValueError):lm.preflight(changed)
+                verify.assert_not_called()
+        with mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank",return_value=dict(manifest_sha256="0"*64)),mock.patch.object(lm,"load_precompiled",return_value=self.precompiled()):
+            with self.assertRaisesRegex(ValueError,"manifest changed"):lm.preflight(env)
+
+    def cpu_module(self, torch=None):
+        spec=importlib.util.spec_from_file_location("cpu_tier_startup_fixture",ROOT/"glm53"/"cpu_tier.py")
+        module=importlib.util.module_from_spec(spec)
+        torch=torch or SimpleNamespace(inference_mode=lambda:lambda function:function)
+        with mock.patch.dict(sys.modules,{"torch":torch}):spec.loader.exec_module(module)
+        return module
+
+    def test_native_lut_start_uses_full_descriptors_and_model_limit_without_trellis_registration(self):
+        env=self.startup_environment();stage=self.stage()
+        binary=self.root/"host.so";binary.write_bytes(b"structural native-build fixture")
+        path=Path(env["GLM53_CT_LUT_COST"]);value=json.loads(path.read_text())
+        value["measurement"]["build_sha256"]=hashlib.sha256(binary.read_bytes()).hexdigest()
+        path.write_text(json.dumps(value));env["GLM53_CT_LUT_COST_SHA256"]=hashlib.sha256(path.read_bytes()).hexdigest()
+        with mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank",return_value=stage),mock.patch.object(lm,"load_precompiled",return_value=self.precompiled(value["measurement"]["build_sha256"])):settings=lm.preflight(env)
+        module=self.cpu_module();host=mock.Mock();host.__file__=str(binary);module._H=host
+        mods=[SimpleNamespace(key=f"model.layers.{layer}.mlp",act_limit=10,hidden_size=4096,intermediate_size=2048,
+                              num_local_experts=None,num_experts=288,routing_first=0,_ec=(object(),li))
+              for li,layer in enumerate(lm.LAYERS)]
+        module.S.update(settings=settings,mods=mods,timeout_ns=2000000000,ctrl=object(),hx=object(),picks=object(),hout=object())
+        with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(module,"preflight",return_value=settings),mock.patch.object(module,"_cpus",return_value=list(range(2,44))),mock.patch.object(os,"sched_getaffinity",return_value=set(range(44))),mock.patch.object(lm,"validate_cost_hardware") as hardware,mock.patch("atexit.register") as register:
+            module.start()
+            hardware.assert_called_once_with(settings.costs,list(range(2,44)),0)
+            register.assert_called_once_with(host.tier_stop)
+        args=host.tier_init_lut.call_args.args
+        self.assertEqual(args[:3],(list(range(2,44)),"i16",stage["layers"]))
+        self.assertEqual(args[-2:],(10,2000));host.tier_start.assert_called_once_with(0)
+        host.tier_init.assert_not_called();host.tier_add_layer.assert_not_called();host.tier_set_act_limit.assert_not_called()
+        self.assertTrue(module.S["started"]);self.assertFalse(module.S["selftest"]["trellis_correctness_comparison"])
+        host.reset_mock();module.S["started"]=False
+        def remote(modules):module.S["rt"]={"backend":"fixture"}
+        with mock.patch.dict(os.environ,{**env,"GLM53_RT":"configured"},clear=True),mock.patch.object(module,"_cpus",return_value=list(range(2,44))),mock.patch.object(os,"sched_getaffinity",return_value=set(range(44))),mock.patch.object(module,"_rt_enable",side_effect=remote) as enable,mock.patch.object(module,"_rt_auto_b_start") as auto,mock.patch.object(lm,"validate_cost_hardware"),mock.patch("atexit.register"):
+            module._start_lut(settings)
+            enable.assert_called_once_with(mods);auto.assert_called_once_with()
+        with self.assertRaisesRegex(RuntimeError,"trellis format difference"):module.selftest()
+        mods[5].act_limit=20
+        with self.assertRaisesRegex(ValueError,"activation limit"):module._start_lut(settings)
+        self.assertEqual(host.tier_init_lut.call_count,1)
+
+    def test_lut_remote_plan_bounds_absolute_deadline_payload_and_resolution(self):
+        import socket
+        module=self.cpu_module();module.S["settings"]=SimpleNamespace(format="lut")
+        endpoint=".".join(map(str,(127,0,0,1)))
+        class Socket:
+            def __init__(self,payload,chunk=65536):self.payload=payload;self.chunk=chunk;self.calls=0
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def settimeout(self,value):self.timeout=value
+            def connect(self,address):self.address=address
+            def sendall(self,data):self.sent=data
+            def recv(self,count):
+                self.calls+=1;size=min(count,self.chunk);value=self.payload[:size];self.payload=self.payload[size:];return value
+        body=json.dumps({"layers":{"3":[0,1]}}).encode()
+        frame=b"GRTC"+struct.pack("<I",len(body))+body
+        stream=Socket(frame,chunk=1)
+        with mock.patch.object(socket,"socket",return_value=stream),mock.patch.object(module.time,"monotonic",return_value=0):
+            self.assertEqual(module._rt_plan(endpoint,1,1),{"layers":{"3":[0,1]}})
+            self.assertEqual(stream.address,(endpoint,1))
+        stream=Socket(frame,chunk=1);clock=iter(i*.2 for i in range(100))
+        with mock.patch.object(socket,"socket",return_value=stream),mock.patch.object(module.time,"monotonic",side_effect=lambda:next(clock)):
+            with self.assertRaisesRegex(TimeoutError,"absolute deadline"):module._rt_plan(endpoint,1,1)
+        stream=Socket(b"GRTC"+struct.pack("<I",2**20+1))
+        with mock.patch.object(socket,"socket",return_value=stream),mock.patch.object(module.time,"monotonic",return_value=0):
+            with self.assertRaisesRegex(ValueError,"bounded JSON"):module._rt_plan(endpoint,1,1)
+        with mock.patch.object(socket,"socket") as network:
+            with self.assertRaises(ValueError):module._rt_plan("hostname",1,1)
+            network.assert_not_called()
+        module._H=mock.Mock()
+        with mock.patch.dict(os.environ,{"GLM53_RT":endpoint+":1"},clear=True),mock.patch.object(module,"_rt_plan",side_effect=TimeoutError("offline")):
+            module._rt_enable([])
+        self.assertEqual(module.S["rt_plan_error"],"offline");module._H.tier_remote.assert_not_called()
+
+    def test_remote_policy_updates_preserve_all_measured_profile_tails(self):
+        module=self.cpu_module()
+        plans={m:[0.0]*12+[m+k/10 for k in range(8)] for m in range(1,5)}
+        tails={m:plan[12:] for m,plan in plans.items()}
+        module.S.update(settings=SimpleNamespace(format="lut"),pol=[0.0]*20,mods=[SimpleNamespace(_ct_pol=plans)])
+        module._write_policy(3,.15);module._write_policy(8,1.0)
+        for m,plan in plans.items():
+            self.assertEqual(plan[3],.15);self.assertEqual(plan[8],1.0);self.assertEqual(plan[12:],tails[m])
+
+    def test_mixed_format_remote_difference_is_labeled_as_a_diagnostic(self):
+        module=self.cpu_module();module.S.update(rt={"backend":"fixture"},settings=SimpleNamespace(format="lut"))
+        module._H=SimpleNamespace(tier_remote_stats=lambda:[1,1,1,0,0,1,0,0,0,0,0,1,123,0])
+        result=module._rt_summary()
+        self.assertNotIn("check_rel_rms",result);self.assertAlmostEqual(result["mixed_format_rel_rms"],123/1e9)
+        self.assertFalse(result["correctness_gate"])
+        module.S["settings"]=SimpleNamespace(format="trellis")
+        self.assertIn("check_rel_rms",module._rt_summary())
+
+    def test_lut_combine_error_is_checked_after_stream_completion_before_buffer_reuse(self):
+        events=[]
+        stream=SimpleNamespace(synchronize=lambda:events.append("stream_done"))
+        torch=SimpleNamespace(inference_mode=lambda:lambda function:function,cuda=SimpleNamespace(current_stream=lambda dev:stream))
+        module=self.cpu_module(torch);module.S.update(dev="cuda:0",started=True)
+        def failure():events.append("check");raise RuntimeError("native failed")
+        module._H=SimpleNamespace(tier_lut_check=failure,tier_lut_abort=lambda:events.append("abort"))
+        with self.assertRaisesRegex(RuntimeError,"native failed"):module._lut_check()
+        self.assertEqual(events,["stream_done","check","abort"]);self.assertFalse(module.S["started"])
+        self.assertEqual(module.S["lut_error"],"native failed")
+        tree=ast.parse((ROOT/"glm53"/"cpu_tier.py").read_text())
+        wrap=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="wrap")
+        routed=next(node for node in ast.walk(wrap) if isinstance(node,ast.FunctionDef) and node.name=="routed")
+        original=mock.Mock(side_effect=AssertionError("failed tier must not fall back to GPU routing"))
+        namespace={"S":module.S,"settings":SimpleNamespace(format="lut"),"orig":original,"m":object()}
+        exec(compile(ast.Module(body=[routed],type_ignores=[]),"cpu_tier.routed","exec"),namespace)
+        for batch in (1,4,4096):
+            with self.subTest(batch=batch),self.assertRaisesRegex(RuntimeError,"restart required"):
+                namespace["routed"](batch,{},None,{})
+        original.assert_not_called()
+
+    def precompile_receipt(self):
+        root=ROOT/"kernels"/"cpu_avx2"
+        sources={"kernels/cpu_avx2/"+name:hashlib.sha256((root/name).read_bytes()).hexdigest()
+                 for name in ("ft_tier_ext.cpp","ft_tier_cu.cu","ft_core.h","ft_lut.cpp","ft_lut.h","lut/kernels.cpp","lut/kernels.h")}
+        outputs={}
+        for name in ("ft_tier_host.so","ft_tier_cu.so"):
+            file=self.root/name;file.write_bytes(("structural binary fixture "+name).encode())
+            outputs[name]=hashlib.sha256(file.read_bytes()).hexdigest()
+        return dict(schema="e1-precompile/v1",variant="lut",state="COMPILED_NO_GPU_CONTEXT",cuda_initialized=False,
+                    source_revision="1"*40,torch_version="fixture",flags=["-DFT_ENABLE_LUT=1"],cuda_flags=["-DFT_ENABLE_LUT=1"],
+                    source_sha256=sources,outputs=outputs,build_directory=str(self.root))
+
+    def write_precompile(self, receipt):
+        path=self.root/"reviewed-precompile.json";path.write_text(json.dumps(receipt))
+        return path,hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_precompile_binds_both_guarded_modules_source_revision_and_torch_without_framework_import(self):
+        receipt=self.precompile_receipt();path,sha=self.write_precompile(receipt)
+        with mock.patch.object(lm.importlib.metadata,"version",return_value="fixture"),mock.patch.object(lm.subprocess,"check_output",return_value="1"*40+"\n"):
+            result=lm.load_precompiled(path,sha)
+            self.assertEqual(set(result["modules"]),{"ft_tier_host.so","ft_tier_cu.so"})
+            self.assertEqual(result["modules"]["ft_tier_host.so"]["identity"],lm.identity((self.root/"ft_tier_host.so").stat()))
+            mutations=[lambda r:r.__setitem__("variant","trellis"),lambda r:r.__setitem__("cuda_initialized",True),
+                       lambda r:r.__setitem__("cuda_flags",["-O3"]),lambda r:r.__setitem__("flags",["-O3"]),
+                       lambda r:r.__setitem__("torch_version","wrong"),lambda r:r.__setitem__("source_revision","0"*40),
+                       lambda r:r["source_sha256"].__setitem__("kernels/cpu_avx2/ft_lut.cpp","0"*64),
+                       lambda r:r["source_sha256"].pop("kernels/cpu_avx2/ft_tier_cu.cu"),
+                       lambda r:r["outputs"].__setitem__("ft_tier_cu.so","0"*64),
+                       lambda r:r.__setitem__("build_directory",str(self.root/"other"))]
+            for index,change in enumerate(mutations):
+                changed=copy.deepcopy(receipt);change(changed);changed_path,changed_sha=self.write_precompile(changed)
+                with self.subTest(index=index),self.assertRaises(ValueError):lm.load_precompiled(changed_path,changed_sha)
+            path,sha=self.write_precompile(receipt)
+            (self.root/"ft_tier_cu.so").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError,"module SHA256"):lm.load_precompiled(path,sha)
+        with self.assertRaisesRegex(ValueError,"PRECOMPILE"):lm.load_precompiled(None,None)
+
+    def test_lut_load_imports_exact_reviewed_modules_without_jit_and_rechecks_identity(self):
+        module=self.cpu_module(SimpleNamespace(inference_mode=lambda:lambda function:function,__version__="fixture"))
+        receipt=self.precompile_receipt()
+        entries={name:dict(path=str(self.root/name),identity=lm.identity((self.root/name).stat())) for name in receipt["outputs"]}
+        settings=SimpleNamespace(precompiled=dict(receipt=receipt,modules=entries))
+        module.S["settings"]=settings
+        specs=[]
+        def spec(name,path):
+            specs.append((name,path))
+            return SimpleNamespace(name=name,path=path,loader=SimpleNamespace(exec_module=lambda loaded:None))
+        def loaded(spec):return SimpleNamespace(__file__=str(spec.path))
+        with mock.patch.object(module.importlib.util,"spec_from_file_location",side_effect=spec),mock.patch.object(module.importlib.util,"module_from_spec",side_effect=loaded):
+            module._build_lut()
+            self.assertEqual([name for name,path in specs],["ft_tier_host","ft_tier_cu"])
+            self.assertEqual(module._H.__file__,str(self.root/"ft_tier_host.so"))
+            (self.root/"ft_tier_host.so").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError,"changed before import"):module._build_lut()
+
+    def test_measured_policy_selects_profile_and_m_without_extra_token_or_k_extrapolation(self):
+        class Tensor:
+            def __init__(self,values):self.values=list(values)
+            def clone(self):return Tensor(self.values)
+            def __getitem__(self,key):return self.values[key]
+            def __setitem__(self,key,value):self.values[key]=value.values if isinstance(value,Tensor) else value
+        torch=SimpleNamespace(inference_mode=lambda:lambda function:function,tensor=lambda values,**kw:Tensor(values),float32=object())
+        module=self.cpu_module(torch);settings=SimpleNamespace(costs=measured_costs(self.bank))
+        with mock.patch.dict(os.environ,{"GLM53_CT_MAXN":"8"},clear=True):
+            plans=module._lut_policy(settings,11,"cpu")
+        self.assertEqual(set(plans),{1,2,3,4});self.assertEqual(plans[4][12:20],[8+k*.1 for k in range(1,9)])
+        self.assertEqual(plans[4][4],0)
+        with mock.patch.dict(os.environ,{"GLM53_CT_MAXN":"9"},clear=True),self.assertRaisesRegex(ValueError,"MAXN"):module._lut_policy(settings,3,"cpu")
+
+
 class IntegrationTests(unittest.TestCase):
     def serve_load(self,namespace):
         tree=ast.parse((ROOT/"glm53"/"serve.py").read_text())
@@ -416,7 +735,7 @@ class IntegrationTests(unittest.TestCase):
                 exec(compile(source,"serve.import","exec"),dict(namespace))
         self.assertEqual(imported,["torch"])
 
-    def test_real_admitted_quality_still_blocks_full_serve_import_before_frameworks(self):
+    def test_real_admitted_quality_without_costs_blocks_serve_before_frameworks(self):
         source=(ROOT/"glm53"/"serve.py").read_text()
         original_import=builtins.__import__
         def guarded_import(name,*args,**kwargs):
@@ -427,10 +746,11 @@ class IntegrationTests(unittest.TestCase):
             bank=lm.BankManifest(Path(directory)/"bank.json","f"*64,public_manifest())
             quality=Path(directory)/"quality.json";quality.write_text(json.dumps(real_report(bank)))
             env=dict(GLM53_CT_FORMAT="lut",GLM53_CT_LUT_MANIFEST=str(bank.path),GLM53_CT_LUT_QUALITY=str(quality),
-                     GLM53_CT_LUT_QUALITY_SHA256=hashlib.sha256(quality.read_bytes()).hexdigest())
+                     GLM53_CT_LUT_QUALITY_SHA256=hashlib.sha256(quality.read_bytes()).hexdigest(),
+                     GLM53_CPU_TIER="1",GLM53_EC="1",GLM53_ZC_VRAM="0")
             namespace={"__name__":"serve_import_fixture","__file__":str(ROOT/"glm53"/"serve.py")}
             with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(lm,"load_manifest",return_value=bank),mock.patch.object(builtins,"__import__",side_effect=guarded_import):
-                with self.assertRaisesRegex(RuntimeError,"production LUT coordinator startup is unavailable"):
+                with self.assertRaisesRegex(ValueError,"measured LUT costs are a separate startup gate"):
                     exec(compile(source,"serve.import","exec"),namespace)
 
     def test_cpu_wrap_and_start_cannot_build_or_allocate_before_admission(self):
@@ -449,7 +769,12 @@ class IntegrationTests(unittest.TestCase):
         build=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="_build")
         strings={node.value for node in ast.walk(build) if isinstance(node,ast.Constant) and isinstance(node.value,str)}
         self.assertIn("ft_tier_ext.cpp",strings);self.assertIn("ft_tier_cu.cu",strings)
-        self.assertFalse(any("lut" in item.lower() for item in strings))
+        self.assertNotIn("-DFT_ENABLE_LUT=1",strings)
+        self.assertNotIn("ft_lut.cpp",strings)
+        lut_build=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="_build_lut")
+        lut_strings={node.value for node in ast.walk(lut_build) if isinstance(node,ast.Constant) and isinstance(node.value,str)}
+        self.assertIn("ft_tier_host",lut_strings);self.assertIn("ft_tier_cu",lut_strings)
+        self.assertNotIn("-O3",lut_strings)  # Production LUT loads reviewed artifacts without JIT.
 
 
 if __name__=="__main__":unittest.main()

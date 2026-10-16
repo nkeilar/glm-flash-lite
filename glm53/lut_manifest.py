@@ -1,8 +1,8 @@
 """LUT bank validation and SHA-bound real-activation quality admission.
 
 PROXY-PASS authorizes conversion only. Owner-approved real reports may admit
-quality; production coordinator startup remains unavailable. No Torch or CUDA
-is imported by this module.
+quality. Startup also requires the complete SHA-verified bank and independently
+approved measured costs. No Torch or CUDA is imported by this module.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import argparse
 import contextlib
 from dataclasses import dataclass
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 import stat
 import statistics
 import struct
+import subprocess
 
 SOURCE_REVISION = "a38483c8cd5df544f53d70fb281afe97369d5ab6"
 IK_REVISION = "5bf8f0fe4db98e9560de0f495232f8d3a733c678"
@@ -34,10 +36,9 @@ TYPES = {138: ("IQ3_K", 256, 110, 0), 144: ("IQ4_KS", 256, 136, 4), 14: ("Q6_K",
 SCALAR_BYTES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 REAL_JSON_LIMIT = 32 * 2**20
 REAL_PROTOCOL = "real-routed-activations/v1"
-REAL_ADMISSION_MESSAGE = (
-    "Real LUT quality is admitted, but production LUT coordinator startup is unavailable; "
-    "restore the default trellis path until production integration is reviewed."
-)
+COST_JSON_LIMIT = 4 * 2**20
+COST_PROFILES = {"ordinary": [138, 138, 144], "upgraded_gate": [144, 144, 14], "upgraded_down": [138, 138, 14]}
+_STARTUP_CACHE = {}
 
 
 def require(condition, message):
@@ -492,7 +493,7 @@ def load_real_report(path, expected_sha256, bank, activation):
 
 
 def validate_model_act_limit(settings, modules):
-    """Future production initialization must match the actual model to admission."""
+    """Match the loaded model to the admitted real replay before bank allocation."""
     require(settings.format == "lut" and settings.admission is not None, "real LUT admission required")
     expected = settings.admission["act_limit"]
     modules = tuple(modules)
@@ -502,6 +503,169 @@ def validate_model_act_limit(settings, modules):
         real_number(actual, "actual model activation limit", positive=True)
         require(actual == expected, "actual model activation limit differs from real quality admission")
     return expected
+
+
+def cost_profile(layer):
+    integer(layer, "model layer", 3, 44)
+    return "upgraded_gate" if layer == 11 else "upgraded_down" if layer in (12, 44) else "ordinary"
+
+
+def validate_cost_table(value, bank, activation):
+    """Check a complete measured grid; never extrapolate unmeasured profiles."""
+    require(isinstance(value, dict) and value.get("schema") == "e1-lut-cost/v1", "measured LUT cost artifact required")
+    require(value.get("complete") is True, "complete measured LUT costs required for all three layer profiles")
+    require(value.get("activation") == activation, "measured LUT cost activation mismatch")
+    require(digest(value.get("bank_manifest_sha256"), "cost bank manifest") == bank.sha256,
+            "measured LUT costs belong to another bank manifest")
+    measurement = value.get("measurement")
+    require(isinstance(measurement, dict) and measurement.get("kind") == "hardware" and
+            measurement.get("placement_verified") is True and measurement.get("clock") == "perf_counter_ns",
+            "costs require hardware measurements with verified physical placement")
+    require(measurement.get("treatment") == "clflush-owned-weights-before-each-call",
+            "serving LUT costs require controlled cold owned weights flushed before each timed call")
+    real_number(measurement.get("act_limit"), "measured model activation limit", positive=True)
+    for field in ("hardware_sha256", "build_sha256"):
+        digest(measurement.get(field), "cost " + field)
+    hardware = measurement.get("hardware")
+    require(isinstance(hardware, dict) and json_digest(hardware) == measurement["hardware_sha256"],
+            "measured cost hardware identity hash mismatch")
+    cpus = measurement.get("cpus")
+    require(isinstance(cpus, list) and len(cpus) == 42 and all(type(cpu) is int and 0 <= cpu < 1024 for cpu in cpus)
+            and len(set(cpus)) == 42 and hardware.get("cpus") == cpus, "measured cost worker CPUs must name 42 distinct workers")
+    coordinator = integer(measurement.get("coordinator_cpu"), "measured coordinator CPU", 0, 1023)
+    require(coordinator not in cpus, "measured coordinator CPU must differ from worker CPUs")
+    topology = hardware.get("topology")
+    keys(topology, (str(cpu) for cpu in cpus), "measured worker topology")
+    physical = set()
+    for row in topology.values():
+        keys(row, ("package", "core"), "measured physical core")
+        require(all(isinstance(value, str) and value.isdigit() and len(value) <= 8 for value in row.values()),
+                "invalid measured physical core")
+        physical.add((row["package"], row["core"]))
+    require(len(physical) == 42, "measured worker CPUs must use distinct physical cores")
+    count = integer(measurement.get("samples_per_cell"), "cost samples per cell", 3, 10000)
+    profiles = value.get("profiles")
+    keys(profiles, COST_PROFILES, "measured LUT profiles")
+    for name, types in COST_PROFILES.items():
+        profile = profiles[name]
+        require(isinstance(profile, dict) and profile.get("types") == types and
+                all(type(item) is int for item in profile["types"]), "measured LUT profile recipe mismatch")
+        digest(profile.get("fixture_sha256"), "cost fixture")
+        digest(profile.get("source_artifact_sha256"), "cost source artifact")
+        # Each measurement must use bytes from this exact full bank.
+        matching = [row for row in bank.value["layers"] if cost_profile(row["layer"]) == name]
+        require(profile["source_artifact_sha256"] in {row["artifact"]["sha256"] for row in matching},
+                "measured LUT fixture does not belong to the admitted bank/profile")
+        rows = profile.get("rows")
+        keys(rows, (str(m) for m in range(1, 5)), "measured M grid")
+        for m, cells in rows.items():
+            keys(cells, (str(k) for k in range(9)), "measured K grid")
+            for k, cell in cells.items():
+                require(isinstance(cell, dict), "invalid measured cost cell")
+                samples = integer(cell.get("samples"), "measured cell samples", count, count)
+                raw = cell.get("raw_ms")
+                require(isinstance(raw, list) and len(raw) == samples, "measured cost samples missing")
+                for sample in raw:
+                    require(real_number(sample, "measured cost sample", positive=k != "0") <= 3600000,
+                            "measured cost exceeds supported job duration")
+                median = real_number(cell.get("median_ms"), "measured median", positive=k != "0")
+                require(math.isclose(median, statistics.median(raw), rel_tol=1e-12, abs_tol=1e-15),
+                        "measured cost median differs from raw samples")
+    return value
+
+
+def validate_cost_hardware(costs, cpus, coordinator=None):
+    """Compare stable worker geometry; recorded CPU MHz is intentionally ignored."""
+    measurement = costs["measurement"]
+    coordinator = measurement["coordinator_cpu"] if coordinator is None else coordinator
+    integer(coordinator, "serving coordinator CPU", 0, 1023)
+    require(coordinator == measurement["coordinator_cpu"], "serving coordinator CPU differs from measured LUT costs")
+    require(list(cpus) == measurement["cpus"], "serving worker CPUs differ from measured LUT costs")
+    for cpu in cpus:
+        root = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        current = dict(package=(root / "physical_package_id").read_text().strip(),
+                       core=(root / "core_id").read_text().strip())
+        require(current == measurement["hardware"]["topology"][str(cpu)],
+                "serving physical-core topology differs from measured LUT costs")
+    root = Path(f"/sys/devices/system/cpu/cpu{coordinator}/topology")
+    core = ((root / "physical_package_id").read_text().strip(), (root / "core_id").read_text().strip())
+    workers = {(row["package"], row["core"]) for row in measurement["hardware"]["topology"].values()}
+    require(core not in workers, "LUT coordinator must use a separate physical core from workers")
+
+
+def load_cost_table(path, expected_sha256, bank, activation):
+    require(path is not None, "GLM53_CT_LUT_COST is required: measured LUT costs are a separate startup gate")
+    digest(expected_sha256, "owner-approved measured cost artifact")
+    value, actual = read_json(path, COST_JSON_LIMIT, "measured cost artifact")
+    require(actual == expected_sha256, "measured cost artifact does not match the owner-approved SHA256")
+    return validate_cost_table(value, bank, activation)
+
+
+def hash_regular(path):
+    with open_regular(path) as (stream, before):
+        result = hashlib.sha256()
+        while True:
+            chunk = stream.read(HASH_CHUNK)
+            if not chunk:
+                break
+            result.update(chunk)
+        unchanged(path, stream, before)
+    return result.hexdigest(), before
+
+
+def load_precompiled(path, expected_sha256):
+    """Admit exact reviewed modules without invoking JIT or initializing CUDA."""
+    require(path is not None, "GLM53_CT_LUT_PRECOMPILE is required; compile before the serving window")
+    digest(expected_sha256, "owner-approved LUT precompile receipt")
+    path = no_symlinks(path)
+    receipt, actual = read_json(path, JSON_LIMIT, "LUT precompile receipt")
+    require(actual == expected_sha256, "LUT precompile receipt does not match the owner-approved SHA256")
+    require(isinstance(receipt, dict) and receipt.get("schema") == "e1-precompile/v1" and
+            receipt.get("variant") == "lut" and receipt.get("state") == "COMPILED_NO_GPU_CONTEXT" and
+            receipt.get("cuda_initialized") is False, "reviewed LUT precompile receipt required")
+    revision = receipt.get("source_revision")
+    require(isinstance(revision, str) and len(revision) == 40 and all(c in "0123456789abcdef" for c in revision),
+            "invalid LUT precompile source revision")
+    require(receipt.get("torch_version") == importlib.metadata.version("torch"), "LUT precompile Torch version mismatch")
+    require("-DFT_ENABLE_LUT=1" in receipt.get("flags", []) and
+            "-DFT_ENABLE_LUT=1" in receipt.get("cuda_flags", []), "both precompiled LUT modules require guarded LUT build flags")
+    sources = receipt.get("source_sha256")
+    required = {"kernels/cpu_avx2/" + name for name in
+                ("ft_tier_ext.cpp", "ft_tier_cu.cu", "ft_core.h", "ft_lut.cpp", "ft_lut.h", "lut/kernels.cpp", "lut/kernels.h")}
+    require(isinstance(sources, dict) and required <= set(sources), "precompiled LUT native source bindings missing")
+    root = Path(__file__).absolute().parent.parent
+    try:
+        head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("reviewed serving checkout revision is unavailable") from error
+    require(head == revision, "serving checkout revision differs from the reviewed LUT precompile")
+    for relative, expected in sources.items():
+        require(isinstance(relative, str) and relative.startswith("kernels/cpu_avx2/") and
+                not Path(relative).is_absolute() and ".." not in Path(relative).parts,
+                "invalid precompile source path")
+        digest(expected, "precompile source")
+        require(hash_regular(root / relative)[0] == expected, "LUT native source differs from the reviewed precompile")
+    outputs = receipt.get("outputs")
+    keys(outputs, ("ft_tier_host.so", "ft_tier_cu.so"), "LUT precompiled modules")
+    require(no_symlinks(receipt.get("build_directory", "")) == path.parent,
+            "LUT precompile build directory differs from its receipt")
+    modules = {}
+    for name, expected in outputs.items():
+        digest(expected, "precompiled module")
+        file = path.parent / name
+        actual, before = hash_regular(file)
+        require(actual == expected, "precompiled LUT module SHA256 mismatch")
+        modules[name] = dict(path=str(file), sha256=actual, identity=before)
+    return dict(receipt=receipt, modules=modules)
+
+
+def validate_staged_identities(staged):
+    """Recheck validated files before passing their bounded extents to C++."""
+    for row in staged["layers"]:
+        path = no_symlinks(row["path"])
+        st = path.stat(follow_symlinks=False)
+        require(stat.S_ISREG(st.st_mode) and identity(st) == row["identity"],
+                "SHA-verified bank artifact changed before native initialization")
 
 
 @dataclass(frozen=True)
@@ -514,6 +678,13 @@ class TierSettings:
     q8_quality: Path | None = None
     q8_quality_sha256: str | None = None
     admission: dict | None = None
+    cost_path: Path | None = None
+    cost_sha256: str | None = None
+    costs: dict | None = None
+    staged_bank: dict | None = None
+    precompile_path: Path | None = None
+    precompile_sha256: str | None = None
+    precompiled: dict | None = None
 
 
 def parse_env(environ=None):
@@ -526,11 +697,20 @@ def parse_env(environ=None):
     q8_quality = env.get("GLM53_CT_LUT_Q8_QUALITY")
     return TierSettings(fmt, activation, Path(manifest) if manifest else None, Path(quality) if quality else None,
                         env.get("GLM53_CT_LUT_QUALITY_SHA256"), Path(q8_quality) if q8_quality else None,
-                        env.get("GLM53_CT_LUT_Q8_QUALITY_SHA256"))
+                        env.get("GLM53_CT_LUT_Q8_QUALITY_SHA256"),
+                        cost_path=Path(env["GLM53_CT_LUT_COST"]) if env.get("GLM53_CT_LUT_COST") else None,
+                        cost_sha256=env.get("GLM53_CT_LUT_COST_SHA256"),
+                        precompile_path=Path(env["GLM53_CT_LUT_PRECOMPILE"]) if env.get("GLM53_CT_LUT_PRECOMPILE") else None,
+                        precompile_sha256=env.get("GLM53_CT_LUT_PRECOMPILE_SHA256"))
 
 
 def preflight(environ=None, *, require_production=True):
-    """Check quality before allocations; production startup remains blocked."""
+    """Admit real quality, then verify measured costs and all bank bytes for startup.
+
+    Quality-only callers leave require_production=False. Verified bank bytes are
+    cached only while every original file identity and all admission digests match.
+    The native loader rechecks these identities before and after its bounded copy.
+    """
     settings = parse_env(environ)
     if settings.format == "trellis":
         return settings
@@ -545,10 +725,46 @@ def preflight(environ=None, *, require_production=True):
     admission = dict(schema="e1-real-admission/v1", real_quality_admitted=True, production_ready=False,
                      bank_manifest_sha256=bank.sha256, report_sha256=reports,
                      capture_manifest_sha256=i16["binding"]["capture_manifest_sha256"], act_limit=i16["act_limit"])
+    costs = staged = precompiled = None
     if require_production:
-        raise RuntimeError(REAL_ADMISSION_MESSAGE)
+        env = os.environ if environ is None else environ
+        for name in ("GLM53_CPU_TIER", "GLM53_EC"):
+            require(env.get(name) == "1", name + "=1 is required for LUT startup")
+        require(bool(env.get("GLM53_ZC_VRAM")), "pinned GPU-readable trellis weights require GLM53_ZC_VRAM")
+        for name in ("GLM53_LA", "GLM53_K_HCFUSE", "GLM53_K_OVL"):
+            require(env.get(name, "0") != "1", name + " is awaiting LUT GPU integration validation; disable it for this path")
+        require(env.get("GLM53_K_FTSPLIT", "0") != "1", "LUT startup requires the guarded stock split kernel; disable GLM53_K_FTSPLIT")
+        require(env.get("GLM53_CT_VALIDATE", "0") != "1", "LUT quality uses real replay and the normal full-model panel; GLM53_CT_VALIDATE is trellis-only")
+        maxbsz = int(env.get("GLM53_CT_MAXBSZ", "4096" if env.get("GLM53_CT_VALIDATE") == "1" else "4"))
+        require(1 <= maxbsz <= 4, "LUT supports M=1..4; set GLM53_CT_MAXBSZ accordingly")
+        require(0 <= int(env.get("GLM53_CT_MAXN", "8")) <= 8, "LUT GLM53_CT_MAXN must be between 0 and 8")
+        require(-1 <= int(env.get("GLM53_CT_FORCE_N", "-1")) <= 8, "LUT GLM53_CT_FORCE_N must be between -1 and 8")
+        timeout = real_number(float(env.get("GLM53_CT_TIMEOUT_S", "2")), "LUT request timeout", positive=True)
+        require(.001 <= timeout <= 3600, "LUT request timeout must be .001..3600 seconds")
+        for name, default in (("GLM53_CT_TZC", ".40"), ("GLM53_CT_THIT", ".023"),
+                              ("GLM53_CT_A", ".11"), ("GLM53_CT_B", ".104"),
+                              ("GLM53_CT_RA", ".37"), ("GLM53_CT_RB", ".03"), ("GLM53_RT_B", ".15")):
+            require(real_number(float(env.get(name, default)), name) <= 3600000, "LUT policy cost exceeds supported duration")
+        require(not env.get("GLM53_CT_LUT", ""), "use SHA-approved GLM53_CT_LUT_COST for LUT format; GLM53_CT_LUT remains the legacy numeric table")
+        costs = load_cost_table(settings.cost_path, settings.cost_sha256, bank, settings.activation)
+        require(costs["measurement"]["act_limit"] == admission["act_limit"],
+                "measured cost activation limit differs from real quality admission")
+        precompiled = load_precompiled(settings.precompile_path, settings.precompile_sha256)
+        require(precompiled["modules"]["ft_tier_host.so"]["sha256"] == costs["measurement"]["build_sha256"],
+                "precompiled LUT host differs from measured cost build")
+        cache_key = (str(bank.path), bank.sha256, settings.activation, tuple(sorted(reports.items())), settings.cost_sha256)
+        staged = _STARTUP_CACHE.get(cache_key)
+        if staged is None:
+            staged = verify_bank(bank.path)
+            require(staged["manifest_sha256"] == bank.sha256, "bank manifest changed during startup admission")
+        validate_staged_identities(staged)
+        _STARTUP_CACHE.clear()  # One startup bank; never accumulate model inventories.
+        _STARTUP_CACHE[cache_key] = staged
+        admission.update(full_bank_verified=True, measured_cost_sha256=settings.cost_sha256)
     return TierSettings(settings.format, settings.activation, settings.manifest, settings.quality,
-                        settings.quality_sha256, settings.q8_quality, settings.q8_quality_sha256, admission)
+                        settings.quality_sha256, settings.q8_quality, settings.q8_quality_sha256, admission,
+                        settings.cost_path, settings.cost_sha256, costs, staged,
+                        settings.precompile_path, settings.precompile_sha256, precompiled)
 
 
 def main(argv=None):

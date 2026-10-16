@@ -242,6 +242,7 @@ class Workers {
     std::atomic<unsigned> ready_{0};
     std::atomic<bool> stop_{false};
     std::atomic<bool> abort_{false};
+    std::atomic<bool> cancelled_{false};
     std::atomic<uint64_t> timeouts_{0};
     std::mutex error_mutex_;
     std::exception_ptr error_;
@@ -249,9 +250,10 @@ class Workers {
     void* context_ = nullptr;
     uint64_t submitted_;
     uint64_t timeout_ms_;
+    const int64_t* external_abort_ = nullptr;
 public:
     bool virtual_tp2;
-    explicit Workers(const Options& options) : submitted_(options.initial_generation), timeout_ms_(options.job_timeout_ms), virtual_tp2(options.virtual_tp2) {
+    explicit Workers(const Options& options) : submitted_(options.initial_generation), timeout_ms_(options.job_timeout_ms), external_abort_(options.abort_flag), virtual_tp2(options.virtual_tp2) {
         set_timeout(options.job_timeout_ms);
         require(options.cpus.size() >= 2 && options.cpus.size() <= 128, "LUT needs at least two bounded worker CPUs");
         cpu_set_t allowed; CPU_ZERO(&allowed);
@@ -319,28 +321,33 @@ public:
     ~Workers() { stop(); for (auto& g : groups_) if (g.control) g.control->~Control(); }
     void capture_error() { std::lock_guard<std::mutex> lock(error_mutex_); if (!error_) error_ = std::current_exception(); }
     void rethrow() { std::exception_ptr error; { std::lock_guard<std::mutex> lock(error_mutex_); error = error_; error_ = nullptr; } if (error) std::rethrow_exception(error); }
-    void run(void (*fn)(void*, int, int, int), void* context) {
+    void run(void (*fn)(void*, int, int, int), void* context, uint64_t remaining_ms = 0) {
+        require(!cancelled_.load(std::memory_order_acquire), "LUT backend was cancelled");
         abort_.store(false, std::memory_order_release);
         task_ = fn; context_ = context; ++submitted_;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining_ms ? std::min(remaining_ms, timeout_ms_) : timeout_ms_);
         for (auto& g : groups_) {
             g.control->remaining.store(unsigned(g.count), std::memory_order_relaxed);
             g.control->epoch.store(submitted_, std::memory_order_release);
         }
-        bool expired = false; unsigned polls = 0;
+        bool expired = false, deadline_expired = false; unsigned polls = 0;
         for (auto& g : groups_) while (g.control->completed.load(std::memory_order_acquire) != submitted_) {
-            if (!expired && (++polls & 255U) == 0 && (stop_.load(std::memory_order_relaxed) || std::chrono::steady_clock::now() >= deadline)) {
-                expired = true; abort_.store(true, std::memory_order_release);
+            if (!expired && (++polls & 255U) == 0 && (stop_.load(std::memory_order_relaxed) || cancelled_.load(std::memory_order_acquire) || (external_abort_ && __atomic_load_n(external_abort_, __ATOMIC_ACQUIRE)) || std::chrono::steady_clock::now() >= deadline)) {
+                expired = true; deadline_expired = std::chrono::steady_clock::now() >= deadline;
+                abort_.store(true, std::memory_order_release);
             }
             _mm_pause();
         }
         // Contexts and buffers remain owned by the caller until BOTH groups have
         // drained. Never detach a worker or return while it can reference them.
-        if (expired) { timeouts_.fetch_add(1, std::memory_order_relaxed); rethrow(); throw std::runtime_error("LUT job deadline expired; both pools drained"); }
+        if (expired) { if (deadline_expired) timeouts_.fetch_add(1, std::memory_order_relaxed); rethrow();
+            throw std::runtime_error(deadline_expired ? "LUT job deadline expired; both pools drained" : "LUT job cancelled; both pools drained"); }
         rethrow();
+        require(!aborted(), "LUT job cancelled; both pools drained");
     }
     void set_timeout(uint64_t milliseconds) { require(milliseconds >= 1 && milliseconds <= 3600000, "LUT job timeout must be 1..3600000 milliseconds"); timeout_ms_ = milliseconds; }
-    bool aborted() const { return abort_.load(std::memory_order_acquire); }
+    void request_abort() { cancelled_.store(true, std::memory_order_release); abort_.store(true, std::memory_order_release); }
+    bool aborted() const { return abort_.load(std::memory_order_acquire) || cancelled_.load(std::memory_order_acquire) || (external_abort_ && __atomic_load_n(external_abort_, __ATOMIC_ACQUIRE)); }
     uint64_t timeouts() const { return timeouts_.load(std::memory_order_relaxed); }
     std::array<uint64_t, 2> naps() const { return {groups_[0].control->naps.load(std::memory_order_relaxed), groups_[1].control->naps.load(std::memory_order_relaxed)}; }
     void barrier(int g) { groups_[g].control->barrier.wait(); }
@@ -780,9 +787,10 @@ void Backend::add_layer(const LayerInput& in) {
     impl_->report = std::move(published);
 }
 
-void Backend::forward(int li, const float* x, int ntok, const Routes& routes, float* output) {
+void Backend::forward(int li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms) {
     std::unique_lock<std::mutex> lock(impl_->mutex, std::try_to_lock);
     require(lock.owns_lock(), "LUT supports one in-flight coordinator job");
+    require(remaining_ms <= 3600000, "LUT remaining deadline budget exceeds one hour");
     require(x && output && ntok >= 1 && ntok <= MAX_TOKENS && routes.size() == size_t(ntok), "LUT supports only M=1..4 with matching routes");
     auto found = impl_->layers.find(li); require(found != impl_->layers.end(), "LUT layer is not loaded");
     Layer& layer = *found->second;
@@ -811,12 +819,19 @@ void Backend::forward(int li, const float* x, int ntok, const Routes& routes, fl
         if (job.m) impl_->jobs[impl_->njobs++] = job;
     }
     impl_->failed.store(false, std::memory_order_release); impl_->failure = nullptr;
-    impl_->workers.run(&Impl::compute, impl_.get());
+    impl_->workers.run(&Impl::compute, impl_.get(), remaining_ms);
     if (impl_->failed.load(std::memory_order_acquire)) std::rethrow_exception(impl_->failure);
     // Both release completions have been acquired before any caller output write.
     for (int n = 0; n < ntok * layer.h; ++n)
         require(std::isfinite(impl_->scratch[0].partial[n] + impl_->scratch[1].partial[n]), "nonfinite merged LUT result");
     for (int n = 0; n < ntok * layer.h; ++n) output[n] = impl_->scratch[0].partial[n] + impl_->scratch[1].partial[n];
+}
+
+void Backend::request_abort() { impl_->workers.request_abort(); }
+void Backend::shutdown() {
+    impl_->workers.request_abort();
+    std::lock_guard<std::mutex> guard(impl_->mutex);
+    impl_->workers.stop();
 }
 
 Receipt Backend::receipt() const {
@@ -838,6 +853,22 @@ void Backend::fixture_set_timeout(uint64_t milliseconds) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     require(impl_->report.offline_fixture, "timeout override is an offline fixture API only");
     impl_->workers.set_timeout(milliseconds);
+}
+uint64_t Backend::fixture_flush_weights() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->report.offline_fixture && !impl_->layers.empty(), "weight flushing requires a loaded offline LUT fixture");
+    uint64_t total = 0;
+    // Validate the entire owned extent before issuing any cache operation.
+    for (const auto& entry : impl_->layers) for (const auto& node : entry.second->nodes) for (const auto& arena : node.arenas) {
+        require(arena && arena->data && arena->bytes && arena->bytes <= FIXTURE_LIMIT - total,
+                "fixture weight flush exceeds its owned allocation bound");
+        total += arena->bytes;
+    }
+    _mm_mfence();
+    for (const auto& entry : impl_->layers) for (const auto& node : entry.second->nodes) for (const auto& arena : node.arenas)
+        for (size_t offset = 0; offset < arena->bytes; offset += 64) _mm_clflush(arena->data + offset);
+    _mm_mfence();
+    return total;
 }
 std::vector<uint8_t> Backend::fixture_slice(int li, int group, int expert, int matrix) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);

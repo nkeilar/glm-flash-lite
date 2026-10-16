@@ -57,6 +57,9 @@ struct Remote
     std::thread th; std::atomic<bool> quit{false};
     std::atomic<long> calls{0}, picks{0}, fallbacks{0}, fallback_picks{0}, connects{0}, errors{0}, timeouts{0}, refused{0};
     std::atomic<long long> rtt_ns{0}, wait_ns{0}, rtt_max_ns{0};
+#ifdef FT_ENABLE_LUT
+    std::mutex chk_mu;
+#endif
     double chk_d2 = 0, chk_r2 = 0; long chk_n = 0;   // worker-thread only: sum |remote-local|^2, sum |local|^2, calls
     std::atomic<bool> enabled{true};          // runtime switch (tier_remote_set): false = every pick computed here
     // [E5] GRT2. version is set by whoever opened the current connection (GRTC v2 probe); the worker re-syncs the full
@@ -81,7 +84,15 @@ struct Tier
     Pool pool;
 #ifdef FT_ENABLE_LUT
     std::unique_ptr<ft_lut::Backend> lut;
-    bool lut_fixture = false;
+    bool lut_fixture = false, lut_test_ingress = false;
+    uint64_t lut_timeout_ms = 30000;
+    double lut_deadline = 0;
+    int64_t lut_generation = 0;
+    std::atomic<bool> lut_active{false};
+    std::atomic<unsigned> lut_waiters{0};
+    std::atomic<long> lut_failed{0}, lut_completed{0};
+    std::mutex lut_error_mutex;
+    std::string lut_error;
 #endif
     std::vector<Layer> layers;
     std::vector<torch::Tensor> keep;
@@ -105,10 +116,26 @@ struct Tier
 };
 
 Tier* T = nullptr;
+#ifdef FT_ENABLE_LUT
+static std::mutex lut_lifecycle_mutex;
+// A caller may arrive with or without the GIL (remote/stop release it). Never
+// wait on the lifecycle mutex while retaining the GIL: full-bank ingest releases
+// and reacquires it while this mutex protects unpublished runtime ownership.
+struct LutLifecycleLock {
+    std::unique_lock<std::mutex> lock{lut_lifecycle_mutex, std::defer_lock};
+    LutLifecycleLock() {
+        if (PyGILState_Check()) { pybind11::gil_scoped_release release; lock.lock(); }
+        else lock.lock();
+    }
+};
+#endif
 
 void tier_init(int64_t threads, std::vector<int64_t> cpus, torch::Tensor ctrl, torch::Tensor hx, torch::Tensor picks, torch::Tensor hout,
                int64_t mode, int64_t H, int64_t I, int64_t nlayers, int64_t swz)
 {
+#ifdef FT_ENABLE_LUT
+    LutLifecycleLock lifecycle;
+#endif
     TORCH_CHECK(T == nullptr, "tier already initialised");
     init_perm(); init_tables();
     T = new Tier();
@@ -129,7 +156,13 @@ void tier_init(int64_t threads, std::vector<int64_t> cpus, torch::Tensor ctrl, t
 void tier_add_layer(int64_t li, torch::Tensor ptrs, torch::Tensor suh_g, torch::Tensor svh_g, torch::Tensor suh_u, torch::Tensor svh_u,
                     torch::Tensor suh_d, torch::Tensor svh_d)
 {
+#ifdef FT_ENABLE_LUT
+    LutLifecycleLock lifecycle;
+#endif
     TORCH_CHECK(T, "init first");
+#ifdef FT_ENABLE_LUT
+    TORCH_CHECK(!T->lut, "LUT startup cannot register a second trellis CPU bank");
+#endif
     const int E = int(ptrs.size(0)), H = T->H, I = T->I;
     for (auto& t : { suh_g, svh_g, suh_u, svh_u, suh_d, svh_d })
         TORCH_CHECK(t.device().is_cpu() && t.scalar_type() == at::kHalf && t.is_contiguous() && t.size(0) == E, "scales: CPU fp16 contiguous [E, .]");
@@ -173,11 +206,37 @@ void tier_add_layer(int64_t li, torch::Tensor ptrs, torch::Tensor suh_g, torch::
     }
 }
 
+#ifdef FT_ENABLE_LUT
+// Mapped ingress extension: [5] sticky abort, [6] sticky error code,
+// [7] failed generation, [8] drained generation. [0..4] retain their ABI.
+static bool lut_aborted()
+{
+    return T && T->lut && T->ctrl && (__atomic_load_n(const_cast<int64_t*>(T->ctrl + 5), __ATOMIC_ACQUIRE) ||
+                                    __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE));
+}
+static void lut_fail(int64_t generation, int code, const std::string& message)
+{
+    { std::lock_guard<std::mutex> guard(T->lut_error_mutex); if (T->lut_error.empty()) T->lut_error = message; }
+    __atomic_store_n(const_cast<int64_t*>(T->ctrl + 5), int64_t(1), __ATOMIC_RELEASE);
+    __atomic_store_n(const_cast<int64_t*>(T->ctrl + 7), generation, __ATOMIC_RELEASE);
+    __atomic_store_n(const_cast<int64_t*>(T->ctrl + 6), int64_t(code), __ATOMIC_RELEASE);
+    T->lut->request_abort();
+}
+static void lut_checkpoint()
+{
+    TORCH_CHECK(!lut_aborted() && !T->quit.load(std::memory_order_relaxed), "LUT request cancelled; ingress remains blocked");
+    TORCH_CHECK(now() < T->lut_deadline, "LUT coordinator job deadline expired");
+}
+#endif
+
 // [rt] socket helpers: full write (MSG_NOSIGNAL) and a busy-polled full read bounded by an absolute deadline
 static bool rt_writev(int fd, struct iovec* iov, int n)
 {
     while (n > 0)
     {
+#ifdef FT_ENABLE_LUT
+        if (T && T->lut && (lut_aborted() || T->quit.load(std::memory_order_relaxed) || now() >= T->lut_deadline)) return false;
+#endif
         struct msghdr mh{}; mh.msg_iov = iov; mh.msg_iovlen = n;
         ssize_t w = sendmsg(fd, &mh, MSG_NOSIGNAL);
         if (w <= 0) return false;
@@ -191,6 +250,9 @@ static int rt_read(int fd, void* buf, size_t len, double deadline)   // 1 ok, 0 
     char* p = static_cast<char*>(buf);
     while (len)
     {
+#ifdef FT_ENABLE_LUT
+        if (T && T->lut && (lut_aborted() || T->quit.load(std::memory_order_relaxed) || now() >= std::min(deadline, T->lut_deadline))) return 0;
+#endif
         ssize_t r = recv(fd, p, len, MSG_DONTWAIT);
         if (r > 0) { p += r; len -= r; continue; }
         if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) return -1;
@@ -204,6 +266,10 @@ static void rt_drop(Remote* R) { int f = R->fd.exchange(-1); if (f >= 0) close(f
 
 static int rt_connect(const std::string& host, int port, int* version = nullptr)
 {
+#ifdef FT_ENABLE_LUT
+    const bool bounded_lut = T && T->lut;
+    const double handshake_deadline = now() + 2.0;
+#endif
     struct addrinfo hints{}, *ai = nullptr; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &ai) || !ai) return -1;
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -223,6 +289,9 @@ static int rt_connect(const std::string& host, int port, int* version = nullptr)
     size_t got = 0;
     while (got < sizeof pr)
     {
+#ifdef FT_ENABLE_LUT
+        if (bounded_lut && (now() >= handshake_deadline || T->quit.load(std::memory_order_relaxed))) { close(fd); return -1; }
+#endif
         struct pollfd rf{ fd, POLLIN, 0 };
         if (poll(&rf, 1, 300) != 1) { close(fd); return -1; }
         ssize_t r = recv(fd, reinterpret_cast<char*>(&pr) + got, sizeof pr - got, MSG_DONTWAIT);
@@ -239,6 +308,9 @@ static int rt_connect(const std::string& host, int port, int* version = nullptr)
         std::string buf; size_t need = 8;
         while (buf.size() < need)
         {
+#ifdef FT_ENABLE_LUT
+            if (bounded_lut && (now() >= handshake_deadline || T->quit.load(std::memory_order_relaxed))) { close(fd); return -1; }
+#endif
             struct pollfd rf{ fd, POLLIN, 0 };
             if (poll(&rf, 1, 2000) != 1) { close(fd); return -1; }
             char tmp[65536];
@@ -248,7 +320,13 @@ static int rt_connect(const std::string& host, int port, int* version = nullptr)
             if (buf.size() == 8 && need == 8)
             {
                 if (buf.compare(0, 4, "GRTC")) { close(fd); return -1; }
+#ifdef FT_ENABLE_LUT
+                uint32_t len; std::memcpy(&len, buf.data() + 4, 4);
+                if (bounded_lut && len > (1u << 20)) { close(fd); return -1; }
+                need = 8 + size_t(len);
+#else
                 uint32_t len; std::memcpy(&len, buf.data() + 4, 4); need = 8 + size_t(len);
+#endif
             }
         }
         if (buf.find("\"version\": 2") != std::string::npos || buf.find("\"version\":2") != std::string::npos) *version = 2;
@@ -262,7 +340,11 @@ static void local_forward(int li, int ntok, const std::vector<std::vector<std::p
 #ifdef FT_ENABLE_LUT
     if (T->lut)
     {
-        T->lut->forward(li, T->xf.data(), ntok, route, out);
+        const bool active = T->lut_active.load(std::memory_order_acquire);
+        if (active) lut_checkpoint();
+        const uint64_t remaining_ms = active ? uint64_t(std::max(1.0, std::ceil((T->lut_deadline - now()) * 1000.0))) : 0;
+        T->lut->forward(li, T->xf.data(), ntok, route, out, remaining_ms);
+        if (active) lut_checkpoint();
         return;
     }
 #endif
@@ -277,8 +359,31 @@ void run_job(int li, int ntok, int np)
 {
     const double tp0 = now();
     const int H = T->H;
+#ifdef FT_ENABLE_LUT
+    if (T->lut)
+    {
+        lut_checkpoint();
+        TORCH_CHECK(li >= 0 && li < int(T->layers.size()) && ntok >= 1 && ntok <= 4 && np >= 0 && np <= ntok * 8,
+                    "LUT ingress layer/token/pick bounds violated");
+        std::array<int, 4> count{};
+        std::array<std::array<bool, 288>, 4> seen{};
+        const int experts = int(T->layers[size_t(li)].ex.size());
+        for (int k = 0; k < np; ++k)
+        {
+            const int t = T->picks[k * 3], e = T->picks[k * 3 + 1]; float weight;
+            std::memcpy(&weight, &T->picks[k * 3 + 2], 4);
+            TORCH_CHECK(t >= 0 && t < ntok && e >= 0 && e < experts && std::isfinite(weight) && weight >= 0,
+                        "LUT ingress contains an invalid route");
+            TORCH_CHECK(++count[size_t(t)] <= 8 && !seen[size_t(t)][size_t(e)], "LUT ingress duplicate route or too many picks per token");
+            seen[size_t(t)][size_t(e)] = true;
+        }
+    }
+#endif
     T->xf.resize(size_t(std::max(ntok, 1)) * H);
     for (size_t i = 0; i < size_t(ntok) * H; ++i) T->xf[i] = h2f(T->hx[i]);
+#ifdef FT_ENABLE_LUT
+    if (T->lut) for (float value : T->xf) TORCH_CHECK(std::isfinite(value), "LUT ingress contains nonfinite activation");
+#endif
     if (np == 0)
     {
         std::memset(T->hout, 0, size_t(ntok) * H * 4); T->st.empty++;
@@ -317,6 +422,9 @@ void run_job(int li, int ntok, int np)
         const int fd = R->fd.load(std::memory_order_relaxed);
         if (v2)
         {
+#ifdef FT_ENABLE_LUT
+            std::lock_guard<std::mutex> generation_lock(R->chk_mu);
+#endif
             if (R->resync.exchange(false)) R->client_gen = 0xFFFFFFFFu;   // after a (re)connect: ask for the full map
             const uint16_t nh = uint16_t(std::min<size_t>(R->hints.size() / 2, 256));
             RtHdr2 h{ { 'G', 'R', 'T', '2' }, ++R->seq, R->mlayer[li], ntok, nr, 0, R->client_gen, nh, 0 };
@@ -362,6 +470,14 @@ void run_job(int li, int ntok, int np)
                 refused = hdr_ok && rh.status != 0;           // whole call refused: header (+ deltas) only, stream in sync
                 if (hdr_ok && !refused) rc = rt_read(fd, R->rbuf.data(), size_t(ntok) * H * 4, dl);
                 if (hdr_ok && rc == 1 && rh.n_delta) { R->dbuf.resize(size_t(rh.n_delta) * 3); rc = rt_read(fd, R->dbuf.data(), size_t(rh.n_delta) * 6, dl); }
+#ifdef FT_ENABLE_LUT
+                if (T->lut && hdr_ok && rc == 1 && !refused)
+                {
+                    const uint64_t valid_mask = nr == 64 ? ~0ull : ((1ull << nr) - 1);
+                    if ((rh.refused_mask & ~valid_mask) || !std::all_of(R->rbuf.begin(), R->rbuf.end(), [](float x) { return std::isfinite(x); }))
+                    { hdr_ok = false; rc = -1; }
+                }
+#endif
                 if (hdr_ok && rc == 1)
                 {
                     if (rh.n_delta || rh.delta_full)
@@ -378,7 +494,11 @@ void run_job(int li, int ntok, int np)
                         }
                         R->deltas += rh.n_delta; if (rh.delta_full) R->full_maps++;
                     }
+#ifdef FT_ENABLE_LUT
+                    { std::lock_guard<std::mutex> generation_lock(R->chk_mu); R->client_gen = rh.server_gen; }
+#else
                     R->client_gen = rh.server_gen;
+#endif
                     if (!refused) { ok = true; rmask = rh.refused_mask; }
                 }
                 if (rc != 1) refused = false;                 // a short read after the header: stream out of sync -> drop below
@@ -391,6 +511,10 @@ void run_job(int li, int ntok, int np)
                 // a refusal is header-only (flags != 0): the stream stays in sync, keep the connection, compute here
                 refused = hdr_ok && rh.flags != 0;
                 if (hdr_ok && !refused) rc = rt_read(fd, R->rbuf.data(), size_t(ntok) * H * 4, dl);
+#ifdef FT_ENABLE_LUT
+                if (T->lut && hdr_ok && !refused && rc == 1 &&
+                    !std::all_of(R->rbuf.begin(), R->rbuf.end(), [](float x) { return std::isfinite(x); })) { hdr_ok = false; rc = -1; }
+#endif
                 if (hdr_ok && !refused && rc == 1) { ok = true; rmask = 0; }
             }
             if (refused) R->refused++;
@@ -401,6 +525,9 @@ void run_job(int li, int ntok, int np)
                 {
                     R->tmp.resize(size_t(ntok) * H);
                     local_forward(li, ntok, rroute, nr, R->tmp.data(), nullptr);
+#ifdef FT_ENABLE_LUT
+                    std::lock_guard<std::mutex> diagnostic_lock(R->chk_mu);
+#endif
                     for (size_t i = 0; i < size_t(ntok) * H; ++i)
                     { const double d = double(R->rbuf[i]) - R->tmp[i]; R->chk_d2 += d * d; R->chk_r2 += double(R->tmp[i]) * R->tmp[i]; }
                     R->chk_n++;
@@ -435,6 +562,13 @@ void run_job(int li, int ntok, int np)
             }
         }
     }
+#ifdef FT_ENABLE_LUT
+    if (T->lut)
+    {
+        lut_checkpoint();
+        for (size_t n = 0; n < size_t(ntok) * H; ++n) TORCH_CHECK(std::isfinite(T->hout[n]), "nonfinite LUT routed result");
+    }
+#endif
     for (int k = 0; k < 5; ++k) T->pt_ns[k].fetch_add(int64_t(lp.t[k] * 1e9), std::memory_order_relaxed);
     T->st.experts += np; T->st.tokens += ntok;
     const int b = std::min(nl, 16);   // [rt] job histogram
@@ -445,7 +579,13 @@ void run_job(int li, int ntok, int np)
 }
 
 // [rt T-27] CPU-tier SwiGLU clamp (exllamav3 semantics); 0 = off. Call before tier_start.
+#ifdef FT_ENABLE_LUT
+void tier_set_act_limit(double limit) {
+    TORCH_CHECK(!T || !T->lut, "LUT activation limit is fixed by model-bound startup admission");
+    ACT_LIMIT = float(limit); }
+#else
 void tier_set_act_limit(double limit) { ACT_LIMIT = float(limit); }
+#endif
 
 // [E5] current residency as uint8 [layers, E] (rows of layers without residency stay 0) — for the device masks (E4 split,
 // E3b skip) that cpu_tier refreshes when the dynamic server's deltas change it
@@ -480,8 +620,29 @@ std::vector<int64_t> tier_job_hist()
 // [rt] enable the remote tier. res[li]: uint8 [E] residency (empty tensor = none for that layer); mlayer[li]: model layer
 void tier_remote(std::string host, int64_t port, std::vector<torch::Tensor> res, std::vector<int64_t> mlayer, int64_t timeout_us)
 {
+#ifdef FT_ENABLE_LUT
+    LutLifecycleLock lifecycle;
+#endif
     TORCH_CHECK(T && !T->rt, "tier_remote: init first / already enabled");
     TORCH_CHECK(res.size() == T->layers.size() && mlayer.size() == T->layers.size(), "tier_remote: one entry per layer");
+#ifdef FT_ENABLE_LUT
+    if (T->lut)
+    {
+        TORCH_CHECK(!T->running && timeout_us >= 1 && timeout_us <= 3600000000LL && port >= 1 && port <= 65535,
+                    "LUT remote setup requires a stopped tier and bounded port/timeout");
+        for (size_t li = 0; li < res.size(); ++li)
+            TORCH_CHECK(res[li].device().is_cpu() && res[li].scalar_type() == at::kByte && res[li].is_contiguous() &&
+                        (res[li].numel() == 0 || res[li].numel() == int64_t(T->layers[li].ex.size())) && mlayer[li] == int64_t(li) + 3,
+                        "LUT remote residency/model-layer geometry mismatch");
+        // Resolve once at startup. Reconnect and teardown never depend on a new
+        // potentially slow DNS transaction; the worker socket uses this address.
+        struct addrinfo hints{}, *address = nullptr; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+        TORCH_CHECK(getaddrinfo(host.c_str(), nullptr, &hints, &address) == 0 && address, "LUT remote address resolution failed");
+        char numeric[INET_ADDRSTRLEN]; const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(address->ai_addr);
+        const char* converted = inet_ntop(AF_INET, &ipv4->sin_addr, numeric, sizeof numeric); freeaddrinfo(address);
+        TORCH_CHECK(converted, "LUT remote address conversion failed"); host = numeric;
+    }
+#endif
     Remote* R = new Remote();
     R->host = host; R->port = int(port); R->timeout_ns = timeout_us * 1000;
     { const char* v = std::getenv("GLM53_RT_CHECK"); R->check = v ? std::max(0, std::atoi(v)) : 0; }
@@ -516,11 +677,56 @@ std::vector<int64_t> tier_remote_stats()
 {
     if (!T || !T->rt) return {};
     Remote* R = T->rt;
+#ifdef FT_ENABLE_LUT
+    std::lock_guard<std::mutex> diagnostic_lock(R->chk_mu);
+    const double metric = R->chk_r2 > 0 ? 1e9 * std::sqrt(R->chk_d2 / R->chk_r2) : -1;
+    const int64_t bounded_metric = metric >= double(std::numeric_limits<int64_t>::max()) ? std::numeric_limits<int64_t>::max() :
+                                   (metric >= 0 && std::isfinite(metric) ? int64_t(metric) : -1);
+#endif
     return { R->fd.load() >= 0, R->calls.load(), R->picks.load(), R->fallbacks.load(), R->fallback_picks.load(), R->connects.load(),
              R->errors.load(), R->timeouts.load(), R->rtt_ns.load(), R->wait_ns.load(), R->rtt_max_ns.load(),
+#ifdef FT_ENABLE_LUT
+             R->chk_n, bounded_metric, R->refused.load(),
+#else
              R->chk_n, (int64_t) (R->chk_r2 > 0 ? 1e9 * std::sqrt(R->chk_d2 / R->chk_r2) : -1), R->refused.load(),
+#endif
              R->version.load(), R->deltas.load(), R->full_maps.load(), R->partial.load(), R->hints_sent.load(), int64_t(R->client_gen) };   // [E5] 14-19
 }
+
+#ifdef FT_ENABLE_LUT
+static void lut_worker_main(int cpu0)
+{
+    Pool::pin(cpu0);
+    int64_t last = __atomic_load_n(const_cast<int64_t*>(T->ctrl + 8), __ATOMIC_ACQUIRE);
+    while (!T->quit.load(std::memory_order_acquire))
+    {
+        const int64_t generation = __atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE);
+        if (generation == last || lut_aborted()) { _mm_pause(); continue; }
+        const double started = now();
+        T->lut_active.store(true, std::memory_order_release);
+        T->lut_generation = generation; T->lut_deadline = started + T->lut_timeout_ms * 1e-3;
+        try
+        {
+            TORCH_CHECK(generation > 0 && generation > last, "LUT ingress generation reuse or wrap is unsupported");
+            run_job(int(T->ctrl[2]), int(T->ctrl[3]), int(T->ctrl[4]));
+            lut_checkpoint();
+            // Publish only complete results. Draining and result completion are
+            // distinct: failures publish [8] but never the success word [1].
+            __atomic_store_n(const_cast<int64_t*>(T->ctrl + 8), generation, __ATOMIC_RELEASE);
+            __atomic_store_n(const_cast<int64_t*>(T->ctrl + 1), generation, __ATOMIC_RELEASE);
+            T->lut_completed.fetch_add(1, std::memory_order_relaxed);
+        }
+        catch (const std::exception& error) { T->lut_failed++; lut_fail(generation, 1, error.what()); }
+        catch (...) { T->lut_failed++; lut_fail(generation, 1, "unknown LUT coordinator failure"); }
+        // run_job/backend always drain before unwinding. Keep input and output
+        // pinned references alive even after this thread stops.
+        __atomic_store_n(const_cast<int64_t*>(T->ctrl + 8), generation, __ATOMIC_RELEASE);
+        T->lut_active.store(false, std::memory_order_release);
+        T->st.busy_ns += (long long)((now() - started) * 1e9); T->st.jobs++;
+        last = generation;
+    }
+}
+#endif
 
 void worker_main(int cpu0)
 {
@@ -557,9 +763,22 @@ std::vector<int64_t> tier_set_e6(int64_t fuse, int64_t fuse_maxn, int64_t lean)
 
 void tier_start(int64_t cpu0)
 {
+#ifdef FT_ENABLE_LUT
+    LutLifecycleLock lifecycle;
+#endif
     TORCH_CHECK(T && !T->running, "init first / already running");
 #ifdef FT_ENABLE_LUT
-    TORCH_CHECK(!T->lut, "LUT GPU coordinator startup is unavailable: reviewed real-activation admission and request-error handling are required; offline API only");
+    if (T->lut)
+    {
+        TORCH_CHECK(!T->lut_fixture, "offline LUT fixture cannot start a production coordinator");
+        const auto receipt = T->lut->receipt();
+        TORCH_CHECK(receipt.bank_complete && receipt.placement_verified && T->ctrl, "LUT production bank/ingress is not ready");
+        TORCH_CHECK(!lut_aborted() && !T->quit.load(), "LUT coordinator is stopped or failed; restart required");
+        cpu_set_t allowed; CPU_ZERO(&allowed);
+        TORCH_CHECK(cpu0 >= 0 && cpu0 < CPU_SETSIZE && sched_getaffinity(0, sizeof allowed, &allowed) == 0 && CPU_ISSET(int(cpu0), &allowed),
+                    "LUT coordinator CPU is outside allowed affinity");
+        T->th = std::thread(lut_worker_main, int(cpu0)); T->running = true; return;
+    }
 #endif
     T->running = true;
     T->th = std::thread(worker_main, int(cpu0));
@@ -567,7 +786,25 @@ void tier_start(int64_t cpu0)
 
 void tier_stop()
 {
+#ifdef FT_ENABLE_LUT
+    LutLifecycleLock lifecycle;
+#endif
     if (!T) return;
+#ifdef FT_ENABLE_LUT
+    if (T->lut)
+    {
+        if (T->ctrl) lut_fail(__atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE), 3, "LUT coordinator stopped");
+        T->quit.store(true, std::memory_order_release);
+        if (T->th.joinable()) T->th.join();
+        if (T->rt) { T->rt->quit = true; if (T->rt->th.joinable()) T->rt->th.join(); rt_drop(T->rt); }
+        T->lut->shutdown();
+        if (T->ctrl) __atomic_store_n(const_cast<int64_t*>(T->ctrl + 8), __atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+        T->running = false;
+        // Retain backend + ingress ownership until process teardown/reset. A
+        // device timeout may have returned before the CPU stopped reading.
+        return;
+    }
+#endif
     T->quit = true;
     if (T->th.joinable()) T->th.join();
     if (T->rt) { T->rt->quit = true; if (T->rt->th.joinable()) T->rt->th.join(); rt_drop(T->rt); }   // [rt]
@@ -627,10 +864,151 @@ std::vector<int64_t> tier_stats()
 }
 
 #ifdef FT_ENABLE_LUT
+static ft_lut::LayerInput lut_descriptor(pybind11::dict descriptor)
+{
+    ft_lut::LayerInput input;
+    input.model_layer = descriptor["model_layer"].cast<int>(); input.internal_li = descriptor["internal_li"].cast<int>(); input.path = descriptor["path"].cast<std::string>();
+    auto identity = descriptor["identity"].cast<pybind11::dict>();
+    input.identity = {identity["dev"].cast<uint64_t>(), identity["ino"].cast<uint64_t>(), identity["size"].cast<uint64_t>(),
+                      identity["mtime_ns"].cast<int64_t>(), identity["ctime_ns"].cast<int64_t>()};
+    auto tensors = descriptor["tensors"].cast<pybind11::list>(); TORCH_CHECK(tensors.size() == 3, "LUT needs gate/up/down descriptors");
+    for (int m = 0; m < 3; ++m)
+    {
+        auto tensor = tensors[m].cast<pybind11::dict>();
+        input.tensors[m] = {tensor["offset"].cast<uint64_t>(), tensor["nbytes"].cast<uint64_t>(), tensor["type_id"].cast<int>(),
+                           tensor["width"].cast<int>(), tensor["rows"].cast<int>(), tensor["experts"].cast<int>()};
+    }
+    return input;
+}
+static void lut_bind_ingress(Tier& tier, torch::Tensor ctrl, torch::Tensor hx, torch::Tensor picks, torch::Tensor hout, bool fixture)
+{
+    for (const auto& tensor : {ctrl, hx, picks, hout})
+    {
+        TORCH_CHECK(tensor.device().is_cpu() && tensor.is_contiguous(), "LUT ingress must be contiguous CPU tensors");
+        TORCH_CHECK(fixture ? !tensor.is_pinned() : tensor.is_pinned(),
+                    fixture ? "offline coordinator tests require unpinned CPU buffers" : "production LUT ingress requires pinned GPU-mapped buffers");
+    }
+    TORCH_CHECK(ctrl.scalar_type() == at::kLong && ctrl.numel() >= 16 && hx.scalar_type() == at::kHalf && hx.numel() >= 4 * tier.H &&
+                picks.scalar_type() == at::kInt && picks.numel() >= 4 * 8 * 3 && hout.scalar_type() == at::kFloat && hout.numel() >= 4 * tier.H,
+                "LUT ingress buffer dtype/capacity mismatch");
+    for (int i = 0; i < 16; ++i) TORCH_CHECK(ctrl.data_ptr<int64_t>()[i] == 0, "LUT ingress control must start at zero");
+    tier.ctrl = reinterpret_cast<volatile int64_t*>(ctrl.data_ptr<int64_t>());
+    tier.hx = reinterpret_cast<const uint16_t*>(hx.data_ptr()); tier.picks = picks.data_ptr<int32_t>(); tier.hout = hout.data_ptr<float>();
+    tier.keep = {ctrl, hx, picks, hout};
+}
+// Python supplies independently SHA-verified complete descriptors and admits
+// the model-bound real quality report before entering this allocation boundary.
+void tier_init_lut(std::vector<int64_t> cpus, std::string activation, pybind11::list descriptors,
+                   torch::Tensor ctrl, torch::Tensor hx, torch::Tensor picks, torch::Tensor hout,
+                   double act_limit, int64_t job_timeout_ms)
+{
+    LutLifecycleLock lifecycle;
+    TORCH_CHECK(!T, "tier already initialised");
+    TORCH_CHECK(std::isfinite(act_limit) && act_limit > 0 && act_limit <= std::numeric_limits<float>::max(), "LUT activation limit must be finite and positive");
+    TORCH_CHECK(job_timeout_ms >= 1 && job_timeout_ms <= 3600000, "LUT coordinator timeout must be 1..3600000 milliseconds");
+    std::vector<ft_lut::LayerInput> inputs;
+    for (auto descriptor : descriptors) inputs.push_back(lut_descriptor(descriptor.cast<pybind11::dict>()));
+    // Complete geometry is checked before pools, pinning or bank allocation.
+    ft_lut::bank_plan(inputs);
+    auto tier = std::make_unique<Tier>(); tier->H = 4096; tier->I = 2048; tier->swz = 0; tier->lut_timeout_ms = uint64_t(job_timeout_ms);
+    lut_bind_ingress(*tier, ctrl, hx, picks, hout, false);
+    ft_lut::Options options; options.cpus.assign(cpus.begin(), cpus.end()); options.activation = activation;
+    options.act_limit = float(act_limit); options.job_timeout_ms = uint64_t(job_timeout_ms); options.abort_flag = ctrl.data_ptr<int64_t>() + 5;
+    // Release the GIL during full-bank ingest; no global runtime is visible until
+    // both the native loader and strict placement checks have completed.
+    { pybind11::gil_scoped_release release; tier->lut = ft_lut::Backend::staged_bank(options, inputs); }
+    tier->layers.resize(42);
+    for (auto& layer : tier->layers) { layer.H = 4096; layer.I = 2048; layer.ex.resize(288); }
+    T = tier.release();
+}
+void tier_lut_check()
+{
+    TORCH_CHECK(T && T->lut && T->ctrl, "LUT coordinator ingress is not initialized");
+    if (lut_aborted())
+    {
+        std::lock_guard<std::mutex> guard(T->lut_error_mutex);
+        TORCH_CHECK(false, "LUT request aborted (error ", __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE),
+                    ", generation ", __atomic_load_n(const_cast<int64_t*>(T->ctrl + 7), __ATOMIC_ACQUIRE), "): ",
+                    T->lut_error.empty() ? "device combine timeout or ingress failure; restart required" : T->lut_error);
+    }
+}
+void tier_lut_abort()
+{
+    TORCH_CHECK(T && T->lut && T->ctrl, "LUT coordinator ingress is not initialized");
+    lut_fail(__atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE), 3, "LUT request explicitly cancelled");
+}
+// CPU-only fault tests bind ordinary, deliberately non-mapped buffers. This
+// cannot start the production path or satisfy bank/quality admission.
+void tier_lut_fixture_coordinator_start(int64_t cpu, torch::Tensor ctrl, torch::Tensor hx, torch::Tensor picks, torch::Tensor hout, int64_t timeout_ms)
+{
+    LutLifecycleLock lifecycle;
+    TORCH_CHECK(T && T->lut && T->lut_fixture && !T->running && !T->ctrl, "fresh offline fixture required");
+    TORCH_CHECK(timeout_ms >= 1 && timeout_ms <= 3600000, "LUT coordinator timeout out of range");
+    lut_bind_ingress(*T, ctrl, hx, picks, hout, true); T->lut_test_ingress = true; T->lut_timeout_ms = uint64_t(timeout_ms);
+    T->lut->fixture_set_timeout(uint64_t(timeout_ms));
+    cpu_set_t allowed; CPU_ZERO(&allowed);
+    TORCH_CHECK(cpu >= 0 && cpu < CPU_SETSIZE && sched_getaffinity(0, sizeof allowed, &allowed) == 0 && CPU_ISSET(int(cpu), &allowed), "offline coordinator CPU is outside allowed affinity");
+    T->th = std::thread(lut_worker_main, int(cpu)); T->running = true;
+}
+// Emulate the device's publication/wait protocol without CUDA or mapped pages.
+// Waiting has a combine-style deadline and leaves storage owned on failure.
+torch::Tensor tier_lut_fixture_job(int64_t li, torch::Tensor x, torch::Tensor sel, torch::Tensor weights, int64_t sequence, int64_t timeout_ms)
+{
+    TORCH_CHECK(T && T->lut_fixture && T->lut_test_ingress && T->running, "offline coordinator test is not running");
+    unsigned no_waiter = 0;
+    TORCH_CHECK(T->lut_waiters.compare_exchange_strong(no_waiter, 1), "only one offline ingress waiter is supported");
+    struct Waiter { Tier* tier; ~Waiter() { tier->lut_waiters.store(0, std::memory_order_release); } } waiter{T};
+    TORCH_CHECK(x.device().is_cpu() && x.scalar_type() == at::kHalf && x.is_contiguous() && x.dim() == 2 &&
+                x.size(0) >= 1 && x.size(0) <= 4 && x.size(1) == T->H, "offline ingress x must be CPU half [M,H], M=1..4");
+    TORCH_CHECK(sel.device().is_cpu() && sel.scalar_type() == at::kInt && sel.is_contiguous() && sel.dim() == 2 &&
+                sel.size(0) == x.size(0) && sel.size(1) <= 8 && weights.device().is_cpu() && weights.scalar_type() == at::kFloat &&
+                weights.is_contiguous() && weights.sizes() == sel.sizes(), "offline ingress route tensors must be CPU int32/float32 [M,K<=8]");
+    TORCH_CHECK(sequence > 0 && sequence < std::numeric_limits<int64_t>::max() && timeout_ms >= 1 && timeout_ms <= 3600000,
+                "offline ingress generation/deadline out of bounds");
+    tier_lut_check();
+    const int64_t previous = __atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE);
+    TORCH_CHECK(sequence > previous && previous == __atomic_load_n(const_cast<int64_t*>(T->ctrl + 8), __ATOMIC_ACQUIRE),
+                "offline ingress generation reused or previous job is still draining");
+    std::memcpy(const_cast<uint16_t*>(T->hx), x.data_ptr(), size_t(x.numel()) * 2);
+    int np = 0;
+    for (int token = 0; token < x.size(0); ++token) for (int slot = 0; slot < sel.size(1); ++slot)
+    {
+        const int at = token * int(sel.size(1)) + slot;
+        if (sel.data_ptr<int32_t>()[at] == -1 && weights.data_ptr<float>()[at] == 0) continue;
+        auto* pick = const_cast<int32_t*>(T->picks) + size_t(np++) * 3;
+        pick[0] = token; pick[1] = sel.data_ptr<int32_t>()[at]; std::memcpy(pick + 2, weights.data_ptr<float>() + at, 4);
+    }
+    T->ctrl[2] = li; T->ctrl[3] = x.size(0); T->ctrl[4] = np;
+    __atomic_store_n(const_cast<int64_t*>(T->ctrl), sequence, __ATOMIC_RELEASE);
+    {
+        pybind11::gil_scoped_release release;
+        const double deadline = now() + timeout_ms * 1e-3;
+        while (__atomic_load_n(const_cast<int64_t*>(T->ctrl + 1), __ATOMIC_ACQUIRE) != sequence && !lut_aborted())
+        {
+            if (now() >= deadline) { lut_fail(sequence, 2, "offline combine deadline expired"); break; }
+            _mm_pause();
+        }
+    }
+    tier_lut_check();
+    auto output = torch::empty({x.size(0), int64_t(T->H)}, torch::kFloat);
+    std::memcpy(output.data_ptr<float>(), T->hout, size_t(output.numel()) * 4);
+    return output;
+}
+
+void tier_lut_fixture_fault(int phase, int group, int delay_ms)
+{
+    TORCH_CHECK(T && T->lut_fixture && !T->running, "fault injection requires a stopped offline fixture");
+    if (delay_ms < 0) T->lut->inject_failure(phase, group);
+    else T->lut->inject_delay(phase, group, unsigned(delay_ms));
+}
+
 // Explicit bounded offline API: it owns neither ingress buffers nor a GPU
 // coordinator, and cannot be selected to bypass production startup admission.
 void tier_init_lut_fixture(std::vector<int64_t> cpus, std::string activation, int64_t H, int64_t I, int64_t E, bool virtual_tp2, double act_limit)
 {
+#ifdef FT_ENABLE_LUT
+    LutLifecycleLock lifecycle;
+#endif
     TORCH_CHECK(T == nullptr, "tier already initialised");
     TORCH_CHECK(H >= 256 && H <= 4096 && H % 256 == 0 && I >= 512 && I <= 2048 && I % 512 == 0 && E >= 1 && E <= 8,
                 "LUT offline fixture exceeds bounded geometry");
@@ -647,6 +1025,7 @@ void tier_init_lut_fixture(std::vector<int64_t> cpus, std::string activation, in
 }
 void tier_lut_fixture_add_layer(pybind11::dict descriptor)
 {
+    LutLifecycleLock lifecycle;
     TORCH_CHECK(T && T->lut_fixture && T->lut && !T->running, "offline LUT fixture init required");
     ft_lut::LayerInput input;
     input.model_layer = descriptor["model_layer"].cast<int>(); input.internal_li = descriptor["internal_li"].cast<int>(); input.path = descriptor["path"].cast<std::string>();
@@ -666,9 +1045,18 @@ void tier_lut_fixture_add_layer(pybind11::dict descriptor)
 }
 pybind11::dict tier_lut_fixture_stats()
 {
-    TORCH_CHECK(T && T->lut_fixture && T->lut, "offline LUT fixture init required");
+    TORCH_CHECK(T && T->lut, "LUT init required");
     const auto receipt = T->lut->receipt(); pybind11::dict result;
-    result["scope"] = "offline fixture only; no serving or promotion admission";
+    result["scope"] = T->lut_fixture ? "offline fixture only; no serving or promotion admission" : "production LUT bank";
+    result["bank_complete"] = receipt.bank_complete;
+    result["production_ready"] = !T->lut_fixture && receipt.bank_complete && receipt.placement_verified;
+    result["coordinator_running"] = T->running.load(); result["coordinator_active"] = T->lut_active.load();
+    result["completed_jobs"] = T->lut_completed.load(); result["failed_jobs"] = T->lut_failed.load();
+    result["job_timeout_ms"] = T->lut_timeout_ms;
+    result["aborted"] = lut_aborted();
+    if (T->ctrl) { result["error_code"] = __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE);
+                   result["failed_generation"] = __atomic_load_n(const_cast<int64_t*>(T->ctrl + 7), __ATOMIC_ACQUIRE);
+                   result["drained_generation"] = __atomic_load_n(const_cast<int64_t*>(T->ctrl + 8), __ATOMIC_ACQUIRE); }
     result["format"] = "lut"; result["activation"] = receipt.activation; result["act_limit"] = receipt.act_limit; result["swz_bytes"] = T->swz_bytes;
     result["placement_verified"] = receipt.placement_verified; result["virtual_tp2"] = receipt.virtual_tp2;
     result["payload_bytes"] = receipt.payload_bytes; result["mapped_bytes"] = receipt.mapped_bytes; result["scratch_bytes"] = receipt.scratch_bytes;
@@ -706,9 +1094,22 @@ pybind11::dict tier_lut_fixture_stats()
     }
     result["regions"] = regions; result["controls"] = controls; result["scratch"] = scratch; return result;
 }
+uint64_t tier_lut_fixture_flush_weights()
+{
+    LutLifecycleLock lifecycle;
+    TORCH_CHECK(T && T->lut && T->lut_fixture && !T->running && T->lut_waiters.load(std::memory_order_acquire) == 0,
+                "weight flushing requires a stopped offline LUT fixture with no API waiter");
+    // Lifecycle ownership outlives the GIL release; reset/stop cannot free or
+    // shut down this backend until the bounded flush has completed.
+    pybind11::gil_scoped_release release;
+    return T->lut->fixture_flush_weights();
+}
 void tier_lut_fixture_reset()
 {
-    TORCH_CHECK(T && T->lut_fixture && !T->running && !T->rt, "only a stopped offline LUT fixture can reset");
+    LutLifecycleLock lifecycle;
+    TORCH_CHECK(T && T->lut_fixture && !T->running && T->lut_waiters.load(std::memory_order_acquire) == 0,
+                "only a stopped offline LUT fixture with no API waiter can reset");
+    if (T->rt) { T->rt->quit = true; if (T->rt->th.joinable()) T->rt->th.join(); rt_drop(T->rt); delete T->rt; T->rt = nullptr; }
     T->lut.reset(); delete T; T = nullptr;
 }
 #endif
@@ -720,19 +1121,36 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tier_init", &ft::tier_init);
     m.def("tier_add_layer", &ft::tier_add_layer);
     m.def("tier_start", &ft::tier_start);
+#ifdef FT_ENABLE_LUT
+    m.def("tier_stop", &ft::tier_stop, pybind11::call_guard<pybind11::gil_scoped_release>());
+#else
     m.def("tier_stop", &ft::tier_stop);
+#endif
     m.def("tier_forward", &ft::tier_forward);
     m.def("tier_stats", &ft::tier_stats);
 #ifdef FT_ENABLE_LUT
+    m.def("tier_init_lut", &ft::tier_init_lut, pybind11::arg("cpus"), pybind11::arg("activation"), pybind11::arg("descriptors"),
+          pybind11::arg("ctrl"), pybind11::arg("hx"), pybind11::arg("picks"), pybind11::arg("hout"), pybind11::arg("act_limit"), pybind11::arg("job_timeout_ms") = 30000);
+    m.def("tier_lut_stats", &ft::tier_lut_fixture_stats);
+    m.def("tier_lut_check", &ft::tier_lut_check);
+    m.def("tier_lut_abort", &ft::tier_lut_abort);
+    m.def("tier_lut_fixture_coordinator_start", &ft::tier_lut_fixture_coordinator_start);
+    m.def("tier_lut_fixture_fault", &ft::tier_lut_fixture_fault);
+    m.def("tier_lut_fixture_job", &ft::tier_lut_fixture_job);
     m.def("tier_init_lut_fixture", &ft::tier_init_lut_fixture,
           pybind11::arg("cpus"), pybind11::arg("activation"), pybind11::arg("H"), pybind11::arg("I"),
           pybind11::arg("E"), pybind11::arg("virtual_tp2"), pybind11::arg("act_limit") = 10.0);
     m.def("tier_lut_fixture_add_layer", &ft::tier_lut_fixture_add_layer);
     m.def("tier_lut_fixture_stats", &ft::tier_lut_fixture_stats);
     m.def("tier_lut_fixture_reset", &ft::tier_lut_fixture_reset);
+    m.def("tier_lut_fixture_flush_weights", &ft::tier_lut_fixture_flush_weights);
 #endif
     m.def("tier_set_e6", &ft::tier_set_e6);
+#ifdef FT_ENABLE_LUT
+    m.def("tier_remote", &ft::tier_remote, pybind11::call_guard<pybind11::gil_scoped_release>());
+#else
     m.def("tier_remote", &ft::tier_remote);              // [rt]
+#endif
     m.def("tier_remote_stats", &ft::tier_remote_stats);  // [rt]
     m.def("tier_remote_set", &ft::tier_remote_set);      // [rt]
     m.def("tier_remote_res", &ft::tier_remote_res);      // [E5]

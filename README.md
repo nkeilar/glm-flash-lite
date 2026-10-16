@@ -48,11 +48,65 @@ A digest supplied by the operator is the acceptance trust root, not a signature:
 the real replay must validate the capture and its transitive artifacts before
 its report is reviewed. Startup does not repeat the full reference-model hash.
 
-**Production LUT startup remains disabled.** A valid real report admits quality
-only. The GPU coordinator, request-error propagation, complete bank placement
-validation and target timing still need production integration and review.
-Default preflight refuses before Torch/exllamav3 imports, model allocations or
-extension builds. It never falls back silently to trellis.
+Experimental production initialization is implemented behind these gates. Before
+Torch/exllamav3 imports, startup checks real quality, reviewed binaries, measured
+costs and every byte of the full bank. Missing evidence stops startup; there is
+no silent fallback. This path has CPU-only integration coverage. Full-bank
+allocation, GPU handoff, target performance and the full quality panel still
+require a supervised validation run before promotion.
+
+Set `GLM53_CT_LUT_COST` and `GLM53_CT_LUT_COST_SHA256` to an independently reviewed
+`e1-lut-cost/v1` artifact. It must contain raw hardware samples and recomputable
+medians for K=0..8 and M=1..4 for all three recipes: ordinary layers, layer 11's
+upgraded gate/up, and layers 12/44's upgraded down. Fixture bytes must trace to
+the admitted bank; physical placement must be verified. A partial grid cannot
+admit serving. The cost report also binds the exact measured native binary. Its recorded
+hardware object has a checked canonical hash; serving worker CPUs and their
+current package/core topology must match the measurement. The selected
+coordinator CPU must also match the cost report and occupy a separate physical
+core from all workers; a worker's SMT sibling is insufficient. The operator must
+also review the target identity and conditions; dynamic CPU-frequency fields
+are retained as evidence rather than compared live.
+Serving cost admission requires the recorded treatment
+`clflush-owned-weights-before-each-call`. The offline fixture API flushes only
+its owned weight arenas before each sample, outside the timer; warmed repeated
+fixtures are ineligible. This controlled cold-weight treatment does not establish
+the cache mixture of real serving. These synchronous backend timings exclude
+flushing, GPU handoff, stream waiting and the rest of serving; they do not
+establish an end-to-end speed gain.
+
+Each layer selects its own recipe and actual-M row. The local expert union is
+capped at eight. Nonuniform routes use the measured full-shared-M workload as a
+split-policy estimate; that route shape is not claimed measured. The existing
+extra-token surcharge is disabled because M is already priced. There is no
+K>8 extrapolation. Runtime updates cannot replace the reviewed grid.
+
+Set `GLM53_CT_LUT_PRECOMPILE` and `GLM53_CT_LUT_PRECOMPILE_SHA256` to a reviewed
+`e1-precompile/v1` LUT receipt. Both host and CUDA modules must have been built
+with `FT_ENABLE_LUT=1`. Startup checks their hashes, source hashes, checkout
+revision and installed Torch version, then imports those exact modules. It
+never invokes JIT compilation for LUT serving. The default trellis build keeps
+its existing source list and flags.
+
+Enable `GLM53_CPU_TIER=1`, `GLM53_EC=1` and the pinned home tier with
+`GLM53_ZC_VRAM`. Use 42 physical worker CPUs across two NUMA nodes, a separate
+allowed `GLM53_CT_COORD_CPU` (default 0), `GLM53_CT_MAXBSZ=1..4` and
+`GLM53_CT_MAXN=0..8`. Disable `GLM53_K_FTSPLIT` so the guarded stock handoff
+remains active. Lookahead, hyper-connection fusion and the shared-expert side
+stream (`GLM53_LA`, `GLM53_K_HCFUSE`, `GLM53_K_OVL`) must also be off until their
+LUT interactions are validated; performance comparisons need matching settings.
+The LUT path allocates no CPU trellis/SWZ bank, regardless of
+`GLM53_CT_SWZ`; GPU zero-copy and expert-cache reads retain their pinned trellis
+home weights. The actual model's routed geometry, layer order and SwiGLU
+activation limit must match admission. `GLM53_CT_VALIDATE` remains trellis-only;
+use real replay and the normal full-model panel for LUT quality.
+
+After each LUT combine, Python synchronizes the current compute stream and
+checks the native sticky error before another layer can reuse ingress buffers.
+Failures abort the request and require a fresh process; no partial CPU output
+is accepted. Normal interpreter exit drains the coordinator, remote client and
+worker pools before module teardown. This safety check changes scheduling and can affect performance.
+It is part of the path that must be timed in the supervised serving comparison.
 
 Offline validation is available without Torch or CUDA:
 
@@ -82,8 +136,8 @@ NUMA slices. Gate/up rows split 1024/1024; down columns split the same way while
 preserving each IQ4_KS row's original scale. It requires the complete verified
 42-layer inventory and 42 distinct physical workers across two nodes. Admission
 keeps 100 GiB host and 8 GiB per-node reserves, additional working overhead, and
-checks visible cgroup memory limits. This full-bank factory is not exposed through
-Python and has not yet been exercised on a complete bank.
+checks visible cgroup memory limits. Python passes the complete SHA-verified
+descriptors to `tier_init_lut`; full-bank execution remains to be validated.
 
 Two pools spin briefly, then take short idle naps until work arrives. They publish
 one job and join both completions before merging outputs. Scratch is preallocated;
@@ -117,7 +171,7 @@ preserved in `kernels/cpu_avx2/lut/LICENSE`.
 
 An additional opt-in test builds the default host extension and both LUT compiler
 modes with an installed PyTorch. It blocks CUDA entrypoints, limits builds to two
-jobs, and checks the offline API and startup refusal:
+jobs, and checks the offline API, production admission and request failure handling:
 
 ```bash
 RUN_LUT_TORCH_EXTENSION_TESTS=1 python3 -B -m unittest discover \
@@ -126,11 +180,21 @@ RUN_LUT_TORCH_EXTENSION_TESTS=1 python3 -B -m unittest discover \
 
 The offline fixture initializer accepts an explicit `act_limit` keyword, which
 must be finite and positive; its default is 10 for compatibility. Use the actual
-model's limit and validate it against the real report before any future
-production initialization. The limit is included in fixture statistics.
+model's limit. Production startup validates that limit against the real report
+before calling the full-bank initializer. The limit is included in fixture statistics.
 
-Production coordinator error/deadline handling, full-bank placement validation
-and target-machine timing remain required before LUT serving can be enabled.
+Full-bank placement, GPU integration and target-machine timing remain required
+before this experimental format is promoted. A LUT/trellis output difference is
+a mixed-format diagnostic, not a trellis-equivalence correctness gate. Remote
+expert calls retain their local LUT fallback on refusal or transport failure.
+Steady-state local split choices stay within K<=8; fallback can compute additional
+remote picks and is not priced by the measured grid. Remote auto-policy updates
+preserve all measured profile/M rows. CPU-only fault tests cover this path;
+GPU/remote end-to-end behavior still needs the supervised run. LUT remote
+endpoints must use numeric IPv4 addresses. Startup plan discovery has one
+absolute deadline and a 1 MiB response limit, including trickling replies. An
+unavailable or invalid plan uses local LUT computation; an optional bounded
+`GLM53_RT_PLAN` can seed residency while the native client reconnects.
 
 ## Measured
 

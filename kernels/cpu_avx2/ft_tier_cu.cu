@@ -30,6 +30,26 @@ __global__ void ft_split_k(const int64_t* __restrict__ sel, const __half* __rest
     __shared__ int s_miss[1024];
     __shared__ int s_rmiss[1024];
     const int t = threadIdx.x;
+#ifdef FT_ENABLE_LUT
+    // One ingress generation owns hx/picks/hout until its CPU drain word is
+    // published. A sticky failure refuses every later handoff until restart.
+    __shared__ int ingress_failed;
+    if (t == 0)
+    {
+        ingress_failed = ctrl[5] || ctrl[6] || seq < 0 || (ctrl[0] != ctrl[8]) || (seq > 0 && seq <= ctrl[0]);
+        if (ingress_failed && !ctrl[6])
+        {
+            ctrl[5] = 1; ctrl[7] = seq; __threadfence_system(); ctrl[6] = 4; __threadfence_system();
+        }
+    }
+    __syncthreads();
+    if (ingress_failed)
+    {
+        for (int s = t; s < n; s += blockDim.x) { sel_out[s] = sel[s]; w_out[s] = w[s]; }
+        if (t == 0) dflag[0] = -1;
+        return;
+    }
+#endif
     for (int e = t; e < E; e += blockDim.x) { cnt[e] = 0; cpu[e] = 0; }
     __syncthreads();
     for (int s = t; s < n; s += blockDim.x)
@@ -139,6 +159,50 @@ __global__ void ft_split_k(const int64_t* __restrict__ sel, const __half* __rest
 __global__ void ft_combine_k(void* out, int is_half, int n, const long long* __restrict__ dflag, volatile long long* ctrl,
     const float* hout, long long* stats, long long timeout_ns)
 {
+#ifdef FT_ENABLE_LUT
+    // A single block makes the timeout decision once for every output lane.
+    // No block can add a successful partial while another block aborts it.
+    __shared__ int go;
+    if (threadIdx.x == 0)
+    {
+        const long long sequence = dflag[0];
+        go = sequence == 0 ? 0 : 1;
+        if (sequence != 0)
+        {
+            unsigned long long started, elapsed;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(started));
+            elapsed = 0;
+            if (sequence > 0 && ctrl[1] == sequence) atomicAdd((unsigned long long*)&stats[7], 1ull);
+            while (sequence > 0 && !ctrl[5] && !ctrl[6] && ctrl[1] != sequence && (long long)elapsed <= timeout_ns)
+            {
+                unsigned long long current;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(current));
+                elapsed = current - started;
+            }
+            if (sequence < 0 || ctrl[5] || ctrl[6] || ctrl[1] != sequence)
+            {
+                go = -1;
+                ctrl[5] = 1; ctrl[7] = sequence > 0 ? sequence : ctrl[0];
+                __threadfence_system();
+                if (!ctrl[6]) ctrl[6] = 2;
+                __threadfence_system();
+                atomicAdd((unsigned long long*)&stats[6], 1ull);
+            }
+            atomicAdd((unsigned long long*)&stats[4], elapsed);
+            atomicAdd((unsigned long long*)&stats[5], 1ull);
+        }
+    }
+    __syncthreads();
+    if (!go) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        // Poison is secondary protection. The Python LUT hook synchronizes this
+        // stream and calls tier_lut_check before a token can leave the request.
+        const float value = go > 0 ? __ldcv(hout + i) : __int_as_float(0x7fffffff);
+        if (is_half) { __half* target = (__half*)out; target[i] = go > 0 ? __float2half(__half2float(target[i]) + value) : __float2half(value); }
+        else ((float*)out)[i] = go > 0 ? ((float*)out)[i] + value : value;
+    }
+#else
     __shared__ int go;
     if (threadIdx.x == 0)
     {
@@ -168,6 +232,7 @@ __global__ void ft_combine_k(void* out, int is_half, int n, const long long* __r
         if (is_half) { __half* o = (__half*) out; o[i] = __float2half(__half2float(o[i]) + v); }
         else ((float*) out)[i] += v;
     }
+#endif
 }
 
 void ft_split(torch::Tensor sel, torch::Tensor w, torch::Tensor z, int64_t E, int64_t first, torch::Tensor slotof, torch::Tensor score,
@@ -179,8 +244,25 @@ void ft_split(torch::Tensor sel, torch::Tensor w, torch::Tensor z, int64_t E, in
     TORCH_CHECK(rres.numel() == 0 || (rres.dtype() == at::kInt && rres.numel() >= E), "ft_split: rres int32 [E] or empty");
     auto st = at::cuda::getCurrentCUDAStream(sel.device().index());
     TORCH_CHECK(sel.dtype() == at::kLong && w.dtype() == at::kHalf && z.dtype() == at::kHalf && z.is_contiguous(), "dtypes");
+#ifdef FT_ENABLE_LUT
+    for (const auto& tensor : {w, z, slotof, score, pol, sel_out, w_out, dflag, stats})
+        TORCH_CHECK(tensor.device() == sel.device() && tensor.is_contiguous(), "LUT split buffers require one CUDA device and contiguous storage");
+    TORCH_CHECK(rres.numel() == 0 || (rres.device() == sel.device() && rres.is_contiguous()), "LUT remote residency device/layout mismatch");
+    TORCH_CHECK(z.dim() == 2 && z.size(0) >= 1 && z.size(0) <= 4 && z.size(1) == 4096 && sel.numel() == w.numel() && sel.numel() <= z.size(0) * 8,
+                "LUT split input shape mismatch");
+    TORCH_CHECK(sel.is_contiguous() && w.is_contiguous() && slotof.dtype() == at::kInt && slotof.numel() >= E &&
+                score.dtype() == at::kFloat && score.numel() >= E && pol.dtype() == at::kFloat &&
+                sel_out.dtype() == at::kLong && sel_out.numel() >= sel.numel() && w_out.dtype() == at::kHalf && w_out.numel() >= w.numel() &&
+                dflag.dtype() == at::kLong && dflag.numel() >= 1 && stats.dtype() == at::kLong && stats.numel() >= 8,
+                "LUT split buffer dtype/capacity mismatch");
+#endif
     const int bsz = (int) z.size(0), H = (int) z.size(1), n = (int) sel.numel(), topk = n / bsz;
     TORCH_CHECK(E <= 1024 && H % 8 == 0, "ft_split: E <= 1024");
+#ifdef FT_ENABLE_LUT
+    TORCH_CHECK(bsz >= 1 && bsz <= 4 && topk >= 1 && topk <= 8 && n == bsz * topk && E >= 1 && E <= 288 && H == 4096,
+                "LUT split requires M=1..4, topk<=8 and model geometry");
+    TORCH_CHECK(seq >= 0 && seq < 0x7fffffffffffffffLL, "LUT job generation must be positive without wrap");
+#endif
     ft_split_k<<<1, 256, 0, st>>>(sel.data_ptr<int64_t>(), (const __half*) w.data_ptr(), (const __half*) z.data_ptr(), n, bsz, topk, H,
         (int) E, (int) first, slotof.data_ptr<int>(), score.data_ptr<float>(), pol.data_ptr<float>(), (volatile long long*) ctrl,
         (__half*) hx, (int*) hpicks, seq, (int) li, (int) keep_ids, sel_out.data_ptr<int64_t>(), (__half*) w_out.data_ptr(),
@@ -193,9 +275,22 @@ void ft_combine(torch::Tensor out, torch::Tensor dflag, int64_t ctrl, int64_t ho
     c10::cuda::CUDAGuard g(out.device());
     auto st = at::cuda::getCurrentCUDAStream(out.device().index());
     TORCH_CHECK(out.is_contiguous() && (out.dtype() == at::kFloat || out.dtype() == at::kHalf), "out fp32/fp16 contiguous");
+#ifdef FT_ENABLE_LUT
+    TORCH_CHECK(out.numel() >= 1 && out.numel() <= 4 * 4096 && dflag.device() == out.device() && stats.device() == out.device(),
+                "LUT combine buffers require one CUDA device and bounded output");
+#endif
     const int n = (int) out.numel();
+#ifdef FT_ENABLE_LUT
+    TORCH_CHECK(dflag.dtype() == at::kLong && dflag.is_contiguous() && dflag.numel() >= 1 &&
+                stats.dtype() == at::kLong && stats.is_contiguous() && stats.numel() >= 8,
+                "LUT combine flag/stat buffer mismatch");
+    TORCH_CHECK(n >= 1 && n <= 4 * 4096 && timeout_ns > 0 && timeout_ns <= 3600000000000LL, "LUT combine shape/deadline out of bounds");
+    ft_combine_k<<<1, 256, 0, st>>>(out.data_ptr(), out.dtype() == at::kHalf, n, (const long long*) dflag.data_ptr<int64_t>(),
+        (volatile long long*) ctrl, (const float*) hout, (long long*) stats.data_ptr<int64_t>(), timeout_ns);
+#else
     ft_combine_k<<<16, 256, 0, st>>>(out.data_ptr(), out.dtype() == at::kHalf, n, (const long long*) dflag.data_ptr<int64_t>(),
         (volatile long long*) ctrl, (const float*) hout, (long long*) stats.data_ptr<int64_t>(), timeout_ns);
+#endif
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)

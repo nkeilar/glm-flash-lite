@@ -44,7 +44,8 @@ G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
 def load():
     """All model loading lives here (nothing heavy at import time)."""
     global args, model, config, cache, tok, draft_model, draft_cache, EOS, hf_tok, CTX, t_load
-    # Reject an unadmitted LUT configuration before installing or loading tiers.
+    # LUT startup verifies real reports, measured costs and complete bank bytes here.
+    # The pinned trellis home weights remain available to GPU zero-copy/cache paths.
     from lut_manifest import preflight as format_preflight
     format_preflight()
     ap = argparse.ArgumentParser()

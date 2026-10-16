@@ -81,6 +81,8 @@ struct Options {
     // before returning an error. A permanently stuck thread requires external
     // process supervision; its referenced storage must never be freed early.
     uint64_t job_timeout_ms = 30000;
+    // Optional mapped ingress cancellation word, owned until backend destruction.
+    const int64_t* abort_flag = nullptr;
     uint64_t initial_generation = 0; // offline wrap/reuse tests
 };
 struct BankPlan {
@@ -111,12 +113,20 @@ public:
     Backend(const Backend&) = delete;
     Backend& operator=(const Backend&) = delete;
     void add_layer(const LayerInput& input);
-    void forward(int internal_li, const float* x, int ntok, const Routes& routes, float* output);
+    void forward(int internal_li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms = 0);
     Receipt receipt() const;
+    // Sticky cooperative cancellation; current generations still drain before
+    // forward returns, and later jobs are rejected. Safe from another thread.
+    void request_abort();
+    // After the coordinator drains, join both pools while retaining allocations.
+    void shutdown();
     // Fixture-only controls: error propagation and exact packed-layout checks.
     void inject_failure(int phase, int group = 1);
     void inject_delay(int phase, int group, unsigned milliseconds);
     void fixture_set_timeout(uint64_t milliseconds);
+    // Flush only owned loaded fixture weight cache lines (<=256 MiB total).
+    // Serialized with forward/load/shutdown; returns flushed payload bytes.
+    uint64_t fixture_flush_weights();
     std::vector<uint8_t> fixture_slice(int internal_li, int group, int expert, int matrix) const;
 private:
     struct Impl;

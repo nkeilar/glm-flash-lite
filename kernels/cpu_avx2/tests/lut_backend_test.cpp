@@ -334,6 +334,26 @@ int main(int argc, char** argv) {
             for (const auto& region : receipt.regions) check(region.sampled_pages == 32, "placement did not sample every expert projection");
             std::vector<float> x(4 * ordinary.h, .25f), out(x.size(), 123.f);
             ft_lut::Routes route(4); route[0] = {{0, .4f}, {1, .6f}}; route[2] = {{0, .25f}}; route[3] = {{1, .9f}};
+            backend->forward(0, x.data(), 4, route, out.data());
+            const auto before_flush = out;
+            check(backend->fixture_flush_weights() == receipt.payload_bytes[0] + receipt.payload_bytes[1], "weight flush extent differs from owned payload");
+            backend->forward(0, x.data(), 4, route, out.data());
+            check(out == before_flush, "owned-weight flushing changed numerical output");
+            // A flush owns the same mutex as forward; a concurrent replay must
+            // either execute with exclusive access or reject without touching it.
+            std::exception_ptr flush_error, forward_error;
+            std::thread flusher([&] { try { for (int n = 0; n < 20; ++n) backend->fixture_flush_weights(); } catch (...) { flush_error = std::current_exception(); } });
+            try {
+                for (int n = 0; n < 20; ++n) {
+                    try { backend->forward(0, x.data(), 4, route, out.data()); check(out == before_flush, "concurrent flush changed replay output"); }
+                    catch (const std::runtime_error& error) {
+                        if (std::string(error.what()).find("one in-flight coordinator") == std::string::npos) throw;
+                    }
+                }
+            } catch (...) { forward_error = std::current_exception(); }
+            flusher.join();
+            if (flush_error) std::rethrow_exception(flush_error);
+            if (forward_error) std::rethrow_exception(forward_error);
             for (int phase = 0; phase < 4; ++phase) for (int group = 0; group < 2; ++group) {
                 std::fill(out.begin(), out.end(), 123.f); backend->inject_failure(phase, group);
                 rejects([&] { backend->forward(0, x.data(), 4, route, out.data()); });
@@ -370,10 +390,40 @@ int main(int argc, char** argv) {
             backend->inject_delay(-1, 1, 0); backend->fixture_set_timeout(30000);
             backend->forward(0, x.data(), 4, route, out.data());
             check(relative(out, reference(ordinary, x, route, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8)) <= 1e-5, "pool did not drain and recover after timeout");
+            // A late fallback receives the original generation's remaining
+            // budget, rather than resetting a full per-call timeout.
+            std::fill(out.begin(), out.end(), 123.f); backend->inject_delay(0, 1, 30);
+            rejects([&] { backend->forward(0, x.data(), 4, route, out.data(), 5); });
+            check(backend->receipt().timed_out_jobs == 2, "remaining-budget deadline was not recorded");
+            check(std::all_of(out.begin(), out.end(), [](float value) { return value == 123.f; }), "remaining-budget deadline published output");
+            backend->inject_delay(-1, 1, 0); backend->forward(0, x.data(), 4, route, out.data());
             std::atomic<bool> stop_stats{false}; std::thread stats([&] { while (!stop_stats.load()) (void)backend->receipt(); });
             try { for (int n = 0; n < 100; ++n) backend->forward(0, x.data(), 4, route, out.data()); }
             catch (...) { stop_stats.store(true); stats.join(); throw; }
             stop_stats.store(true); stats.join();
+        }
+        // Cancellation is sticky for serving: drain both asymmetric groups,
+        // leave the caller result untouched and refuse subsequent generations.
+        for (int cancellation : {0, 1, 2}) {
+            int64_t abort_word = 0;
+            ft_lut::Options cancel_options; cancel_options.cpus = workers; cancel_options.virtual_tp2 = true;
+            if (cancellation == 1) cancel_options.abort_flag = &abort_word;
+            auto cancelled = ft_lut::Backend::offline_fixture(cancel_options); cancelled->add_layer(ordinary.input);
+            cancelled->inject_delay(0, 1, 40);
+            std::vector<float> x(ordinary.h, .25f), out(ordinary.h, 123.f);
+            ft_lut::Routes routes(1); routes[0] = {{0, 1.f}};
+            std::thread aborter([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+                if (cancellation == 1) __atomic_store_n(&abort_word, int64_t(1), __ATOMIC_RELEASE);
+                else if (cancellation == 2) cancelled->shutdown();
+                else cancelled->request_abort();
+            });
+            const auto started = std::chrono::steady_clock::now();
+            rejects([&] { cancelled->forward(0, x.data(), 1, routes, out.data()); });
+            aborter.join();
+            check(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(30), "cancellation returned before the delayed pool drained");
+            check(std::all_of(out.begin(), out.end(), [](float value) { return value == 123.f; }), "cancellation published partial output");
+            rejects([&] { cancelled->forward(0, x.data(), 1, routes, out.data()); });
         }
         Temporary production_temp;
         std::unique_ptr<Fixture> production = real_directory.empty() ? std::make_unique<Fixture>(production_temp, 3, 1, 4096, 2048) : std::make_unique<Fixture>(real_directory + "/blk.03.experts-0-1.lut.gguf", 3);
@@ -417,7 +467,7 @@ int main(int argc, char** argv) {
         for (float limit : {0.f, -1.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) { options.act_limit = limit; rejects([&] { ft_lut::Backend::offline_fixture(options); }); }
         std::cout << "PASS cases=" << cases << " worst_relative_l2=" << worst
                   << " paths=i16,q8 M=1,2,3,4 K=0..8 profiles=ordinary,upgrade,down6"
-                  << " worker_failures=16 timeouts=2 stats_concurrency=200 groups=2/3 production_width=4096/2048 placement_claim=none generation_wrap=covered\n";
+                  << " worker_failures=16 timeouts=4 cancellations=3 owned_weight_flush=covered stats_concurrency=200 groups=2/3 production_width=4096/2048 placement_claim=none generation_wrap=covered\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }
