@@ -66,6 +66,12 @@ def _build():
                extra_cuda_cflags=["-O3"], verbose=False)
 
 
+def preflight():
+    """Validate the format before any CPU-tier allocation or extension build."""
+    from lut_manifest import preflight as format_preflight
+    return format_preflight()
+
+
 def auto_cpus(skip=2):
     """One logical CPU per physical core (first SMT sibling) among the CPUs this process may run on, minus the first
     `skip` cores (left to the GPU-feeding Python thread and the OS). On a 24-core EPYC 7443P with SMT: 2-23 (22)."""
@@ -113,6 +119,7 @@ def _policy(dev):
 
 def wrap(model):
     """Before expert_cache.attach: wrap every MoE router (so the cache sees the CPU picks removed) and the combine hook."""
+    preflight()
     _build()
     import expert_cache
     mods = expert_cache.find_moe(model.modules)
@@ -208,6 +215,7 @@ def _prelaunch(dev, H, m):
 
 def start():
     """After expert_cache.attach: register the native pinned home copies with the host kernel, self-test, start."""
+    preflight()
     mods = S["mods"]
     m0 = mods[0]
     H, I = m0.hidden_size, m0.intermediate_size

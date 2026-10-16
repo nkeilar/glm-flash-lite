@@ -23,6 +23,12 @@ No output caps: max_tokens defaults to the remaining context.
   python3 glm53/serve.py -m /models -cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4 --host 0.0.0.0 --port 30000
 """
 import argparse, asyncio, json, os, re, sys, time, uuid
+
+# Admission must precede framework imports, which can initialize CUDA or JIT.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lut_manifest import preflight as _format_preflight
+_format_preflight()
+
 import torch
 from exllamav3 import model_init
 from exllamav3.generator import AsyncGenerator, AsyncJob
@@ -31,8 +37,6 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 app = FastAPI()
 G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
 
@@ -40,6 +44,9 @@ G = {"gen": None, "stats": {"requests": 0, "completion_tokens": 0}}
 def load():
     """All model loading lives here (nothing heavy at import time)."""
     global args, model, config, cache, tok, draft_model, draft_cache, EOS, hf_tok, CTX, t_load
+    # Reject an unadmitted LUT configuration before installing or loading tiers.
+    from lut_manifest import preflight as format_preflight
+    format_preflight()
     ap = argparse.ArgumentParser()
     model_init.add_args(ap, cache=True, add_draft_model_args=True, default_chunk_size=2048)
     ap.add_argument("--port", type=int, default=30000)

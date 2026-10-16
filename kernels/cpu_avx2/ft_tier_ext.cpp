@@ -16,6 +16,9 @@
 // ops/remote-tier/PROTOCOL.md.
 #include <torch/extension.h>
 #include "ft_core.h"
+#ifdef FT_ENABLE_LUT
+#include "ft_lut.h"
+#endif
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -75,6 +78,10 @@ struct JobHist { std::atomic<long long> n[17], busy[17], local[17], wait[17]; };
 struct Tier
 {
     Pool pool;
+#ifdef FT_ENABLE_LUT
+    std::unique_ptr<ft_lut::Backend> lut;
+    bool lut_fixture = false;
+#endif
     std::vector<Layer> layers;
     std::vector<torch::Tensor> keep;
     volatile int64_t* ctrl = nullptr;
@@ -251,6 +258,13 @@ static int rt_connect(const std::string& host, int port, int* version = nullptr)
 // Compute `route` on the CPU into out (zeroing it when the route is empty)
 static void local_forward(int li, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route, int nr, float* out, PhaseTimes* lp)
 {
+#ifdef FT_ENABLE_LUT
+    if (T->lut)
+    {
+        T->lut->forward(li, T->xf.data(), ntok, route, out);
+        return;
+    }
+#endif
     if (nr == 0) { std::memset(out, 0, size_t(ntok) * T->H * 4); return; }
     int maxm = 0;
     { std::vector<int> cnt(T->layers[li].ex.size(), 0); for (auto& r : route) for (auto& pr : r) maxm = std::max(maxm, ++cnt[pr.first]); }
@@ -543,6 +557,9 @@ std::vector<int64_t> tier_set_e6(int64_t fuse, int64_t fuse_maxn, int64_t lean)
 void tier_start(int64_t cpu0)
 {
     TORCH_CHECK(T && !T->running, "init first / already running");
+#ifdef FT_ENABLE_LUT
+    TORCH_CHECK(!T->lut, "LUT GPU coordinator startup is unavailable: reviewed real-activation admission and request-error handling are required; offline API only");
+#endif
     T->running = true;
     T->th = std::thread(worker_main, int(cpu0));
 }
@@ -560,6 +577,32 @@ void tier_stop()
 torch::Tensor tier_forward(int64_t li, torch::Tensor x, torch::Tensor sel, torch::Tensor w, int64_t mode)
 {
     TORCH_CHECK(T && !T->running, "tier_forward: worker running");
+#ifdef FT_ENABLE_LUT
+    if (T->lut)
+    {
+        TORCH_CHECK(T->lut_fixture && mode == -1, "LUT fixture activation is fixed at init; use mode=-1");
+        TORCH_CHECK(li >= 0 && li < int64_t(T->layers.size()), "LUT fixture layer index out of range");
+        TORCH_CHECK(x.device().is_cpu() && x.scalar_type() == at::kFloat && x.is_contiguous() && x.dim() == 2 && x.size(1) == T->H && x.size(0) >= 1 && x.size(0) <= 4,
+                    "LUT fixture x must be contiguous CPU float32 [M,H], M=1..4");
+        TORCH_CHECK(sel.device().is_cpu() && sel.scalar_type() == at::kInt && sel.is_contiguous() && sel.dim() == 2 && sel.size(0) == x.size(0) && sel.size(1) <= 8,
+                    "LUT fixture sel must be contiguous CPU int32 [M,K], K<=8");
+        TORCH_CHECK(w.device().is_cpu() && w.scalar_type() == at::kFloat && w.is_contiguous() && w.sizes() == sel.sizes(), "LUT fixture weights must match sel as contiguous CPU float32");
+        const int m = int(x.size(0)), k = int(sel.size(1));
+        auto out = torch::zeros({m, T->H}, torch::kFloat);
+        ft_lut::Routes route(m); int nr = 0;
+        auto sa = sel.accessor<int32_t, 2>(); auto wa = w.accessor<float, 2>();
+        for (int t = 0; t < m; ++t) for (int j = 0; j < k; ++j)
+        {
+            TORCH_CHECK(sa[t][j] >= -1 && std::isfinite(wa[t][j]) && wa[t][j] >= 0,
+                        "LUT fixture route IDs/weights must be finite and valid");
+            if (sa[t][j] == -1) { TORCH_CHECK(wa[t][j] == 0, "LUT fixture masked picks require zero weight"); }
+            else { route[t].push_back({sa[t][j], wa[t][j]}); ++nr; }
+        }
+        T->xf.assign(x.data_ptr<float>(), x.data_ptr<float>() + x.numel());
+        local_forward(int(li), m, route, nr, out.data_ptr<float>(), nullptr);
+        return out;
+    }
+#endif
     const int m = int(x.size(0)), k = int(sel.size(1));
     auto out = torch::zeros({ m, T->H }, torch::kFloat);
     std::vector<std::vector<std::pair<int, float>>> route(m);
@@ -582,6 +625,81 @@ std::vector<int64_t> tier_stats()
              T->pt_ns[4].load(std::memory_order_relaxed), T->prep_ns.load(std::memory_order_relaxed) };
 }
 
+#ifdef FT_ENABLE_LUT
+// Explicit bounded offline API: it owns neither ingress buffers nor a GPU
+// coordinator, and cannot be selected to bypass production startup admission.
+void tier_init_lut_fixture(std::vector<int64_t> cpus, std::string activation, int64_t H, int64_t I, int64_t E, bool virtual_tp2)
+{
+    TORCH_CHECK(T == nullptr, "tier already initialised");
+    TORCH_CHECK(H >= 256 && H <= 4096 && H % 256 == 0 && I >= 512 && I <= 2048 && I % 512 == 0 && E >= 1 && E <= 8,
+                "LUT offline fixture exceeds bounded geometry");
+    ft_lut::Options options; options.cpus.assign(cpus.begin(), cpus.end()); options.activation = activation; options.virtual_tp2 = virtual_tp2;
+    auto runtime = ft_lut::Backend::offline_fixture(options);
+    auto tier = std::make_unique<Tier>();
+    tier->lut = std::move(runtime); tier->lut_fixture = true; tier->H = int(H); tier->I = int(I); tier->swz = 0;
+    tier->layers.resize(42);
+    for (auto& layer : tier->layers) { layer.H = int(H); layer.I = int(I); layer.ex.resize(size_t(E)); }
+    T = tier.release();
+}
+void tier_lut_fixture_add_layer(pybind11::dict descriptor)
+{
+    TORCH_CHECK(T && T->lut_fixture && T->lut && !T->running, "offline LUT fixture init required");
+    ft_lut::LayerInput input;
+    input.model_layer = descriptor["model_layer"].cast<int>(); input.internal_li = descriptor["internal_li"].cast<int>(); input.path = descriptor["path"].cast<std::string>();
+    auto identity = descriptor["identity"].cast<pybind11::dict>();
+    input.identity = {identity["dev"].cast<uint64_t>(), identity["ino"].cast<uint64_t>(), identity["size"].cast<uint64_t>(),
+                      identity["mtime_ns"].cast<int64_t>(), identity["ctime_ns"].cast<int64_t>()};
+    auto tensors = descriptor["tensors"].cast<pybind11::list>(); TORCH_CHECK(tensors.size() == 3, "offline LUT fixture needs gate/up/down descriptors");
+    for (int m = 0; m < 3; ++m)
+    {
+        auto tensor = tensors[m].cast<pybind11::dict>();
+        input.tensors[m] = {tensor["offset"].cast<uint64_t>(), tensor["nbytes"].cast<uint64_t>(), tensor["type_id"].cast<int>(),
+                           tensor["width"].cast<int>(), tensor["rows"].cast<int>(), tensor["experts"].cast<int>()};
+        TORCH_CHECK(input.tensors[m].width == (m == 2 ? T->I : T->H) && input.tensors[m].rows == (m == 2 ? T->H : T->I) &&
+                    input.tensors[m].experts == int(T->layers[0].ex.size()), "offline LUT fixture disagrees with init dimensions");
+    }
+    T->lut->add_layer(input);
+}
+pybind11::dict tier_lut_fixture_stats()
+{
+    TORCH_CHECK(T && T->lut_fixture && T->lut, "offline LUT fixture init required");
+    const auto receipt = T->lut->receipt(); pybind11::dict result;
+    result["scope"] = "offline fixture only; no serving or promotion admission";
+    result["format"] = "lut"; result["activation"] = receipt.activation; result["swz_bytes"] = T->swz_bytes;
+    result["placement_verified"] = receipt.placement_verified; result["virtual_tp2"] = receipt.virtual_tp2;
+    result["payload_bytes"] = receipt.payload_bytes; result["mapped_bytes"] = receipt.mapped_bytes; result["scratch_bytes"] = receipt.scratch_bytes;
+    result["nodes"] = receipt.nodes; result["workers"] = receipt.workers; result["staging_peak_bytes"] = receipt.staging_peak_bytes;
+    result["placement_scope"] = "sampled weight slices, pool controls and activation/scratch payloads; metadata not placed";
+    pybind11::list regions, controls, scratch;
+    for (const auto& row : receipt.regions) {
+        pybind11::dict record;
+        record["model_layer"] = row.model_layer; record["group"] = row.group; record["node"] = row.node; record["matrix"] = row.matrix;
+        record["payload_bytes"] = row.payload_bytes; record["mapped_bytes"] = row.mapped_bytes; record["preferred_policy"] = row.preferred_policy;
+        record["policy_errno"] = row.policy_errno; record["query_errno"] = row.query_errno; record["sampled_pages"] = row.sampled_pages;
+        record["off_node_pages"] = row.off_node_pages; record["page_errors"] = row.page_errors; regions.append(record);
+    }
+    for (const auto& row : receipt.controls) {
+        pybind11::dict record;
+        record["group"] = row.group; record["node"] = row.node; record["owner_cpu"] = row.owner_cpu; record["cpus"] = row.cpus;
+        record["preferred_policy"] = row.preferred_policy; record["policy_errno"] = row.policy_errno;
+        record["worker_policy_failures"] = row.worker_policy_failures; record["query_errno"] = row.query_errno; record["observed_node"] = row.observed_node;
+        controls.append(record);
+    }
+    for (const auto& row : receipt.scratch) {
+        pybind11::dict record;
+        record["group"] = row.group; record["node"] = row.node; record["query_errno"] = row.query_errno;
+        record["sampled_pages"] = row.sampled_pages; record["off_node_pages"] = row.off_node_pages; record["page_errors"] = row.page_errors;
+        scratch.append(record);
+    }
+    result["regions"] = regions; result["controls"] = controls; result["scratch"] = scratch; return result;
+}
+void tier_lut_fixture_reset()
+{
+    TORCH_CHECK(T && T->lut_fixture && !T->running && !T->rt, "only a stopped offline LUT fixture can reset");
+    T->lut.reset(); delete T; T = nullptr;
+}
+#endif
+
 }  // namespace ft
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -592,6 +710,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tier_stop", &ft::tier_stop);
     m.def("tier_forward", &ft::tier_forward);
     m.def("tier_stats", &ft::tier_stats);
+#ifdef FT_ENABLE_LUT
+    m.def("tier_init_lut_fixture", &ft::tier_init_lut_fixture);
+    m.def("tier_lut_fixture_add_layer", &ft::tier_lut_fixture_add_layer);
+    m.def("tier_lut_fixture_stats", &ft::tier_lut_fixture_stats);
+    m.def("tier_lut_fixture_reset", &ft::tier_lut_fixture_reset);
+#endif
     m.def("tier_set_e6", &ft::tier_set_e6);
     m.def("tier_remote", &ft::tier_remote);              // [rt]
     m.def("tier_remote_stats", &ft::tier_remote_stats);  // [rt]

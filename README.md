@@ -21,6 +21,90 @@ Two modes, one switch (`GLM53_MODE`):
 | `fast` (default) | GPU expert cache + zero-copy misses + **AVX2 CPU tier** for cold decode misses, batched decode (`-ambs 4`), fused decode kernels | prefill exact; decode **not exact** (see Quality) | ~218 GiB (234 GB) |
 | `exact` (`-e GLM53_MODE=exact`) | GPU expert cache + zero-copy misses, nothing else | bit-exact (panel top-1 1.0000, KL 0) | ~111 GiB (119 GB) |
 
+### Experimental LUT bank validation
+
+`GLM53_CT_FORMAT=trellis` remains the default and uses the existing CPU tier.
+`GLM53_CT_FORMAT=lut` selects the experimental bank contract, with
+`GLM53_CT_LUT_ACT=i16|q8` (`i16` by default) and
+`GLM53_CT_LUT_MANIFEST` pointing to an `e1-lut-bank/v1` public manifest beside its
+42 per-layer GGUF files. `GLM53_CT_LUT` retains its existing meaning as the CPU
+cost table; it does not select the weight format.
+
+**LUT server startup is deliberately disabled.** Early preflight checks the full
+42-layer, 126-tensor recipe, provenance, byte ledger, relative filenames and file
+sizes, then refuses startup before importing Torch/exllamav3, allocating model
+weights or building extensions.
+`PROXY-PASS` permits conversion only. Real-activation quality admission is still
+unimplemented, and no `GLM53_CT_LUT_QUALITY` value can enable serving. The public
+conversion manifest must keep `real_pass=false`.
+
+Offline validation is available without Torch or CUDA:
+
+```bash
+python3 glm53/lut_manifest.py --manifest /models/lut/e1-lut-bank.json
+python3 -B -m unittest discover -s tests -p test_lut_manifest.py -v
+```
+
+The first command performs structural validation and cheap file-size checks.
+In an owner-supervised offline I/O window, add `--verify-files` to stream and hash
+every artifact. This reads the whole bank, one file at a time; tokenizer metadata
+is skipped and SHA buffers are 4 MiB. The Python `verify_bank(path, tick=...)` API
+accepts a resource/deadline callback and returns stable file identities plus
+ordered gate/up/down descriptors for a native loader. Neither API starts workers,
+allocates a weight bank, or grants serving admission. The loader must recheck file
+identities and enforce RAM/NUMA admission before allocation.
+
+The native implementation is opt-in at compile time with `FT_ENABLE_LUT`. The
+normal extension build does not include it. Its offline fixture API exercises the
+same `local_forward` dispatch with at most eight experts and 256 MiB of payload;
+it starts no GPU coordinator and allocates no trellis SWZ bank.
+
+The C++ `staged_bank` factory streams one expert projection at a time into two
+NUMA slices. Gate/up rows split 1024/1024; down columns split the same way while
+preserving each IQ4_KS row's original scale. It requires the complete verified
+42-layer inventory and 42 distinct physical workers across two nodes. Admission
+keeps 100 GiB host and 8 GiB per-node reserves, additional working overhead, and
+checks visible cgroup memory limits. This full-bank factory is not exposed through
+Python and has not yet been exercised on a complete bank.
+
+Two spinning pools publish one job and join both completions before merging
+outputs. Scratch is preallocated; M=3 uses the verified M=2 plus M=1 kernels.
+Worker errors drain both groups before propagating, without publishing partial
+outputs. Callers must quiesce before destroying a backend. Placement receipts
+cover sampled weight slices, pool control pages and activation/scratch payload
+pages; they do not prove all-page or metadata locality. Virtual TP2 tests always
+report placement as unverified.
+
+Run the standalone CPU correctness and failure-recovery tests from the repository
+root (no Torch or CUDA required):
+
+```bash
+g++ -std=c++17 -O3 -Wall -Wextra -Werror -mavx2 -mfma -mf16c \
+  -mtune=znver3 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1 -pthread \
+  kernels/cpu_avx2/tests/lut_backend_test.cpp kernels/cpu_avx2/ft_lut.cpp \
+  kernels/cpu_avx2/lut/kernels.cpp -o /tmp/lut-backend-test
+/tmp/lut-backend-test
+```
+
+Repeat with `-ffp-contract=off` and a separate output binary. These tests compare
+LUT TP2 outputs against a canonical packed-weight replay; LUT arithmetic changes
+CPU-tier numerics and is not claimed bit-identical to trellis. The vendored codec
+sources are unchanged from the verified benchmark revision and retain their MIT
+attribution in `kernels/cpu_avx2/lut/LICENSE`.
+
+An additional opt-in test builds the default host extension and both LUT compiler
+modes with an installed PyTorch. It blocks CUDA entrypoints, limits builds to two
+jobs, and checks the offline API and startup refusal:
+
+```bash
+RUN_LUT_TORCH_EXTENSION_TESTS=1 python3 -B -m unittest discover \
+  -s tests -p test_lut_torch_extension.py -v
+```
+
+Real-activation admission, production coordinator error/deadline handling,
+full-bank placement validation and target-machine timing remain required before
+LUT serving can be enabled.
+
 ## Measured
 
 Host: AMD EPYC 7443P (24 cores, SMT on), 8-channel DDR4 (503 GiB), 1x RTX 3090 24 GB on PCIe 4.0 x16, driver
