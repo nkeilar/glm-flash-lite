@@ -7,8 +7,9 @@ the field note [How does a 320B model run on one RTX 3090?](https://nathankeilar
 which explains the design, the measurements and their limits. It is **not** rebased onto current glm-flash-lite.
 
 On that box: `exact` mode 4.13 tok/s, upstream `fast` settings ~13.1-13.3 tok/s, this branch with the profile below
-**15.2 tok/s** decode (single stream, short prose prompt, greedy, thinking off, 131k context configured). Your numbers
-will differ with your CPU, RAM channels and PCIe generation.
+**15.2 tok/s** decode (single stream, short prose prompt, greedy, thinking off, 131k context configured), and **~16.6 tok/s**
+with the N32CTRL decode flags and `GLM53_CT_TZC=1.3` (2026-10-16, 60 s greedy windows, ten alone). Your numbers will
+differ with your CPU, RAM channels and PCIe generation.
 
 Every switch added here defaults to off (upstream behaviour). In the table, the bold value is the one in the measured profile.
 
@@ -20,7 +21,7 @@ Every switch added here defaults to off (upstream behaviour). In the table, the 
 | `GLM53_CT_P0BLK` | 0 · **1** | block-parallel input prep (needs `SPLIT1=2`, I16 path) | CPU job −2.5% (bit-identical) |
 | `GLM53_CT_SOCKQ` | 0 · **1** | per-socket work counters with stealing instead of one shared atomic | ≈ 0 (kept, harmless) |
 | `GLM53_CT_CFLAGS` | string | compiler flags for the CPU-tier JIT build; `-DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1` enable Broadwell decode tweaks | CPU time −3% (bit-identical) |
-| `GLM53_CT_CFLAGS` += `-DFT_OPT_EXP_EXTRACT=1 -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1` ("N32CTRL", experimental, off) | flags | cheaper trellis decode: exponent-field bit extraction instead of convert-multiply-convert, `vpmaddubsw` byte sums on all 32 groups, shuffle masks kept in registers. Optional, also off: `GLM53_CT_LIGHT_STATIC=1`, `GLM53_CT_SERIAL_SUM=1` (static short phases, serial reduction) | decode loop 188 → ~160 cycles per 256 weights (uiCA, Broadwell); harness on the test box: 7.4-13.9% less time per decode call, projected +3.5% tok/s. **Live on the test box (8 restarts per arm):** CPU job −6.4% (0.182 + 0.255·K → 0.160 + 0.242·K ms), quality-panel output identical with the I16 path forced; tok/s +0.4% with the split cost model unchanged, **+7.9% (15.42 → 16.63, ten alone) together with `GLM53_CT_TZC=1.3`**, which lets the faster CPU take more of each layer's misses. Output bit-identical in the harness (server flags and `-ffp-contract=off`, both layouts); may set the MXCSR inexact status flag (exception stays masked) |
+| `GLM53_CT_CFLAGS` += `-DFT_OPT_EXP_EXTRACT=1 -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1` ("N32CTRL") | **on** in the profile | cheaper trellis decode: exponent-field bit extraction instead of convert-multiply-convert, `vpmaddubsw` byte sums on all 32 groups, shuffle masks kept in registers. Optional, also off: `GLM53_CT_LIGHT_STATIC=1`, `GLM53_CT_SERIAL_SUM=1` (static short phases, serial reduction) | decode loop 188 → ~160 cycles per 256 weights (uiCA, Broadwell); harness on the test box: 7.4-13.9% less time per decode call, projected +3.5% tok/s. **Live on the test box (8 restarts per arm):** CPU job −6.4% (0.182 + 0.255·K → 0.160 + 0.242·K ms), quality-panel output identical with the I16 path forced; tok/s +0.4% with the split cost model unchanged, **+7.9% (15.42 → 16.63, ten alone) together with `GLM53_CT_TZC=1.3`**, which lets the faster CPU take more of each layer's misses. Output bit-identical in the harness (server flags and `-ffp-contract=off`, both layouts); may set the MXCSR inexact status flag (exception stays masked) |
 | `GLM53_CT_BUILD` | path | separate JIT build dir per flag set, so variants don't overwrite each other | |
 | `GLM53_ZC_THP` | 0 · **1** | pinned expert arena backed by 2 MB pages (mmap + `MADV_HUGEPAGE` before first touch) | prefill +4-5%, decode tie; needs THP `madvise` or `always` |
 | `GLM53_LA` | 0 · **1** | decode lookahead (ported from upstream `1f6d74e`); runtime `GET /la?on=0\|1` | +3.3%; greedy-identical in `exact` mode |
@@ -40,7 +41,7 @@ and `[E4]` name the experiment each change came from.
 ## The measured profile
 
 Upstream's `docker/entrypoint.sh` sets the base `fast`-mode settings (first block). Run natively, the measured
-server's full environment was (paths shortened):
+server's full environment is (paths shortened; give each `GLM53_CT_CFLAGS` set its own `GLM53_CT_BUILD` directory):
 
 ```bash
 # upstream fast-mode base (what entrypoint.sh exports)
@@ -49,11 +50,12 @@ export GLM53_MODE=fast GLM53_CPU_TIER=1 GLM53_EC=1 GLM53_K_FTSPLIT=1 GLM53_K_HCF
   GLM53_ZC_STATS=$PWD/data/stats_own_dec.json GLM53_EC_WARM=$PWD/data/stats_own_dec.json \
   GLM53_TRITON_PIN=$PWD/data/triton_pin_exact.json
 # upstream knobs, tuned for this box
-export GLM53_CT_CPUS=2-43 GLM53_CT_SWZ=1 GLM53_CT_B=0.31 GLM53_CT_TZC=1.0
+export GLM53_CT_CPUS=2-43 GLM53_CT_SWZ=1 GLM53_CT_B=0.31 GLM53_CT_TZC=1.3   # 1.0 before N32CTRL; 1.3 lets the faster CPU take more misses
 # this branch
 export GLM53_CT_SPLIT1=2 GLM53_CT_SOCKQ=1 GLM53_CT_P0BLK=1 GLM53_ZC_THP=1 GLM53_LA=1 GLM53_CT_SWIGLU_CLAMP=1 \
   GLM53_EC_BG=1 GLM53_CT_FUSE=1 GLM53_CT_FUSE_MAXN=1 GLM53_CT_PF_LEAN=1 \
-  GLM53_CT_CFLAGS="-mavx2 -mfma -mf16c -mtune=znver3 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1"
+  GLM53_CT_CFLAGS="-mavx2 -mfma -mf16c -mtune=znver3 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1 \
+    -DFT_OPT_EXP_EXTRACT=1 -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1"   # N32CTRL (2026-10-16)
 python glm53/serve.py -m /path/to/GLM-5.3-Flash-exl3-3.05bpw -cs 131072 --max-batch-size 8 -chunk_size 8192 -ambs 4 \
   --host 0.0.0.0 --port 30000 --served-name glm-5.3-flash
 ```
