@@ -276,6 +276,76 @@ def teacher_forced(ids, start, topn, want_ids):
             "output_token_ids_logprobs": [o_ids], "next_token": int(lp[L - 1].argmax())}
 
 
+# GLM53_TF_DECODE=1: teacher-forced logprobs through generator decode steps instead of one whole-sequence
+# forward. The prompt prefills as usual (GPU path, as in production); every scored position is then a single-token
+# decode step, so a LUT CPU tier (M <= 4) computes it. A filter allows exactly the next reference token, and the
+# step's held (pre-sampling) logits are scored. Same response shape as teacher_forced.
+TF_DECODE = os.environ.get("GLM53_TF_DECODE") == "1"
+
+
+def _force_filter(forced):
+    from exllamav3.generator.filter.filter import Filter
+
+    class ForceNext(Filter):
+        def __init__(self):
+            super().__init__(tok, None, None, False)
+            self.pos = 0
+
+        def reset(self):
+            self.pos = 0
+
+        def accept_token(self, token):
+            self.pos += 1
+
+        def get_next_logit_mask(self):
+            mask = torch.zeros((1, self.vocab_size), dtype=torch.half)
+            if self.pos < len(forced):
+                mask.fill_(-float("inf"))
+                mask[0, forced[self.pos]] = 0
+            return mask
+
+        def is_completed(self):
+            return False
+
+        def use_background_worker(self):
+            return False
+    return ForceNext()
+
+
+async def teacher_forced_decode(ids, start, topn, want_ids):
+    if start < 1:
+        raise ValueError("decode teacher forcing needs logprob_start_len >= 1")
+    forced = ids[0, start:].tolist()
+    job = AsyncJob(G["gen"], input_ids=ids[:, :start], max_new_tokens=len(forced) + 1, sampler=ArgmaxSampler(),
+                   filters=[_force_filter(forced)], return_logits=True, stop_conditions=[], decode_special_tokens=False)
+    G["stats"]["requests"] += 1
+    chunks, emitted = [], []
+    async for r in job:
+        if r.get("logits") is not None:
+            chunks.append(r["logits"].reshape(-1, r["logits"].shape[-1]).float().cpu())
+        if r.get("token_ids") is not None:
+            emitted += r["token_ids"].reshape(-1).tolist()
+    logits = torch.cat(chunks, 0)
+    if logits.shape[0] != len(forced) + 1 or emitted[:len(forced)] != forced:
+        raise RuntimeError(f"decode teacher forcing drifted: {logits.shape[0]} rows, forced prefix ok={emitted[:len(forced)] == forced}")
+    if int(torch.isfinite(logits).sum(-1).min()) < 2:
+        raise RuntimeError("held logits were masked in place; decode teacher forcing would be meaningless")
+    lp = torch.log_softmax(logits, -1)          # row k: distribution after consuming position start - 1 + k
+
+    def dist(row):
+        v, ix = lp[row].topk(topn)
+        top = [[float(a), int(b), None] for a, b in zip(v.tolist(), ix.tolist())]
+        sel = [[float(lp[row, t]), int(t), None] for t in want_ids] if want_ids else []
+        return top, sel
+    in_top, in_ids = [], []
+    for t in range(start, ids.shape[-1]):
+        a, b = dist(t - start); in_top.append(a); in_ids.append(b)
+    o_top, o_ids = dist(len(forced))
+    G["stats"]["completion_tokens"] += len(forced) + 1
+    return {"input_top_logprobs": in_top, "input_token_ids_logprobs": in_ids, "output_top_logprobs": [o_top],
+            "output_token_ids_logprobs": [o_ids], "next_token": int(lp[len(forced)].argmax())}
+
+
 def sse(obj):
     return "data: " + json.dumps(obj) + "\n\n"
 
@@ -309,8 +379,9 @@ async def generate(req: Request):
     if body.get("return_logprob"):
         while len(G["gen"].jobs):
             await asyncio.sleep(0.05)
-        r = teacher_forced(ids, int(body.get("logprob_start_len", 0)), int(body.get("top_logprobs_num", 20)),
-                           body.get("token_ids_logprob") or [])
+        args_tf = (ids, int(body.get("logprob_start_len", 0)), int(body.get("top_logprobs_num", 20)),
+                   body.get("token_ids_logprob") or [])
+        r = await teacher_forced_decode(*args_tf) if TF_DECODE else teacher_forced(*args_tf)
         meta = {k: r[k] for k in ("input_top_logprobs", "input_token_ids_logprobs", "output_top_logprobs",
                                   "output_token_ids_logprobs")}
         meta.update({"prompt_tokens": ids.shape[-1], "completion_tokens": 1, "finish_reason": {"type": "length"}})
@@ -485,7 +556,8 @@ async def models():
 async def server_info():
     sa = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool, type(None)))}
     sa.update({"context_length": CTX, "max_running_requests": args.max_batch_size, "max_total_num_tokens": CTX,
-               "chunked_prefill_size": int(os.environ.get("GLM53_GEN_CHUNK_SIZE", "0") or 0) or args.chunk_size, "kv_cache_dtype": args.cache_quant or "fp16",
+               "chunked_prefill_size": int(os.environ.get("GLM53_GEN_CHUNK_SIZE", "0") or 0) or args.chunk_size,
+               "teacher_forcing": "decode" if TF_DECODE else "prefill", "kv_cache_dtype": args.cache_quant or "fp16",
                "engine": "exllamav3", "env": {k: v for k, v in os.environ.items() if k.startswith(("GLM53_", "EXL3_"))}})
     return JSONResponse({"context_length": CTX, "server_args": sa, "load_seconds": round(t_load, 1)})
 
