@@ -93,7 +93,8 @@ struct Options {
     // Offline diagnostics only. Production accepts exactly these defaults.
     bool fixture_allow_smt = false; // requires virtual_tp2; duplicate CPUs still fail
     std::string fixture_weight_pages = "deferred"; // deferred, base, eager
-    int fixture_spin_us = 2000; // -1 keeps offline workers spinning indefinitely
+    int fixture_spin_us = 50000; // production: spin 50 ms before napping (2 ms let cores reach deep C-states between
+                                 // calls: +0.3-0.4 ms per call on ten, 2026-10-17 matched diagnostic); -1 = never nap (offline)
     std::string fixture_wake = "futex"; // sleep is an offline causal comparison
     int fixture_nap_us = 1000; // interruptible maximum wait; publication wakes it
     bool fixture_idle_after_drain = true; // start idle clock only after both groups retire

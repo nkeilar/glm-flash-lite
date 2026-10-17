@@ -222,7 +222,7 @@ const Options& checked_options(const Options& options, bool fixture) {
     require(options.fixture_wake == "sleep" || options.fixture_wake == "futex", "invalid offline LUT wake policy");
     require(options.fixture_nap_us >= 1 && options.fixture_nap_us <= 1000000, "offline LUT nap duration must be1..1000000 microseconds");
     require(!options.fixture_allow_smt || (fixture && options.virtual_tp2), "SMT diagnostics require an offline virtual TP2 fixture");
-    require(fixture || (!options.fixture_allow_smt && options.fixture_weight_pages == "deferred" && options.fixture_spin_us == 2000 && options.fixture_wake == "futex" && options.fixture_nap_us == 1000 && options.fixture_idle_after_drain),
+    require(fixture || (!options.fixture_allow_smt && options.fixture_weight_pages == "deferred" && options.fixture_spin_us == 50000 && options.fixture_wake == "futex" && options.fixture_nap_us == 1000 && options.fixture_idle_after_drain),
             "production LUT rejects offline diagnostic options");
 #ifdef FT_LUT_DIAG_TRACE
     require(fixture, "instrumented LUT builds are offline only");

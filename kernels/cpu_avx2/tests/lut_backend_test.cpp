@@ -262,7 +262,7 @@ void idle_measure(ft_lut::Backend& backend, const Fixture& f) {
         for (int n = 0; n < 8; ++n) {
             auto begin = Clock::now(); backend.forward(f.input.internal_li, x.data(), tokens, route, out.data());
             warm.push_back(std::chrono::duration<double, std::micro>(Clock::now() - begin).count());
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));   // > the 50 ms production spin, so idle workers must back off
             begin = Clock::now(); backend.forward(f.input.internal_li, x.data(), tokens, route, out.data());
             after_idle.push_back(std::chrono::duration<double, std::micro>(Clock::now() - begin).count());
         }
@@ -270,8 +270,8 @@ void idle_measure(ft_lut::Backend& backend, const Fixture& f) {
         check(naps[0] > before[0] && naps[1] > before[1], "idle workers did not enter bounded backoff");
         std::sort(warm.begin(), warm.end()); std::sort(after_idle.begin(), after_idle.end());
         std::cout << "IDLE_MEASUREMENT scope=real_loader_smoke H=" << f.h << " I=" << f.i
-                  << " M=" << tokens << " selected_experts=1 samples=8 warm_p50_us=" << warm[4] << " after_20ms_p50_us=" << after_idle[4]
-                  << " warm_max_us=" << warm.back() << " after_20ms_max_us=" << after_idle.back() << '\n';
+                  << " M=" << tokens << " selected_experts=1 samples=8 warm_p50_us=" << warm[4] << " after_60ms_p50_us=" << after_idle[4]
+                  << " warm_max_us=" << warm.back() << " after_60ms_max_us=" << after_idle.back() << '\n';
     }
 }
 void integers(const std::vector<int>& values) { std::cout << '['; for (size_t n = 0; n < values.size(); ++n) { if (n) std::cout << ','; std::cout << values[n]; } std::cout << ']'; }
