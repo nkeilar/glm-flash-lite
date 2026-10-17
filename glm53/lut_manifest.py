@@ -662,6 +662,10 @@ def hash_regular(path):
     return result.hexdigest(), before
 
 
+SPLIT_MODULE = "ft_split_fast.so"
+SPLIT_SOURCE = "kernels/k110/ft_split_fast.cu"
+
+
 def load_precompiled(path, expected_sha256):
     """Admit exact reviewed modules without invoking JIT or initializing CUDA."""
     require(path is not None, "GLM53_CT_LUT_PRECOMPILE is required; compile before the serving window")
@@ -692,13 +696,17 @@ def load_precompiled(path, expected_sha256):
         raise ValueError("reviewed serving checkout revision is unavailable") from error
     require(head == revision, "serving checkout revision differs from the reviewed LUT precompile")
     for relative, expected in sources.items():
-        require(isinstance(relative, str) and relative.startswith("kernels/cpu_avx2/") and
+        require(isinstance(relative, str) and (relative.startswith("kernels/cpu_avx2/") or relative == SPLIT_SOURCE) and
                 not Path(relative).is_absolute() and ".." not in Path(relative).parts,
                 "invalid precompile source path")
         digest(expected, "precompile source")
         require(hash_regular(root / relative)[0] == expected, "LUT native source differs from the reviewed precompile")
     outputs = receipt.get("outputs")
-    keys(outputs, ("ft_tier_host.so", "ft_tier_cu.so"), "LUT precompiled modules")
+    base = {"ft_tier_host.so", "ft_tier_cu.so"}
+    require(isinstance(outputs, dict) and set(outputs) in (base, base | {SPLIT_MODULE}), "invalid fields: LUT precompiled modules")
+    if SPLIT_MODULE in outputs:   # optional third module: the k110 fast split kernel built with the LUT ingress guard
+        require(SPLIT_SOURCE in sources and "-DFT_ENABLE_LUT=1" in receipt.get("split_cuda_flags", []),
+                "precompiled fast split module requires its bound source and guarded LUT build flags")
     require(no_symlinks(receipt.get("build_directory", "")) == path.parent,
             "LUT precompile build directory differs from its receipt")
     modules = {}
@@ -783,9 +791,10 @@ def preflight(environ=None, *, require_production=True):
         for name in ("GLM53_CPU_TIER", "GLM53_EC"):
             require(env.get(name) == "1", name + "=1 is required for LUT startup")
         require(bool(env.get("GLM53_ZC_VRAM")), "pinned GPU-readable trellis weights require GLM53_ZC_VRAM")
-        for name in ("GLM53_LA", "GLM53_K_HCFUSE", "GLM53_K_OVL"):
-            require(env.get(name, "0") != "1", name + " is awaiting LUT GPU integration validation; disable it for this path")
-        require(env.get("GLM53_K_FTSPLIT", "0") != "1", "LUT startup requires the guarded stock split kernel; disable GLM53_K_FTSPLIT")
+        # GPU-side speed features (T-71): lookahead needs the per-token LUT check (cpu_tier._lut_token_check), and the
+        # fast split kernel is admitted only as the guarded precompiled module checked after load_precompiled.
+        for name in ("GLM53_LA", "GLM53_K_HCFUSE", "GLM53_K_OVL", "GLM53_K_FTSPLIT"):
+            require(env.get(name, "0") in ("0", "1"), name + " must be 0 or 1 for the LUT path")
         require(env.get("GLM53_CT_VALIDATE", "0") != "1", "LUT quality uses real replay and the normal full-model panel; GLM53_CT_VALIDATE is trellis-only")
         maxbsz = int(env.get("GLM53_CT_MAXBSZ", "4096" if env.get("GLM53_CT_VALIDATE") == "1" else "4"))
         require(1 <= maxbsz <= 4, "LUT supports M=1..4; set GLM53_CT_MAXBSZ accordingly")
@@ -804,6 +813,8 @@ def preflight(environ=None, *, require_production=True):
         precompiled = load_precompiled(settings.precompile_path, settings.precompile_sha256)
         require(precompiled["modules"]["ft_tier_host.so"]["sha256"] == costs["measurement"]["build_sha256"],
                 "precompiled LUT host differs from measured cost build")
+        require(env.get("GLM53_K_FTSPLIT", "0") != "1" or SPLIT_MODULE in precompiled["modules"],
+                "GLM53_K_FTSPLIT=1 with LUT requires the guarded fast split module in the reviewed precompile")
         cache_key = (str(bank.path), bank.sha256, settings.activation, tuple(sorted(reports.items())), settings.cost_sha256)
         staged = _STARTUP_CACHE.get(cache_key)
         if staged is None:

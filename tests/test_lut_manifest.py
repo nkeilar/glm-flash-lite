@@ -546,7 +546,7 @@ class StartupTests(unittest.TestCase):
     def test_startup_rejects_changed_bank_report_cost_and_unsupported_runtime_before_hashing(self):
         env=self.startup_environment()
         mutations=[("GLM53_CPU_TIER","0"),("GLM53_EC","0"),("GLM53_ZC_VRAM",""),
-                   ("GLM53_K_FTSPLIT","1"),("GLM53_LA","1"),("GLM53_K_HCFUSE","1"),("GLM53_K_OVL","1"),
+                   ("GLM53_K_FTSPLIT","2"),("GLM53_LA","yes"),("GLM53_K_HCFUSE","-1"),("GLM53_K_OVL","on"),
                    ("GLM53_CT_VALIDATE","1"),("GLM53_CT_LUT",".1,.2"),("GLM53_CT_MAXBSZ","5"),
                    ("GLM53_CT_MAXN","9"),("GLM53_CT_FORCE_N","9"),("GLM53_CT_TIMEOUT_S","inf"),("GLM53_CT_TIMEOUT_S","0"),
                    ("GLM53_CT_MAXN","7.5"),("GLM53_CT_B","nan"),("GLM53_CT_B","-1"),
@@ -558,6 +558,34 @@ class StartupTests(unittest.TestCase):
                 verify.assert_not_called()
         with mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank",return_value=dict(manifest_sha256="0"*64)),mock.patch.object(lm,"load_precompiled",return_value=self.precompiled()):
             with self.assertRaisesRegex(ValueError,"manifest changed"):lm.preflight(env)
+
+    def test_lut_admits_gpu_features_and_fast_split_only_with_its_guarded_module(self):
+        env=dict(self.startup_environment(),GLM53_LA="1",GLM53_K_HCFUSE="1",GLM53_K_OVL="1")
+        with_split=dict(modules={"ft_tier_host.so":dict(sha256="9"*64),lm.SPLIT_MODULE:dict(sha256="8"*64)})
+        cases=[(env,self.precompiled(),"manifest changed"),
+               (dict(env,GLM53_K_FTSPLIT="1"),self.precompiled(),"guarded fast split module"),
+               (dict(env,GLM53_K_FTSPLIT="1"),with_split,"manifest changed")]
+        for index,(changed,precompiled,message) in enumerate(cases):
+            with self.subTest(index=index),mock.patch.object(lm,"load_manifest",return_value=self.bank),\
+                 mock.patch.object(lm,"verify_bank",return_value=dict(manifest_sha256="0"*64)),\
+                 mock.patch.object(lm,"load_precompiled",return_value=precompiled):
+                with self.assertRaisesRegex(ValueError,message):lm.preflight(changed)
+
+    def test_lut_fast_split_install_imports_only_the_admitted_precompiled_module(self):
+        spec=importlib.util.spec_from_file_location("k_ftsplit_fixture",ROOT/"glm53"/"k_ftsplit.py")
+        module=importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules,{"torch":SimpleNamespace()}):spec.loader.exec_module(module)
+        stock=SimpleNamespace(ft_split=mock.Mock(),ft_combine=mock.Mock())
+        tier=SimpleNamespace(S={"settings":SimpleNamespace(format="lut",precompiled=dict(modules={}))},_CU=stock)
+        with mock.patch.dict(sys.modules,{"cpu_tier":tier,"lut_manifest":lm}):
+            with self.assertRaisesRegex(ValueError,"guarded fast split module"):module.install()
+            fast=SimpleNamespace(ft_split=mock.Mock(return_value="fast"))
+            with mock.patch.object(module,"_load_lut",return_value=fast) as loader:
+                module.install()
+            loader.assert_called_once_with(tier.S["settings"])
+            sel=SimpleNamespace(numel=lambda:8)
+            self.assertEqual(tier._CU.ft_split(sel,1,2),"fast");fast.ft_split.assert_called_once_with(sel,1,2)
+            self.assertIs(tier._CU.ft_combine,stock.ft_combine)
 
     def cpu_module(self, torch=None):
         spec=importlib.util.spec_from_file_location("cpu_tier_startup_fixture",ROOT/"glm53"/"cpu_tier.py")
@@ -735,6 +763,25 @@ class StartupTests(unittest.TestCase):
             (self.root/"ft_tier_cu.so").write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError,"module SHA256"):lm.load_precompiled(path,sha)
         with self.assertRaisesRegex(ValueError,"PRECOMPILE"):lm.load_precompiled(None,None)
+
+    def test_precompile_admits_the_guarded_fast_split_module_only_with_its_bound_source(self):
+        receipt=self.precompile_receipt()
+        split=ROOT/"kernels"/"k110"/"ft_split_fast.cu"
+        receipt["source_sha256"][lm.SPLIT_SOURCE]=hashlib.sha256(split.read_bytes()).hexdigest()
+        receipt["split_cuda_flags"]=["-O3","-DFT_ENABLE_LUT=1"]
+        file=self.root/lm.SPLIT_MODULE;file.write_bytes(b"structural binary fixture split")
+        receipt["outputs"][lm.SPLIT_MODULE]=hashlib.sha256(file.read_bytes()).hexdigest()
+        with mock.patch.object(lm.importlib.metadata,"version",return_value="fixture"),mock.patch.object(lm.subprocess,"check_output",return_value="1"*40+"\n"):
+            path,sha=self.write_precompile(receipt)
+            self.assertEqual(set(lm.load_precompiled(path,sha)["modules"]),{"ft_tier_host.so","ft_tier_cu.so",lm.SPLIT_MODULE})
+            mutations=[lambda r:r.__setitem__("split_cuda_flags",["-O3"]),lambda r:r.pop("split_cuda_flags"),
+                       lambda r:r["source_sha256"].pop(lm.SPLIT_SOURCE),
+                       lambda r:r["source_sha256"].__setitem__(lm.SPLIT_SOURCE,"0"*64),
+                       lambda r:r["source_sha256"].__setitem__("kernels/k110/other.cu","0"*64),
+                       lambda r:r["outputs"].__setitem__("other.so","0"*64)]
+            for index,change in enumerate(mutations):
+                changed=copy.deepcopy(receipt);change(changed);changed_path,changed_sha=self.write_precompile(changed)
+                with self.subTest(index=index),self.assertRaises(ValueError):lm.load_precompiled(changed_path,changed_sha)
 
     def test_precompile_metadata_keeps_receipt_local_suffix_for_exact_runtime_check(self):
         receipt=self.precompile_receipt()
