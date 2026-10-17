@@ -31,6 +31,9 @@ def _load_json(p):
 _THP_KEEP = []   # [bdw-opt zc-thp] mmap objects backing THP arenas (must outlive their tensors)
 
 
+_NODE1_ARENAS = [int(os.environ.get("GLM53_ZC_NODE1_ARENAS", "0") or 0)]
+
+
 def _thp_host_tensor(nbytes):
     """[bdw-opt zc-thp] 2 MB-aligned anonymous mapping with madvise(MADV_HUGEPAGE) BEFORE first touch, so the faults
     cudaHostRegister triggers allocate transparent huge pages (host THP mode 'madvise'). Process-local; same bytes.
@@ -46,6 +49,14 @@ def _thp_host_tensor(nbytes):
     rc = libc.madvise(base + off, nbytes, 14)   # MADV_HUGEPAGE
     if rc != 0:
         print(f" -- zc-thp: madvise failed errno={ctypes.get_errno()} (falling back to 4 KB pages)", flush=True)
+    if _NODE1_ARENAS[0] > 0:
+        # [T-61 E1] GLM53_ZC_NODE1_ARENAS=N: the first N layer arenas prefer node 1. The GPU (and so this whole arena)
+        # sits on node 0, which E1's half of the LUT bank also needs; GPU reads of these N layers cross the socket link.
+        _NODE1_ARENAS[0] -= 1
+        mask = (ctypes.c_ulong * 2)(1 << 1, 0)
+        rc = libc.syscall(237, ctypes.c_void_p(base + off), ctypes.c_size_t(nbytes), 1, mask, ctypes.c_ulong(65), 0)  # mbind MPOL_PREFERRED
+        if rc != 0:
+            print(f" -- zc-thp: mbind node 1 failed errno={ctypes.get_errno()} (default placement)", flush=True)
     ctypes.memset(base + off, 0, nbytes)   # first touch here (the verified bench path), not inside cudaHostRegister
     t = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes, offset=off)
     _THP_KEEP.append(mm)
