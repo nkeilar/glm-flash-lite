@@ -428,6 +428,20 @@ struct Scratch {
         for (const auto& job : hidden_q) for (const auto& a : job) size += activation_bytes(a);
         return size;
     }
+    size_t mapped_bytes() const {
+        size_t total = 0;
+        auto count = [&](const auto& values) {
+            if (values.capacity()) total += lutbench::aligned_mapping_bytes(values.capacity() * sizeof(typename std::decay_t<decltype(values)>::value_type));
+        };
+        auto activation = [&](const Activation& a) {
+            count(a.scales); count(a.i16); count(a.i16_lo_bsums); count(a.i16_hi_bsums);
+            count(a.i16_swizzled); count(a.i16_lo); count(a.i16_hi); count(a.q8);
+        };
+        for (const auto& a : input) activation(a);
+        for (const auto& pair : pairs) for (const auto& a : pair) activation(a);
+        for (const auto& job : hidden_q) for (const auto& a : job) activation(a);
+        count(hidden); count(partial); return total;
+    }
     void init(Path path, int width, int ihalf) {
         for (auto& a : input) lutbench::prepare_storage(path, width, a);
         for (auto& pair : pairs) for (auto& a : pair) lutbench::prepare_storage(path, width, a);
@@ -760,7 +774,8 @@ void Backend::add_layer(const LayerInput& in) {
     impl_->workers.run(&Init::run, &init);
     for (int group = 0; group < 2; ++group) {
         impl_->report.scratch_bytes[group] = impl_->scratch[group].bytes();
-        require(impl_->report.scratch_bytes[group] <= 32ULL * 1024 * 1024, "LUT per-node scratch exceeds declared bound");
+        impl_->report.scratch_mapped_bytes[group] = impl_->scratch[group].mapped_bytes();
+        require(impl_->report.scratch_mapped_bytes[group] <= 32ULL * 1024 * 1024, "LUT per-node mapped scratch exceeds declared bound");
     }
     bool verified = impl_->workers.controls_verified();
     for (const auto& receipt : receipts) verified = verified && receipt.preferred_policy && !receipt.query_errno && !receipt.page_errors && !receipt.off_node_pages;
@@ -768,9 +783,16 @@ void Backend::add_layer(const LayerInput& in) {
     for (int group = 0; group < 2; ++group) {
         auto addresses = impl_->scratch[group].sample_addresses(); std::vector<int> status(addresses.size(), -1);
         ScratchReceipt receipt; receipt.group = group; receipt.node = impl_->workers.node(group); receipt.sampled_pages = addresses.size();
+        receipt.payload_bytes = impl_->report.scratch_bytes[group]; receipt.mapped_bytes = impl_->report.scratch_mapped_bytes[group];
+        for (void* address : addresses) {
+            const auto policy = read_policy(receipt.node, address, true);
+            if (receipt.policy_mode == -1) { receipt.policy_mode = policy.mode; receipt.policy_nodes = policy_nodes(policy); }
+            if (!policy.verified) { ++receipt.policy_failures; if (!receipt.policy_errno) receipt.policy_errno = policy.error; }
+        }
+        receipt.preferred_policy = !addresses.empty() && receipt.policy_failures == 0;
         if (syscall(SYS_move_pages, 0, addresses.size(), addresses.data(), nullptr, status.data(), 0) < 0) receipt.query_errno = errno;
         else for (int observed : status) { if (observed < 0) ++receipt.page_errors; else if (observed != receipt.node) ++receipt.off_node_pages; }
-        verified = verified && !receipt.query_errno && !receipt.page_errors && !receipt.off_node_pages;
+        verified = verified && receipt.preferred_policy && !receipt.query_errno && !receipt.page_errors && !receipt.off_node_pages;
         scratch_receipts.push_back(receipt);
     }
     require(!impl_->options.require_verified_placement || verified, "LUT placement could not be verified");

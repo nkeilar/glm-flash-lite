@@ -54,6 +54,10 @@ struct ControlReceipt {
 };
 struct ScratchReceipt {
     int group = -1, node = -1, query_errno = 0;
+    bool preferred_policy = false;
+    int policy_errno = 0, policy_mode = -1;
+    std::vector<int> policy_nodes;
+    uint64_t policy_failures = 0, payload_bytes = 0, mapped_bytes = 0;
     uint64_t sampled_pages = 0, off_node_pages = 0, page_errors = 0;
 };
 struct Receipt {
@@ -63,7 +67,7 @@ struct Receipt {
     float act_limit = 10.0f;
     std::array<int, 2> nodes{}, workers{};
     std::array<uint64_t, 2> payload_bytes{}, mapped_bytes{};
-    std::array<uint64_t, 2> scratch_bytes{};
+    std::array<uint64_t, 2> scratch_bytes{}, scratch_mapped_bytes{};
     uint64_t staging_peak_bytes = 0;
     std::array<uint64_t, 2> pool_naps{};
     uint64_t timed_out_jobs = 0;

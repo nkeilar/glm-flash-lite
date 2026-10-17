@@ -94,6 +94,7 @@ class TorchExtensionTests(unittest.TestCase):
                     self.assertEqual(stats['act_limit'], 20.0)
                     self.assertEqual(len(stats['pool_naps']), 2)
                     self.assertEqual(stats['timed_out_jobs'], 0)
+                    self.assertEqual(stats['scratch_mapped_bytes'], [0, 0])
                     self.assertEqual(len(stats['controls']), 2)
                     for control in stats['controls']:
                         self.assertIn('policy_mode', control)

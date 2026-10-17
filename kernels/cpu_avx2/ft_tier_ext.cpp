@@ -1060,6 +1060,7 @@ pybind11::dict tier_lut_fixture_stats()
     result["format"] = "lut"; result["activation"] = receipt.activation; result["act_limit"] = receipt.act_limit; result["swz_bytes"] = T->swz_bytes;
     result["placement_verified"] = receipt.placement_verified; result["virtual_tp2"] = receipt.virtual_tp2;
     result["payload_bytes"] = receipt.payload_bytes; result["mapped_bytes"] = receipt.mapped_bytes; result["scratch_bytes"] = receipt.scratch_bytes;
+    result["scratch_mapped_bytes"] = receipt.scratch_mapped_bytes;
     result["nodes"] = receipt.nodes; result["workers"] = receipt.workers; result["staging_peak_bytes"] = receipt.staging_peak_bytes;
     result["pool_naps"] = receipt.pool_naps; result["timed_out_jobs"] = receipt.timed_out_jobs;
     result["placement_scope"] = "sampled weight slices, pool controls and activation/scratch payloads; metadata not placed";
@@ -1090,6 +1091,9 @@ pybind11::dict tier_lut_fixture_stats()
         pybind11::dict record;
         record["group"] = row.group; record["node"] = row.node; record["query_errno"] = row.query_errno;
         record["sampled_pages"] = row.sampled_pages; record["off_node_pages"] = row.off_node_pages; record["page_errors"] = row.page_errors;
+        record["preferred_policy"] = row.preferred_policy; record["policy_mode"] = row.policy_mode; record["policy_nodes"] = row.policy_nodes;
+        record["policy_errno"] = row.policy_errno; record["policy_failures"] = row.policy_failures;
+        record["payload_bytes"] = row.payload_bytes; record["mapped_bytes"] = row.mapped_bytes;
         scratch.append(record);
     }
     result["regions"] = regions; result["controls"] = controls; result["scratch"] = scratch; return result;

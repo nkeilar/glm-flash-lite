@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -19,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace {
@@ -196,7 +198,34 @@ void numeric(ft_lut::Backend& backend, const Fixture& f, lutbench::Path path, in
         check(error <= 1e-5, "TP2 output differs from canonical packed-weight reference"); ++cases;
     }
 }
+void mapping_allocator_checks() {
+    lutbench::AlignedAllocator<float> allocator;
+    rejects([&] { allocator.allocate(std::numeric_limits<size_t>::max()); });
+    rejects([&] { lutbench::aligned_mapping_bytes(std::numeric_limits<size_t>::max()); });
+    const size_t page = size_t(sysconf(_SC_PAGESIZE));
+    for (size_t count : {size_t(1), page / sizeof(float), page / sizeof(float) + 1}) {
+        void* address;
+        {
+            lutbench::AlignedVector<float> values(count, 1.25f);
+            address = values.data();
+            check(reinterpret_cast<uintptr_t>(address) % page == 0, "scratch allocation is not page aligned");
+            check(values.front() == 1.25f && values.back() == 1.25f, "mapped vector initialization failed");
+            unsigned char resident = 0;
+            check(mincore(address, page, &resident) == 0 && (resident & 1), "mapped scratch was not first touched");
+        }
+        // No intervening allocation: release must unmap, never retain resident
+        // libc pages that a worker on the other NUMA node can later inherit.
+        unsigned char resident = 0; errno = 0;
+        check(mincore(address, page, &resident) == -1 && errno == ENOMEM, "scratch release retained a resident mapping");
+    }
+}
 void verify_policy_receipts(const ft_lut::Receipt& receipt) {
+    for (const auto& row : receipt.scratch) {
+        check(row.payload_bytes == receipt.scratch_bytes[row.group] && row.mapped_bytes == receipt.scratch_mapped_bytes[row.group], "scratch receipt byte ledger mismatch");
+        check(row.mapped_bytes >= row.payload_bytes && row.mapped_bytes <= (32ULL << 20), "scratch mapped allocation bound incorrect");
+        if (row.preferred_policy)
+            check(row.policy_mode == MPOL_PREFERRED && row.policy_nodes == std::vector<int>{row.node} && !row.policy_failures && !row.policy_errno, "scratch policy was not read back exactly");
+    }
     for (const auto& row : receipt.regions) if (row.preferred_policy)
         check(row.policy_mode == MPOL_PREFERRED && row.policy_nodes == std::vector<int>{row.node}, "weight policy was not read back exactly");
     for (const auto& row : receipt.controls) {
@@ -264,6 +293,7 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string(argv[1]) == "--numa-probe") {
             check(argc == 5, "usage: --numa-probe CPU_CSV FIXTURE_DIRECTORY i16|q8"); return numa_probe(argv[2], argv[3], argv[4]);
         }
+        mapping_allocator_checks();
         std::string real_directory;
         if (argc > 1) { check(argc == 3 && std::string(argv[1]) == "--fixtures", "usage: [--fixtures FIXTURE_DIRECTORY]"); real_directory = argv[2]; }
         // Full-bank planning is structural only; these descriptors deliberately
@@ -317,6 +347,19 @@ int main(int argc, char** argv) {
         rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, broken); });
         Fixture ordinary(temp, 3, 8), upgrade(temp, 11, 8), down6(temp, 12, 8);
         int cases = 0; double worst = 0;
+        // Recreate the cost-table lifetime pattern: independent successive
+        // backends must own and release their scratch mappings for every recipe.
+        for (const std::string activation : {"i16", "q8"}) {
+            std::array<uint64_t, 2> mapped{};
+            for (int repeat = 0; repeat < 2; ++repeat) for (const Fixture* fixture : {&ordinary, &upgrade, &down6}) {
+                ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true; options.activation = activation;
+                auto fresh = ft_lut::Backend::offline_fixture(options); fresh->add_layer(fixture->input);
+                const auto receipt = fresh->receipt(); verify_policy_receipts(receipt);
+                if (!mapped[0]) mapped = receipt.scratch_mapped_bytes;
+                check(receipt.scratch_mapped_bytes == mapped, "scratch footprint changed across recipe/backend resets");
+                numeric(*fresh, *fixture, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst);
+            }
+        }
         for (const std::string activation : {"i16", "q8"}) {
             ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true; options.activation = activation;
             options.initial_generation = std::numeric_limits<uint64_t>::max() - 1;
@@ -436,7 +479,12 @@ int main(int argc, char** argv) {
             ft_lut::Options production_options; production_options.cpus = workers; production_options.virtual_tp2 = true; production_options.activation = activation; production_options.act_limit = 1.5f;
             auto full_width = ft_lut::Backend::offline_fixture(production_options); full_width->add_layer(production->input);
             layout(*full_width, *production); numeric(*full_width, *production, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst, 1.5f);
-            check(full_width->receipt().act_limit == 1.5f, "model activation limit not recorded");
+            const auto full_receipt = full_width->receipt(); verify_policy_receipts(full_receipt);
+            check(full_receipt.act_limit == 1.5f, "model activation limit not recorded");
+            if (sysconf(_SC_PAGESIZE) == 4096) {
+                const uint64_t expected = activation == "i16" ? 4849664 : 1245184;
+                check(full_receipt.scratch_mapped_bytes == std::array<uint64_t, 2>{expected, expected}, "production scratch mapped ledger differs from page-rounded recipe");
+            }
             if (real_upgrade) { full_width->add_layer(real_upgrade->input); layout(*full_width, *real_upgrade); numeric(*full_width, *real_upgrade, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst, 1.5f); }
             if (activation == "i16") idle_measure(*full_width, *production);
         }
@@ -467,7 +515,7 @@ int main(int argc, char** argv) {
         for (float limit : {0.f, -1.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) { options.act_limit = limit; rejects([&] { ft_lut::Backend::offline_fixture(options); }); }
         std::cout << "PASS cases=" << cases << " worst_relative_l2=" << worst
                   << " paths=i16,q8 M=1,2,3,4 K=0..8 profiles=ordinary,upgrade,down6"
-                  << " worker_failures=16 timeouts=4 cancellations=3 owned_weight_flush=covered stats_concurrency=200 groups=2/3 production_width=4096/2048 placement_claim=none generation_wrap=covered\n";
+                  << " worker_failures=16 timeouts=4 cancellations=3 owned_weight_flush=covered stats_concurrency=200 groups=2/3 production_width=4096/2048 scratch_unmap=covered repeated_profile_resets=12 placement_claim=none generation_wrap=covered\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

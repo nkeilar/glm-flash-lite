@@ -145,7 +145,7 @@ M=3 uses the verified M=2 plus M=1 kernels. A cooperative request deadline stops
 further phase work and drains both groups before returning an error; a stuck
 thread still requires process supervision. Worker errors never publish partial
 outputs. Callers must quiesce before destroying a backend. Placement receipts
-include NUMA policy mode/mask readback for weights, controls and every worker;
+include NUMA policy mode/mask readback for weights, controls, scratch and every worker;
 successful setters alone do not establish placement. Sampled page checks cover
 weight slices, pool controls and activation/scratch payload pages, without proving
 all-page or metadata locality. Virtual TP2 tests report placement as unverified.
@@ -167,7 +167,13 @@ CPU-tier numerics and is not claimed bit-identical to trellis. The vendored code
 sources come from [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), with
 work by the [ggml](https://github.com/ggml-org/ggml) and
 [llama.cpp](https://github.com/ggml-org/llama.cpp) authors. Their MIT notices are
-preserved in `kernels/cpu_avx2/lut/LICENSE`.
+preserved in `kernels/cpu_avx2/lut/LICENSE`. The serving copy's aligned allocator
+uses fresh anonymous mappings with normal-page first touch, retaining the worker's
+preferred NUMA policy; this prevents reused libc heap pages from inheriting another
+node's residency across backend resets. Codec arithmetic is unchanged. Scratch
+receipts distinguish payload from page-rounded mapped bytes; the 32 MiB per-node
+scratch bound applies to mapped bytes. No page migration or global policy changes
+are used.
 
 An additional opt-in test builds the default host extension and both LUT compiler
 modes with an installed PyTorch. It blocks CUDA entrypoints, limits builds to two
