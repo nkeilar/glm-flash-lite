@@ -526,6 +526,21 @@ struct Layer {
     std::array<NodeWeights, 2> nodes;
 };
 struct Job { int expert = 0, m = 0; int tokens[4]{}; float weights[4]{}; };
+
+// Software prefetch for the cold weight streams (T-61 run 16). Each worker reads contiguous rows, but Intel's hardware
+// streamer stops at every 4 KB page, so a DRAM-cold call stalls at each boundary; the trellis kernel prefetches
+// PF_DIST rows ahead for the same reason. A hint only: results are unchanged. 0 disables a stream's prefetch.
+#ifndef FT_LUT_PF_GATE_UP
+#define FT_LUT_PF_GATE_UP 16   // rows ahead in the gate/up phase (~28 KB per stream for IQ3_K; run 17 sweep)
+#endif
+#ifndef FT_LUT_PF_DOWN
+#define FT_LUT_PF_DOWN 48      // rows ahead in the down phase (~26 KB for IQ4_KS; run 17 sweep)
+#endif
+static inline void prefetch_bytes(const uint8_t* p, size_t bytes) {
+    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + bytes;
+    for (uintptr_t line = reinterpret_cast<uintptr_t>(p) & ~uintptr_t(63); line < end; line += 64)
+        _mm_prefetch(reinterpret_cast<const char*>(line), _MM_HINT_T0);
+}
 struct Scratch {
     std::array<Activation, 4> input;
     std::array<std::array<Activation, 2>, 6> pairs;
@@ -690,12 +705,23 @@ struct Backend::Impl {
             // hidden values stay on one worker's cache lines, and each worker
             // streams through one expert's gate/up rows before changing expert.
             const int begin = half * local / nworkers, end = half * (local + 1) / nworkers;
+            const int rows = end - begin;
+            // Prefetch position p + FT_LUT_PF_GATE_UP of this worker's (job, row) stream, continuing into the next job.
+            auto prefetch_gate_up = [&](int position) {
+                if (FT_LUT_PF_GATE_UP <= 0 || rows <= 0 || position >= self.njobs * rows) return;
+                const int expert = self.jobs[position / rows].expert, r = begin + position % rows;
+                const auto& node = l.nodes[group];
+                prefetch_bytes(node.row(0, expert, r), node.strides[0]);
+                prefetch_bytes(node.row(1, expert, r), node.strides[1]);
+            };
+            for (int p = 0; p < FT_LUT_PF_GATE_UP; ++p) prefetch_gate_up(p);
             for (int j = 0; j < self.njobs; ++j) {
                 const Job& job = self.jobs[j];
                 const Activation* input = &s.input[job.tokens[0]];
                 if (job.m >= 2 && job.tokens[1] != job.tokens[0] + 1) input = s.pairs[pair_index(job.tokens[0], job.tokens[1])].data();
                 for (int r = begin; r < end; ++r) {
                     if (self.workers.aborted()) break;
+                    prefetch_gate_up(j * rows + (r - begin) + FT_LUT_PF_GATE_UP);
                     float g[4], u[4]; int first = job.m == 3 ? 2 : job.m;
                     dots(l.formats[0], l.nodes[group].row(0, job.expert, r), input, l.h, first, g);
                     dots(l.formats[1], l.nodes[group].row(1, job.expert, r), input, l.h, first, u);
@@ -743,10 +769,18 @@ struct Backend::Impl {
                 for (int t = 0; t < self.ntok; ++t) s.partial[size_t(t) * l.h + r] = 0;
             // Expert-major streaming preserves the same ascending expert
             // addition order for every output while avoiding interleaved rows.
+            const int rows = end - begin;
+            auto prefetch_down = [&](int position) {
+                if (FT_LUT_PF_DOWN <= 0 || rows <= 0 || position >= self.njobs * rows) return;
+                const auto& node = l.nodes[group];
+                prefetch_bytes(node.row(2, self.jobs[position / rows].expert, begin + position % rows), node.strides[2]);
+            };
+            for (int p = 0; p < FT_LUT_PF_DOWN; ++p) prefetch_down(p);
             for (int j = 0; j < self.njobs; ++j) {
                 const Job& job = self.jobs[j];
                 for (int r = begin; r < end; ++r) {
                     if (self.workers.aborted()) break;
+                    prefetch_down(j * rows + (r - begin) + FT_LUT_PF_DOWN);
                     float values[4];
                     dots(l.formats[2], l.nodes[group].row(2, job.expert, r), s.hidden_q[j].data(), half, job.m, values);
                     for (int t = 0; t < job.m; ++t) {
@@ -1057,9 +1091,24 @@ uint64_t Backend::fixture_flush_weights() {
                 "fixture weight flush exceeds its owned allocation bound");
         total += arena->bytes;
     }
+    // Each node's own workers flush that node's arenas (T-61 run 17). A coordinator on node 0 flushing node 1's lines
+    // left node 1's next reads ~1.6x slower (measured: gate/up 414 vs 268 us per worker; symmetric without the flush),
+    // which production, where weights only go cold by eviction, never sees. The pool run also leaves workers awake,
+    // as in decode, instead of napping through a ~200 ms single-thread flush.
+    struct Flush {
+        Impl* impl;
+        static void run(void* opaque, int group, int local, int nworkers) {
+            for (const auto& entry : static_cast<Flush*>(opaque)->impl->layers)
+                for (const auto& arena : entry.second->nodes[group].arenas) {
+                    const size_t lines = (arena->bytes + 63) / 64;
+                    for (size_t line = lines * local / nworkers; line < lines * (local + 1) / nworkers; ++line)
+                        _mm_clflush(arena->data + line * 64);
+                }
+            _mm_mfence();
+        }
+    } flush{impl_.get()};
     _mm_mfence();
-    for (const auto& entry : impl_->layers) for (const auto& node : entry.second->nodes) for (const auto& arena : node.arenas)
-        for (size_t offset = 0; offset < arena->bytes; offset += 64) _mm_clflush(arena->data + offset);
+    impl_->workers.run(&Flush::run, &flush);
     _mm_mfence();
     return total;
 }
