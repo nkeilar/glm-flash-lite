@@ -14,6 +14,7 @@
 #include <fstream>
 #include <limits>
 #include <linux/mempolicy.h>
+#include <linux/futex.h>
 #include <map>
 #include <mutex>
 #include <new>
@@ -180,21 +181,27 @@ struct Arena {
     uint8_t* data = nullptr;
     size_t bytes = 0, mapped = 0;
     Policy policy;
-    Arena(size_t n, int node) : bytes(n) {
+    std::string page_policy;
+    Arena(size_t n, int node, std::string pages = "base") : bytes(n), page_policy(std::move(pages)) {
         const size_t page = size_t(sysconf(_SC_PAGESIZE));
         require(n && n <= std::numeric_limits<size_t>::max() - page, "invalid LUT arena size");
         mapped = (n + page - 1) / page * page;
         void* pointer = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         require(pointer != MAP_FAILED, "LUT arena mmap failed");
         data = static_cast<uint8_t*>(pointer);
-        // First touch uses ordinary pages: preferred THP fault allocation can
+        // Default first touch uses ordinary pages: preferred THP allocation can
         // fall back to a remote node when local high-order blocks are scarce.
         // Do not change any global THP setting or impose a strict memory bind.
-        if (madvise(data, mapped, MADV_NOHUGEPAGE) != 0) {
+        // Eager THP is an offline weight-only experiment. Establish and read
+        // back the VMA policy before any owner-worker first touch. The hint
+        // guarantees neither huge pages nor locality; receipts still measure
+        // placement and offline smaps observations measure actual page size.
+        if (page_policy == "eager") policy = preferred(data, mapped, node);
+        if (madvise(data, mapped, page_policy == "eager" ? MADV_HUGEPAGE : MADV_NOHUGEPAGE) != 0) {
             munmap(data, mapped); data = nullptr;
-            throw std::runtime_error("cannot establish ordinary-page first touch");
+            throw std::runtime_error("cannot establish LUT first-touch page advice");
         }
-        policy = preferred(data, mapped, node);
+        if (page_policy != "eager") policy = preferred(data, mapped, node);
     }
     void hint_after_touch(int node) {
         // All payload pages have already been touched by their owning workers.
@@ -202,12 +209,31 @@ struct Arena {
         // promise. No forced collapse/migration is requested. Linux khugepaged
         // selects collapse nodes from the existing pages; residency is still
         // measured below rather than inferred from advice or policy success.
-        (void)madvise(data, mapped, MADV_HUGEPAGE);
+        if (page_policy == "deferred") (void)madvise(data, mapped, MADV_HUGEPAGE);
         policy = read_policy(node, data, true);
     }
     ~Arena() { if (data) munmap(data, mapped); }
     Arena(const Arena&) = delete;
 };
+const Options& checked_options(const Options& options, bool fixture) {
+    require(options.fixture_weight_pages == "deferred" || options.fixture_weight_pages == "base" || options.fixture_weight_pages == "eager",
+            "invalid offline LUT weight page policy");
+    require(options.fixture_spin_us >= -1 && options.fixture_spin_us <= 1000000, "offline LUT spin duration must be -1..1000000 microseconds");
+    require(options.fixture_wake == "sleep" || options.fixture_wake == "futex", "invalid offline LUT wake policy");
+    require(options.fixture_nap_us >= 1 && options.fixture_nap_us <= 1000000, "offline LUT nap duration must be1..1000000 microseconds");
+    require(!options.fixture_allow_smt || (fixture && options.virtual_tp2), "SMT diagnostics require an offline virtual TP2 fixture");
+    require(fixture || (!options.fixture_allow_smt && options.fixture_weight_pages == "deferred" && options.fixture_spin_us == 2000 && options.fixture_wake == "futex" && options.fixture_nap_us == 1000 && options.fixture_idle_after_drain),
+            "production LUT rejects offline diagnostic options");
+#ifdef FT_LUT_DIAG_TRACE
+    require(fixture, "instrumented LUT builds are offline only");
+#endif
+    return options;
+}
+#ifdef FT_LUT_DIAG_TRACE
+uint64_t trace_clock_ns() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+#endif
 struct Barrier {
     std::atomic<unsigned> count{0}, epoch{0};
     unsigned n;
@@ -226,14 +252,22 @@ struct alignas(64) Control {
     alignas(64) std::atomic<unsigned> remaining{0};
     alignas(64) Barrier barrier;
     alignas(64) std::atomic<uint64_t> naps{0};
-    Control(unsigned n, uint64_t initial) : epoch(initial), completed(initial), barrier(n) {}
+    // A dedicated32-bit futex word avoids aliasing the64-bit publication epoch.
+    alignas(64) std::atomic<uint32_t> wake_generation;
+    alignas(64) std::atomic<uint64_t> retired;
+    Control(unsigned n, uint64_t initial) : epoch(initial), completed(initial), barrier(n), wake_generation(uint32_t(initial)), retired(initial) {}
 };
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
+              "LUT futex requires an aligned native32-bit atomic");
 class Workers {
     struct Group {
         int node = -1, count = 0;
         std::unique_ptr<Arena> arena;
         Control* control = nullptr;
         std::atomic<bool> ready{false};
+#ifdef FT_LUT_DIAG_TRACE
+        uint64_t publication_ns = 0;
+#endif
     };
     std::array<Group, 2> groups_;
     std::vector<std::thread> threads_;
@@ -251,9 +285,17 @@ class Workers {
     uint64_t submitted_;
     uint64_t timeout_ms_;
     const int64_t* external_abort_ = nullptr;
+    bool futex_wake_ = false;
+    bool idle_after_drain_ = false;
+    std::atomic<int> wake_error_{0}, last_wake_errno_{0};
+    std::atomic<uint64_t> wake_failures_{0};
+#ifdef FT_LUT_DIAG_TRACE
+    struct alignas(128) TraceSlot { FixtureWorkerTrace value; };
+    std::array<std::array<TraceSlot, 128>, 2> traces_{};
+#endif
 public:
     bool virtual_tp2;
-    explicit Workers(const Options& options) : submitted_(options.initial_generation), timeout_ms_(options.job_timeout_ms), external_abort_(options.abort_flag), virtual_tp2(options.virtual_tp2) {
+    explicit Workers(const Options& options) : submitted_(options.initial_generation), timeout_ms_(options.job_timeout_ms), external_abort_(options.abort_flag), futex_wake_(options.fixture_wake == "futex"), idle_after_drain_(options.fixture_idle_after_drain), virtual_tp2(options.virtual_tp2) {
         set_timeout(options.job_timeout_ms);
         require(options.cpus.size() >= 2 && options.cpus.size() <= 128, "LUT needs at least two bounded worker CPUs");
         cpu_set_t allowed; CPU_ZERO(&allowed);
@@ -265,7 +307,8 @@ public:
             int cpu = options.cpus[i];
             require(cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed) && unique.insert(cpu).second,
                     "LUT worker CPU is repeated or outside allowed affinity");
-            require(cores.insert(physical_core(cpu)).second, "LUT workers must use distinct physical cores");
+            const bool distinct_core = cores.insert(physical_core(cpu)).second;
+            require(distinct_core || options.fixture_allow_smt, "LUT workers must use distinct physical cores");
             int node = cpu_node(cpu);
             int label = options.virtual_tp2 ? int(i >= options.cpus.size() / 2) : node;
             if (!labels.count(label)) {
@@ -280,7 +323,7 @@ public:
         cpus_ = options.cpus; thread_policies_.resize(cpus_.size());
         for (auto& group : groups_) group.arena = std::make_unique<Arena>(sizeof(Control), group.node);
         try {
-            for (size_t i = 0; i < options.cpus.size(); ++i) threads_.emplace_back([this, i, cpu = options.cpus[i], initial = options.initial_generation] {
+            for (size_t i = 0; i < options.cpus.size(); ++i) threads_.emplace_back([this, i, cpu = options.cpus[i], initial = options.initial_generation, spin_us = options.fixture_spin_us, nap_us = options.fixture_nap_us] {
                 Group& group = groups_[group_[i]];
                 try {
                     cpu_set_t affinity; CPU_ZERO(&affinity); CPU_SET(cpu, &affinity);
@@ -295,21 +338,54 @@ public:
                 if (stop_.load(std::memory_order_relaxed)) return;
                 uint64_t seen = initial;
                 while (true) {
+                    // Finishing this worker's rows is not whole-job idleness:
+                    // another group may still be on the critical path. The
+                    // coordinator retires both groups only after both release
+                    // completions were acquired. New work/stop always bypasses
+                    // this observation; it is not an additional pool barrier.
+                    if (idle_after_drain_ && spin_us >= 0)
+                        while (group.control->epoch.load(std::memory_order_acquire) == seen &&
+                               group.control->retired.load(std::memory_order_acquire) != seen &&
+                               !stop_.load(std::memory_order_relaxed)) _mm_pause();
                     unsigned polls = 0;
-                    const auto spin_end = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+                    const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us < 0 ? 0 : spin_us);
                     bool napping = false;
                     while (group.control->epoch.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed)) {
                         if (!napping) {
                             _mm_pause();
-                            if ((++polls & 255U) == 0) napping = std::chrono::steady_clock::now() >= spin_end;
+                            if ((++polls & 255U) == 0 && spin_us >= 0) napping = std::chrono::steady_clock::now() >= spin_end;
                         } else {
                             group.control->naps.fetch_add(1, std::memory_order_relaxed);
-                            std::this_thread::sleep_for(std::chrono::microseconds(20));
+                            if (futex_wake_) {
+                                const uint32_t expected = group.control->wake_generation.load(std::memory_order_acquire);
+                                // Publication between either load and WAIT changes the
+                                // futex value, so the kernel returns EAGAIN instead of
+                                // parking after a missed wake. The64-bit epoch remains
+                                // authoritative, including across32-bit futex wrap.
+                                if (group.control->epoch.load(std::memory_order_acquire) != seen || stop_.load(std::memory_order_relaxed)) continue;
+                                const timespec nap{nap_us / 1000000, (nap_us % 1000000) * 1000};
+                                const long rc = syscall(SYS_futex, &group.control->wake_generation, FUTEX_WAIT_PRIVATE, expected, &nap, nullptr, 0);
+                                if (rc < 0 && errno != EAGAIN && errno != EINTR && errno != ETIMEDOUT) {
+                                    // Preserve the worker and its drain responsibility.
+                                    // Report the failed primitive after a complete job;
+                                    // bounded fallback also lets constructor/stop join.
+                                    try { throw std::runtime_error("LUT futex wait failed"); } catch (...) { capture_error(); }
+                                    std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
+                                }
+                            } else std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
                         }
                     }
                     if (stop_.load(std::memory_order_relaxed)) return;
                     seen = group.control->epoch.load(std::memory_order_relaxed);
+#ifdef FT_LUT_DIAG_TRACE
+                    auto& trace = traces_[group_[i]][local_[i]].value;
+                    trace.wake_ns = trace_clock_ns();
+                    trace.publication_ns = group.publication_ns;
+#endif
                     try { task_(context_, group_[i], local_[i], group.count); } catch (...) { capture_error(); }
+#ifdef FT_LUT_DIAG_TRACE
+                    trace.completion_ns = trace_clock_ns();
+#endif
                     if (group.control->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
                         group.control->completed.store(seen, std::memory_order_release);
                 }
@@ -320,15 +396,31 @@ public:
     }
     ~Workers() { stop(); for (auto& g : groups_) if (g.control) g.control->~Control(); }
     void capture_error() { std::lock_guard<std::mutex> lock(error_mutex_); if (!error_) error_ = std::current_exception(); }
-    void rethrow() { std::exception_ptr error; { std::lock_guard<std::mutex> lock(error_mutex_); error = error_; error_ = nullptr; } if (error) std::rethrow_exception(error); }
+    void rethrow() {
+        std::exception_ptr error;
+        { std::lock_guard<std::mutex> lock(error_mutex_); error = error_; error_ = nullptr; }
+        if (error) std::rethrow_exception(error);
+        if (wake_error_.exchange(0, std::memory_order_acq_rel)) throw std::runtime_error("LUT futex wake failed; pools drained");
+    }
     void run(void (*fn)(void*, int, int, int), void* context, uint64_t remaining_ms = 0) {
         require(!cancelled_.load(std::memory_order_acquire), "LUT backend was cancelled");
         abort_.store(false, std::memory_order_release);
         task_ = fn; context_ = context; ++submitted_;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining_ms ? std::min(remaining_ms, timeout_ms_) : timeout_ms_);
         for (auto& g : groups_) {
+#ifdef FT_LUT_DIAG_TRACE
+            const int group = int(&g - groups_.data());
+            for (size_t worker = 0; worker < cpus_.size(); ++worker) if (group_[worker] == group) {
+                auto& trace = traces_[group][local_[worker]].value;
+                trace = {}; trace.cpu = cpus_[worker]; trace.group = group; trace.local = local_[worker];
+            }
+#endif
             g.control->remaining.store(unsigned(g.count), std::memory_order_relaxed);
+#ifdef FT_LUT_DIAG_TRACE
+            g.publication_ns = trace_clock_ns();
+#endif
             g.control->epoch.store(submitted_, std::memory_order_release);
+            notify(g);
         }
         bool expired = false, deadline_expired = false; unsigned polls = 0;
         for (auto& g : groups_) while (g.control->completed.load(std::memory_order_acquire) != submitted_) {
@@ -338,6 +430,10 @@ public:
             }
             _mm_pause();
         }
+        // Publish retirement even when the completed generation will report an
+        // error. Equality remains valid across64-bit epoch wrap and load jobs.
+        if (idle_after_drain_) for (auto& group : groups_)
+            group.control->retired.store(submitted_, std::memory_order_release);
         // Contexts and buffers remain owned by the caller until BOTH groups have
         // drained. Never detach a worker or return while it can reference them.
         if (expired) { if (deadline_expired) timeouts_.fetch_add(1, std::memory_order_relaxed); rethrow();
@@ -346,11 +442,33 @@ public:
         require(!aborted(), "LUT job cancelled; both pools drained");
     }
     void set_timeout(uint64_t milliseconds) { require(milliseconds >= 1 && milliseconds <= 3600000, "LUT job timeout must be 1..3600000 milliseconds"); timeout_ms_ = milliseconds; }
-    void request_abort() { cancelled_.store(true, std::memory_order_release); abort_.store(true, std::memory_order_release); }
+    void request_abort() {
+        cancelled_.store(true, std::memory_order_release); abort_.store(true, std::memory_order_release);
+        for (auto& group : groups_) notify(group);
+    }
     bool aborted() const { return abort_.load(std::memory_order_acquire) || cancelled_.load(std::memory_order_acquire) || (external_abort_ && __atomic_load_n(external_abort_, __ATOMIC_ACQUIRE)); }
     uint64_t timeouts() const { return timeouts_.load(std::memory_order_relaxed); }
+    uint64_t wake_failures() const { return wake_failures_.load(std::memory_order_relaxed); }
+    int wake_errno() const { return last_wake_errno_.load(std::memory_order_relaxed); }
     std::array<uint64_t, 2> naps() const { return {groups_[0].control->naps.load(std::memory_order_relaxed), groups_[1].control->naps.load(std::memory_order_relaxed)}; }
+    std::array<FixtureGeneration, 2> generations() const {
+        std::array<FixtureGeneration, 2> result;
+        for (int group = 0; group < 2; ++group) {
+            const auto& control = *groups_[group].control;
+            result[group] = {control.epoch.load(std::memory_order_acquire), control.completed.load(std::memory_order_acquire), control.retired.load(std::memory_order_acquire)};
+        }
+        return result;
+    }
     void barrier(int g) { groups_[g].control->barrier.wait(); }
+#ifdef FT_LUT_DIAG_TRACE
+    void trace_phase(int group, int local, int phase, uint64_t nanoseconds) { traces_[group][local].value.phase_ns[size_t(phase)] = nanoseconds; }
+    void trace_barrier(int group, int local, int barrier, uint64_t nanoseconds) { traces_[group][local].value.barrier_ns[size_t(barrier)] = nanoseconds; }
+    std::vector<FixtureWorkerTrace> trace() const {
+        std::vector<FixtureWorkerTrace> result;
+        for (size_t worker = 0; worker < cpus_.size(); ++worker) result.push_back(traces_[group_[worker]][local_[worker]].value);
+        return result;
+    }
+#endif
     int node(int g) const { return groups_[g].node; }
     int count(int g) const { return groups_[g].count; }
     std::vector<ControlReceipt> controls() const {
@@ -377,7 +495,23 @@ public:
             if (!receipt.preferred_policy || receipt.worker_policy_failures || receipt.query_errno || receipt.observed_node != receipt.node) return false;
         return !virtual_tp2;
     }
-    void stop() { stop_.store(true); for (auto& t : threads_) if (t.joinable()) t.join(); }
+    void notify(Group& group) {
+        if (!futex_wake_ || !group.ready.load(std::memory_order_acquire)) return;
+        group.control->wake_generation.fetch_add(1, std::memory_order_release);
+        // Always wake every parked worker. Avoid a separate waiter-count fast
+        // path whose ordering could race the final epoch check before WAIT.
+        if (syscall(SYS_futex, &group.control->wake_generation, FUTEX_WAKE_PRIVATE, INT32_MAX, nullptr, nullptr, 0) < 0) {
+            const int error = errno;
+            wake_error_.store(error, std::memory_order_release);
+            last_wake_errno_.store(error, std::memory_order_relaxed);
+            wake_failures_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    void stop() {
+        stop_.store(true);
+        for (auto& group : groups_) notify(group);
+        for (auto& t : threads_) if (t.joinable()) t.join();
+    }
 };
 struct NodeWeights {
     std::array<std::unique_ptr<Arena>, 3> arenas;
@@ -488,7 +622,7 @@ struct Backend::Impl {
     int ntok = 0, njobs = 0;
     std::array<Job, MAX_PICKS> jobs;
     std::array<uint64_t, 2> pending_mapped{};
-    explicit Impl(const Options& o, bool fixture) : options(o), path(o.activation == "i16" ? Path::I16 : Path::Q8), workers(o) {
+    explicit Impl(const Options& o, bool fixture) : options(o), path(o.activation == "i16" ? Path::I16 : Path::Q8), workers(checked_options(o, fixture)) {
         require(o.activation == "i16" || o.activation == "q8", "LUT activation must be i16 or q8");
         require(std::isfinite(o.act_limit) && o.act_limit > 0, "LUT SwiGLU limit must be finite and positive");
         report.activation = o.activation; report.act_limit = o.act_limit; report.virtual_tp2 = o.virtual_tp2;
@@ -502,6 +636,9 @@ struct Backend::Impl {
         cgroup_headroom(pending_mapped[0] + pending_mapped[1] + HOST_OVERHEAD);
     }
     template<class F> void phase(int number, int group, int local, F fn) noexcept {
+#ifdef FT_LUT_DIAG_TRACE
+        const uint64_t phase_start = trace_clock_ns();
+#endif
         try {
             if (number == delayed_phase && group == delayed_group && local == 0)
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -512,6 +649,9 @@ struct Backend::Impl {
             if (!failure) failure = std::current_exception();
             failed.store(true, std::memory_order_release);
         }
+#ifdef FT_LUT_DIAG_TRACE
+        workers.trace_phase(group, local, number, trace_clock_ns() - phase_start);
+#endif
     }
     static void compute(void* opaque, int group, int local, int nworkers) {
         auto& self = *static_cast<Impl*>(opaque);
@@ -538,7 +678,13 @@ struct Backend::Impl {
                 lutbench::prepare_range(self.path, in.source, l.h, begin, begin + block, *in.destination);
             }
         });
+#ifdef FT_LUT_DIAG_TRACE
+        const uint64_t barrier0_start = trace_clock_ns();
+#endif
         self.workers.barrier(group);
+#ifdef FT_LUT_DIAG_TRACE
+        self.workers.trace_barrier(group, local, 0, trace_clock_ns() - barrier0_start);
+#endif
         self.phase(1, group, local, [&] {
             // Match the codec runner's contiguous row ownership: adjacent
             // hidden values stay on one worker's cache lines, and each worker
@@ -568,7 +714,13 @@ struct Backend::Impl {
                 }
             }
         });
+#ifdef FT_LUT_DIAG_TRACE
+        const uint64_t barrier1_start = trace_clock_ns();
+#endif
         self.workers.barrier(group);
+#ifdef FT_LUT_DIAG_TRACE
+        self.workers.trace_barrier(group, local, 1, trace_clock_ns() - barrier1_start);
+#endif
         self.phase(2, group, local, [&] {
             const int blocks = half / block;
             for (int task = local; task < self.njobs * 4 * blocks; task += nworkers) {
@@ -578,7 +730,13 @@ struct Backend::Impl {
                 lutbench::prepare_range(self.path, s.hidden.data() + size_t(slot) * half, half, b * block, (b + 1) * block, s.hidden_q[j][t]);
             }
         });
+#ifdef FT_LUT_DIAG_TRACE
+        const uint64_t barrier2_start = trace_clock_ns();
+#endif
         self.workers.barrier(group);
+#ifdef FT_LUT_DIAG_TRACE
+        self.workers.trace_barrier(group, local, 2, trace_clock_ns() - barrier2_start);
+#endif
         self.phase(3, group, local, [&] {
             const int begin = l.h * local / nworkers, end = l.h * (local + 1) / nworkers;
             for (int r = begin; r < end; ++r)
@@ -650,6 +808,7 @@ void check_memory_limit(uint64_t limit, uint64_t current, uint64_t additional) {
 Backend::Backend(const Options& options, bool fixture) : impl_(std::make_unique<Impl>(options, fixture)) {}
 std::unique_ptr<Backend> Backend::offline_fixture(const Options& options) { return std::unique_ptr<Backend>(new Backend(options)); }
 std::unique_ptr<Backend> Backend::staged_bank(const Options& options, const std::vector<LayerInput>& inputs) {
+    checked_options(options, false);
     const auto plan = bank_plan(inputs);
     require(!options.virtual_tp2 && options.cpus.size() == 42, "full LUT bank requires 42 physical workers on two actual NUMA nodes");
     std::vector<int> nodes;
@@ -719,7 +878,7 @@ void Backend::add_layer(const LayerInput& in) {
         for (int g = 0; g < 2; ++g) {
             auto& node = layer->nodes[g]; node.strides[m] = lutbench::row_bytes(layer->formats[m], m == 2 ? i / 2 : h);
             node.expert_bytes[m] = mul(node.strides[m], size_t(m == 2 ? h : i / 2));
-            node.arenas[m] = std::make_unique<Arena>(mul(node.expert_bytes[m], size_t(e)), impl_->workers.node(g));
+            node.arenas[m] = std::make_unique<Arena>(mul(node.expert_bytes[m], size_t(e)), impl_->workers.node(g), impl_->options.fixture_weight_pages);
             require(impl_->report.offline_fixture || node.arenas[m]->policy.verified, "full LUT bank preferred placement policy unavailable or read-back mismatch");
         }
     }
@@ -869,7 +1028,8 @@ void Backend::shutdown() {
 
 Receipt Backend::receipt() const {
     std::lock_guard<std::mutex> lock(impl_->report_mutex);
-    Receipt report = impl_->report; report.pool_naps = impl_->workers.naps(); report.timed_out_jobs = impl_->workers.timeouts(); return report;
+    Receipt report = impl_->report; report.pool_naps = impl_->workers.naps(); report.timed_out_jobs = impl_->workers.timeouts();
+    report.futex_wake_failures = impl_->workers.wake_failures(); report.futex_wake_errno = impl_->workers.wake_errno(); return report;
 }
 void Backend::inject_failure(int phase, int group) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -912,4 +1072,28 @@ std::vector<uint8_t> Backend::fixture_slice(int li, int group, int expert, int m
     const auto& node = layer.nodes[group]; const uint8_t* first = node.row(matrix, expert, 0);
     return {first, first + node.expert_bytes[matrix]};
 }
+std::vector<FixtureArena> Backend::fixture_arenas() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->report.offline_fixture, "arena addresses are an offline fixture API only");
+    std::vector<FixtureArena> result;
+    for (const auto& entry : impl_->layers) for (int group = 0; group < 2; ++group) for (int matrix = 0; matrix < 3; ++matrix) {
+        const auto& arena = *entry.second->nodes[group].arenas[matrix];
+        result.push_back({entry.second->model_layer, group, impl_->workers.node(group), matrix,
+                          reinterpret_cast<uintptr_t>(arena.data), arena.bytes, arena.mapped, arena.page_policy});
+    }
+    return result;
+}
+std::array<FixtureGeneration, 2> Backend::fixture_generations() const {
+    // offline_fixture is immutable after construction. Do not take the forward
+    // mutex: observing an in-flight delayed generation is the purpose of this API.
+    require(impl_->report.offline_fixture, "generation snapshots are an offline fixture API only");
+    return impl_->workers.generations();
+}
+#ifdef FT_LUT_DIAG_TRACE
+std::vector<FixtureWorkerTrace> Backend::fixture_trace() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->report.offline_fixture, "worker traces are an offline fixture API only");
+    return impl_->workers.trace();
+}
+#endif
 } // namespace ft_lut

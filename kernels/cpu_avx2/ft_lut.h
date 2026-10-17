@@ -71,6 +71,8 @@ struct Receipt {
     uint64_t staging_peak_bytes = 0;
     std::array<uint64_t, 2> pool_naps{};
     uint64_t timed_out_jobs = 0;
+    uint64_t futex_wake_failures = 0;
+    int futex_wake_errno = 0;
     std::vector<ControlReceipt> controls;
     std::vector<ScratchReceipt> scratch;
     std::vector<RegionReceipt> regions;
@@ -88,7 +90,32 @@ struct Options {
     // Optional mapped ingress cancellation word, owned until backend destruction.
     const int64_t* abort_flag = nullptr;
     uint64_t initial_generation = 0; // offline wrap/reuse tests
+    // Offline diagnostics only. Production accepts exactly these defaults.
+    bool fixture_allow_smt = false; // requires virtual_tp2; duplicate CPUs still fail
+    std::string fixture_weight_pages = "deferred"; // deferred, base, eager
+    int fixture_spin_us = 2000; // -1 keeps offline workers spinning indefinitely
+    std::string fixture_wake = "futex"; // sleep is an offline causal comparison
+    int fixture_nap_us = 1000; // interruptible maximum wait; publication wakes it
+    bool fixture_idle_after_drain = true; // start idle clock only after both groups retire
 };
+struct FixtureGeneration {
+    uint64_t epoch = 0, completed = 0, retired = 0;
+};
+struct FixtureArena {
+    int model_layer = -1, group = -1, node = -1, matrix = -1;
+    uintptr_t address = 0;
+    uint64_t payload_bytes = 0, mapped_bytes = 0;
+    std::string page_policy;
+};
+#ifdef FT_LUT_DIAG_TRACE
+// Instrumented offline builds only; never used by production admission.
+struct FixtureWorkerTrace {
+    int cpu = -1, group = -1, local = -1;
+    uint64_t publication_ns = 0, wake_ns = 0, completion_ns = 0;
+    std::array<uint64_t, 4> phase_ns{}; // input, gate/up, hidden quantization, down
+    std::array<uint64_t, 3> barrier_ns{};
+};
+#endif
 struct BankPlan {
     std::array<uint64_t, 2> mapped_bytes{};
     uint64_t canonical_payload_bytes = 0, tp2_payload_bytes = 0;
@@ -131,6 +158,15 @@ public:
     // Flush only owned loaded fixture weight cache lines (<=256 MiB total).
     // Serialized with forward/load/shutdown; returns flushed payload bytes.
     uint64_t fixture_flush_weights();
+    // Read-only, process-local ranges for /proc/self/smaps diagnostics. The
+    // caller must retain and quiesce the backend while inspecting these ranges.
+    std::vector<FixtureArena> fixture_arenas() const;
+    // Atomic diagnostic snapshots, valid during forward while the caller owns
+    // the backend lifetime. A snapshot is observational, not a synchronization API.
+    std::array<FixtureGeneration, 2> fixture_generations() const;
+#ifdef FT_LUT_DIAG_TRACE
+    std::vector<FixtureWorkerTrace> fixture_trace() const;
+#endif
     std::vector<uint8_t> fixture_slice(int internal_li, int group, int expert, int matrix) const;
 private:
     struct Impl;

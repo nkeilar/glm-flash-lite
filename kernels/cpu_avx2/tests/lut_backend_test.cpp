@@ -26,6 +26,11 @@
 namespace {
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 template<class F> void rejects(F fn) { bool rejected = false; try { fn(); } catch (const std::exception&) { rejected = true; } check(rejected, "invalid operation accepted"); }
+template<class F> void rejects_with(F fn, const char* message) {
+    bool rejected = false;
+    try { fn(); } catch (const std::exception& e) { rejected = std::string(e.what()).find(message) != std::string::npos; }
+    check(rejected, "operation did not fail at its required admission check");
+}
 float fp16(float x) { return _cvtsh_ss(_cvtss_sh(x, _MM_FROUND_TO_NEAREST_INT)); }
 lutbench::Format fmt(int type) {
     return type == 138 ? lutbench::Format::IQ3_K : type == 144 ? lutbench::Format::IQ4_KS : lutbench::Format::Q6_K;
@@ -40,6 +45,20 @@ std::vector<int> cpus() {
         if (pkg >= 0 && core >= 0 && cores.insert({pkg, core}).second) result.push_back(c);
     }
     check(result.size() >= 5, "tests need five distinct allowed physical cores for asymmetric 2/3 groups"); return result;
+}
+std::vector<int> allowed_siblings() {
+    cpu_set_t allowed; CPU_ZERO(&allowed); check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "affinity unavailable");
+    std::map<std::pair<int, int>, int> cores;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) if (CPU_ISSET(cpu, &allowed)) {
+        int package = -1, core = -1;
+        const auto base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+        std::ifstream(base + "physical_package_id") >> package; std::ifstream(base + "core_id") >> core;
+        if (package < 0 || core < 0) continue;
+        auto found = cores.find({package, core});
+        if (found != cores.end()) return {found->second, cpu};
+        cores[{package, core}] = cpu;
+    }
+    return {};
 }
 struct Temporary {
     std::string path;
@@ -347,6 +366,169 @@ int main(int argc, char** argv) {
         rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, broken); });
         Fixture ordinary(temp, 3, 8), upgrade(temp, 11, 8), down6(temp, 12, 8);
         int cases = 0; double worst = 0;
+        // The diagnostics cannot enter production, even before a bank exists.
+        // Verify the specific early rejection instead of relying on empty-bank
+        // or workstation topology errors to hide an admitted diagnostic mode.
+        for (const std::string pages : {"base", "eager"}) {
+            ft_lut::Options option; option.fixture_weight_pages = pages;
+            rejects_with([&] { ft_lut::Backend::staged_bank(option, {}); }, "production LUT rejects offline diagnostic options");
+        }
+        for (int spin : {-1, 0, 1, 1000000}) {
+            ft_lut::Options option; option.fixture_spin_us = spin;
+            rejects_with([&] { ft_lut::Backend::staged_bank(option, {}); }, "production LUT rejects offline diagnostic options");
+        }
+        { ft_lut::Options option; option.fixture_wake = "sleep";
+          rejects_with([&] { ft_lut::Backend::staged_bank(option, {}); }, "production LUT rejects offline diagnostic options"); }
+        { ft_lut::Options option; option.fixture_nap_us = 20;
+          rejects_with([&] { ft_lut::Backend::staged_bank(option, {}); }, "production LUT rejects offline diagnostic options"); }
+        { ft_lut::Options option; option.fixture_idle_after_drain = false;
+          rejects_with([&] { ft_lut::Backend::staged_bank(option, {}); }, "production LUT rejects offline diagnostic options"); }
+#ifdef FT_LUT_DIAG_TRACE
+        rejects_with([&] { ft_lut::Backend::staged_bank(ft_lut::Options{}, {}); }, "instrumented LUT builds are offline only");
+#endif
+        ft_lut::Options diagnostic; diagnostic.cpus = workers; diagnostic.virtual_tp2 = true;
+        diagnostic.fixture_allow_smt = true;
+        rejects_with([&] { ft_lut::Backend::staged_bank(diagnostic, {}); }, "SMT diagnostics require an offline virtual TP2 fixture");
+        diagnostic.virtual_tp2 = false;
+        rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "SMT diagnostics require an offline virtual TP2 fixture");
+        diagnostic.virtual_tp2 = true; diagnostic.fixture_allow_smt = false;
+        diagnostic.fixture_weight_pages = "invalid";
+        rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "invalid offline LUT weight page policy");
+        diagnostic.fixture_weight_pages = "deferred";
+        diagnostic.fixture_wake = "invalid";
+        rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "invalid offline LUT wake policy");
+        diagnostic.fixture_wake = "sleep";
+        for (int nap : {0, 1000001}) {
+            diagnostic.fixture_nap_us = nap;
+            rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "offline LUT nap duration");
+        }
+        diagnostic.fixture_nap_us = 20;
+        for (int spin : {-2, 1000001}) {
+            diagnostic.fixture_spin_us = spin;
+            rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "offline LUT spin duration");
+        }
+        const auto siblings = allowed_siblings();
+        if (!siblings.empty()) {
+            diagnostic.fixture_spin_us = 2000; diagnostic.cpus = siblings;
+            rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "distinct physical cores");
+            diagnostic.fixture_allow_smt = true;
+            auto smt = ft_lut::Backend::offline_fixture(diagnostic); smt->add_layer(ordinary.input);
+            check(smt->receipt().virtual_tp2 && !smt->receipt().placement_verified, "SMT diagnostic claimed physical placement");
+            layout(*smt, ordinary);
+            diagnostic.cpus = {siblings[0], siblings[0]};
+            rejects_with([&] { ft_lut::Backend::offline_fixture(diagnostic); }, "CPU is repeated");
+        }
+        // Page and wake policies must leave packed slices and arithmetic exact.
+        // No performance assertion is made here: THP advice is not a guarantee.
+        for (const std::string activation : {"i16", "q8"}) {
+            std::vector<float> reference, input(ordinary.h, .25f), output(ordinary.h);
+            const ft_lut::Routes route{{{0, .25f}, {1, .75f}, {2, .5f}}};
+            for (const std::string pages : {"deferred", "base", "eager"}) for (int spin : {2000, -1, 0}) for (const std::string wake : {"sleep", "futex"}) {
+                ft_lut::Options option; option.cpus = workers; option.virtual_tp2 = true; option.activation = activation;
+                option.fixture_weight_pages = pages; option.fixture_spin_us = spin;
+                option.fixture_wake = wake; option.initial_generation = uint64_t(UINT32_MAX) - 26;
+                option.fixture_idle_after_drain = wake == "futex";
+                if (wake == "futex" && spin == 0) option.fixture_nap_us = 1000;
+                auto probe = ft_lut::Backend::offline_fixture(option);
+                check(probe->fixture_arenas().empty(), "empty fixture has a weight arena");
+                probe->add_layer(ordinary.input); layout(*probe, ordinary); verify_policy_receipts(probe->receipt());
+                const auto arenas = probe->fixture_arenas(); check(arenas.size() == 6, "fixture arena diagnostic omitted a projection");
+                uint64_t payload = 0; const auto page = uintptr_t(sysconf(_SC_PAGESIZE));
+                for (const auto& arena : arenas) {
+                    check(arena.address && arena.address % page == 0 && arena.mapped_bytes % page == 0 &&
+                          arena.payload_bytes <= arena.mapped_bytes && arena.mapped_bytes - arena.payload_bytes < page,
+                          "fixture arena address or extent is invalid");
+                    check(arena.model_layer == 3 && arena.group >= 0 && arena.group < 2 && arena.matrix >= 0 && arena.matrix < 3 &&
+                          arena.page_policy == pages, "fixture arena labels are invalid");
+                    payload += arena.payload_bytes;
+                }
+                const auto receipt = probe->receipt();
+                check(payload == receipt.payload_bytes[0] + receipt.payload_bytes[1], "fixture arena diagnostic payload ledger mismatch");
+                if (wake == "futex" && spin >= 0) {
+                    const auto before = probe->receipt().pool_naps;
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                    while (true) {
+                        const auto after = probe->receipt().pool_naps;
+                        if (after[0] > before[0] && after[1] > before[1]) break;
+                        check(std::chrono::steady_clock::now() < deadline, "futex test did not exercise parked workers");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }
+                probe->forward(0, input.data(), 1, route, output.data());
+#ifdef FT_LUT_DIAG_TRACE
+                const auto traces = probe->fixture_trace(); check(traces.size() == workers.size(), "worker trace inventory mismatch");
+                for (const auto& trace : traces) {
+                    check(trace.publication_ns && trace.wake_ns >= trace.publication_ns && trace.completion_ns >= trace.wake_ns,
+                          "worker trace timestamps are not ordered");
+                    uint64_t elapsed = 0;
+                    for (auto duration : trace.phase_ns) elapsed += duration;
+                    for (auto duration : trace.barrier_ns) elapsed += duration;
+                    check(elapsed <= trace.completion_ns - trace.wake_ns, "worker phase trace exceeds whole job interval");
+                }
+#endif
+                if (reference.empty()) reference = output;
+                else check(std::memcmp(reference.data(), output.data(), output.size() * sizeof(float)) == 0, "offline diagnostic changed arithmetic bits");
+                if (spin == -1) check(probe->receipt().pool_naps == std::array<uint64_t, 2>{0, 0}, "spin-only fixture entered nap backoff");
+                if (wake == "futex") {
+                    // Loading publishes25 generations, so these calls cross
+                    // the separate32-bit futex wrap without reusing a64-bit job.
+                    for (int repeat = 0; repeat < 3; ++repeat) {
+                        probe->forward(0, input.data(), 1, route, output.data());
+                        check(std::memcmp(reference.data(), output.data(), output.size() * sizeof(float)) == 0, "futex generation wrap changed output");
+                    }
+                    if (pages == "base" && spin == 0) {
+                        probe->inject_failure(1, 1);
+                        rejects([&] { probe->forward(0, input.data(), 1, route, output.data()); });
+                        probe->inject_failure(-1); probe->fixture_set_timeout(2); probe->inject_delay(0, 1, 10);
+                        rejects([&] { probe->forward(0, input.data(), 1, route, output.data()); });
+                        probe->fixture_set_timeout(30000); probe->inject_delay(-1, 1, 0);
+                        probe->forward(0, input.data(), 1, route, output.data());
+                        check(std::memcmp(reference.data(), output.data(), output.size() * sizeof(float)) == 0, "futex pool failed recovery after drain");
+                        probe->request_abort();
+                        rejects([&] { probe->forward(0, input.data(), 1, route, output.data()); });
+                        probe->shutdown();
+                    }
+                }
+            }
+        }
+        {
+            ft_lut::Options option; option.cpus = workers; option.virtual_tp2 = true;
+            option.fixture_wake = "futex"; option.fixture_spin_us = 0; option.fixture_idle_after_drain = true;
+            option.initial_generation = UINT64_MAX - 26;
+            auto probe = ft_lut::Backend::offline_fixture(option); probe->add_layer(ordinary.input);
+            probe->inject_delay(3, 1, 500);
+            std::vector<float> input(ordinary.h, .25f), output(ordinary.h);
+            const ft_lut::Routes route{{{0, 1.f}}};
+            std::atomic<bool> returned{false}; std::exception_ptr failure;
+            std::thread forward([&] {
+                try { probe->forward(0, input.data(), 1, route, output.data()); } catch (...) { failure = std::current_exception(); }
+                returned.store(true, std::memory_order_release);
+            });
+            bool witnessed = false; uint64_t delayed_epoch = 0;
+            const auto witness_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!returned.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < witness_deadline) {
+                const auto generations = probe->fixture_generations();
+                if (generations[0].epoch == generations[1].epoch &&
+                    generations[0].completed == generations[0].epoch &&
+                    generations[1].completed != generations[1].epoch) {
+                    witnessed = true; delayed_epoch = generations[0].epoch; break;
+                }
+                std::this_thread::yield();
+            }
+            const auto before = probe->receipt().pool_naps;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const auto after = probe->receipt().pool_naps;
+            const auto generations = probe->fixture_generations();
+            const bool active = generations[0].epoch == delayed_epoch && generations[1].epoch == delayed_epoch &&
+                                generations[0].completed == delayed_epoch && generations[1].completed != delayed_epoch;
+            forward.join();
+            if (failure) std::rethrow_exception(failure);
+            check(witnessed && active && before[0] == after[0], "completed group entered nap before whole generation retired");
+            probe->inject_delay(-1, 1, 0);
+            probe->forward(0, input.data(), 1, route, output.data()); //64-bit generation wraps after delayed retirement.
+            probe->shutdown(); probe->shutdown();
+        }
         // Recreate the cost-table lifetime pattern: independent successive
         // backends must own and release their scratch mappings for every recipe.
         for (const std::string activation : {"i16", "q8"}) {
@@ -447,14 +629,17 @@ int main(int argc, char** argv) {
         }
         // Cancellation is sticky for serving: drain both asymmetric groups,
         // leave the caller result untouched and refuse subsequent generations.
-        for (int cancellation : {0, 1, 2}) {
+        for (const std::string wake : {"sleep", "futex"}) for (int cancellation : {0, 1, 2}) {
             int64_t abort_word = 0;
             ft_lut::Options cancel_options; cancel_options.cpus = workers; cancel_options.virtual_tp2 = true;
+            cancel_options.fixture_wake = wake;
+            if (wake == "futex") cancel_options.fixture_spin_us = 0;
             if (cancellation == 1) cancel_options.abort_flag = &abort_word;
             auto cancelled = ft_lut::Backend::offline_fixture(cancel_options); cancelled->add_layer(ordinary.input);
             cancelled->inject_delay(0, 1, 40);
             std::vector<float> x(ordinary.h, .25f), out(ordinary.h, 123.f);
             ft_lut::Routes routes(1); routes[0] = {{0, 1.f}};
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
             std::thread aborter([&] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(8));
                 if (cancellation == 1) __atomic_store_n(&abort_word, int64_t(1), __ATOMIC_RELEASE);
@@ -467,6 +652,7 @@ int main(int argc, char** argv) {
             check(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(30), "cancellation returned before the delayed pool drained");
             check(std::all_of(out.begin(), out.end(), [](float value) { return value == 123.f; }), "cancellation published partial output");
             rejects([&] { cancelled->forward(0, x.data(), 1, routes, out.data()); });
+            cancelled->shutdown(); cancelled->shutdown();
         }
         Temporary production_temp;
         std::unique_ptr<Fixture> production = real_directory.empty() ? std::make_unique<Fixture>(production_temp, 3, 1, 4096, 2048) : std::make_unique<Fixture>(real_directory + "/blk.03.experts-0-1.lut.gguf", 3);
@@ -515,7 +701,7 @@ int main(int argc, char** argv) {
         for (float limit : {0.f, -1.f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) { options.act_limit = limit; rejects([&] { ft_lut::Backend::offline_fixture(options); }); }
         std::cout << "PASS cases=" << cases << " worst_relative_l2=" << worst
                   << " paths=i16,q8 M=1,2,3,4 K=0..8 profiles=ordinary,upgrade,down6"
-                  << " worker_failures=16 timeouts=4 cancellations=3 owned_weight_flush=covered stats_concurrency=200 groups=2/3 production_width=4096/2048 scratch_unmap=covered repeated_profile_resets=12 placement_claim=none generation_wrap=covered\n";
+                  << " worker_failures=16 timeouts=4 cancellations=6 owned_weight_flush=covered stats_concurrency=200 groups=2/3 production_width=4096/2048 scratch_unmap=covered repeated_profile_resets=12 placement_claim=none generation_wrap=covered offline_page_spin_wake_bits=36 diagnostic_admission=covered futex_wrap_drain_abort=covered\n";
         return 0;
     } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
 }

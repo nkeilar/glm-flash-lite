@@ -1063,6 +1063,7 @@ pybind11::dict tier_lut_fixture_stats()
     result["scratch_mapped_bytes"] = receipt.scratch_mapped_bytes;
     result["nodes"] = receipt.nodes; result["workers"] = receipt.workers; result["staging_peak_bytes"] = receipt.staging_peak_bytes;
     result["pool_naps"] = receipt.pool_naps; result["timed_out_jobs"] = receipt.timed_out_jobs;
+    result["futex_wake_failures"] = receipt.futex_wake_failures; result["futex_wake_errno"] = receipt.futex_wake_errno;
     result["placement_scope"] = "sampled weight slices, pool controls and activation/scratch payloads; metadata not placed";
     pybind11::list regions, controls, scratch;
     for (const auto& row : receipt.regions) {
