@@ -201,8 +201,12 @@ def make_sampler(sp):
 
 @app.on_event("startup")
 async def startup():
+    # GLM53_GEN_CHUNK_SIZE: prefill chunk for the generator only. Model load keeps -chunk_size, which exllamav3's
+    # autosplit needs as a multiple of its 256-token page; the E1 quality panel prefills 1 token per forward so every
+    # teacher-forced token passes the LUT CPU tier (M <= 4).
+    gen_chunk = int(os.environ.get("GLM53_GEN_CHUNK_SIZE", "0") or 0) or args.chunk_size
     G["gen"] = AsyncGenerator(model=model, cache=cache, tokenizer=tok, max_batch_size=args.max_batch_size,
-                              max_chunk_size=args.chunk_size, max_q_size=args.max_q_size,
+                              max_chunk_size=gen_chunk, max_q_size=args.max_q_size,
                               draft_model=draft_model, draft_cache=draft_cache,
                               num_draft_tokens=args.num_draft_tokens, dynamic_draft_tokens=args.dynamic_draft,
                               draft_confidence=args.draft_confidence, ngram_match_min=args.ngram_match_min,
