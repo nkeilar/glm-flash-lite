@@ -626,7 +626,10 @@ def load_precompiled(path, expected_sha256):
     revision = receipt.get("source_revision")
     require(isinstance(revision, str) and len(revision) == 40 and all(c in "0123456789abcdef" for c in revision),
             "invalid LUT precompile source revision")
-    require(receipt.get("torch_version") == importlib.metadata.version("torch"), "LUT precompile Torch version mismatch")
+    runtime_version = receipt.get("torch_version")
+    require(isinstance(runtime_version, str) and bool(runtime_version) and
+            runtime_version.split("+", 1)[0] == importlib.metadata.version("torch"),
+            "LUT precompile Torch metadata/public runtime version mismatch")
     require("-DFT_ENABLE_LUT=1" in receipt.get("flags", []) and
             "-DFT_ENABLE_LUT=1" in receipt.get("cuda_flags", []), "both precompiled LUT modules require guarded LUT build flags")
     sources = receipt.get("source_sha256")

@@ -661,6 +661,26 @@ class StartupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"module SHA256"):lm.load_precompiled(path,sha)
         with self.assertRaisesRegex(ValueError,"PRECOMPILE"):lm.load_precompiled(None,None)
 
+    def test_precompile_metadata_keeps_receipt_local_suffix_for_exact_runtime_check(self):
+        receipt=self.precompile_receipt()
+        receipt["torch_version"]="fixture+vendor"
+        receipt["torch_metadata_version"]="untrusted-observation"
+        path,sha=self.write_precompile(receipt)
+        with mock.patch.object(lm.subprocess,"check_output",return_value="1"*40+"\n"):
+            with mock.patch.object(lm.importlib.metadata,"version",return_value="fixture"):
+                result=lm.load_precompiled(path,sha)
+                self.assertEqual(result["receipt"]["torch_version"],"fixture+vendor")
+            for version in ("other","fixture+vendor","fixture+other"):
+                with self.subTest(version=version),mock.patch.object(lm.importlib.metadata,"version",return_value=version):
+                    with self.assertRaisesRegex(ValueError,"Torch metadata"):lm.load_precompiled(path,sha)
+        entries={name:dict(path=str(self.root/name),identity=lm.identity((self.root/name).stat()))
+                 for name in receipt["outputs"]}
+        for version in ("fixture","fixture+other"):
+            module=self.cpu_module(SimpleNamespace(inference_mode=lambda:lambda function:function,__version__=version))
+            module.S["settings"]=SimpleNamespace(precompiled=dict(receipt=receipt,modules=entries))
+            with self.subTest(runtime=version),self.assertRaisesRegex(ValueError,"Torch version mismatch"):
+                module._build_lut()
+
     def test_lut_load_imports_exact_reviewed_modules_without_jit_and_rechecks_identity(self):
         module=self.cpu_module(SimpleNamespace(inference_mode=lambda:lambda function:function,__version__="fixture"))
         receipt=self.precompile_receipt()
