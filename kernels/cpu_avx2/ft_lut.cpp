@@ -540,25 +540,31 @@ struct Backend::Impl {
         });
         self.workers.barrier(group);
         self.phase(1, group, local, [&] {
-            for (int task = local; task < self.njobs * half; task += nworkers) {
-                if (self.workers.aborted()) break;
-                int j = task / half, r = task % half; const Job& job = self.jobs[j];
+            // Match the codec runner's contiguous row ownership: adjacent
+            // hidden values stay on one worker's cache lines, and each worker
+            // streams through one expert's gate/up rows before changing expert.
+            const int begin = half * local / nworkers, end = half * (local + 1) / nworkers;
+            for (int j = 0; j < self.njobs; ++j) {
+                const Job& job = self.jobs[j];
                 const Activation* input = &s.input[job.tokens[0]];
                 if (job.m >= 2 && job.tokens[1] != job.tokens[0] + 1) input = s.pairs[pair_index(job.tokens[0], job.tokens[1])].data();
-                float g[4], u[4]; int first = job.m == 3 ? 2 : job.m;
-                dots(l.formats[0], l.nodes[group].row(0, job.expert, r), input, l.h, first, g);
-                dots(l.formats[1], l.nodes[group].row(1, job.expert, r), input, l.h, first, u);
-                if (job.m == 3) {
-                    dots(l.formats[0], l.nodes[group].row(0, job.expert, r), &s.input[job.tokens[2]], l.h, 1, g + 2);
-                    dots(l.formats[1], l.nodes[group].row(1, job.expert, r), &s.input[job.tokens[2]], l.h, 1, u + 2);
-                }
-                for (int t = 0; t < job.m; ++t) {
-                    require(std::isfinite(g[t]) && std::isfinite(u[t]), "nonfinite LUT gate/up projection");
-                    float gate = std::min(g[t] / (1.0f + std::exp(-g[t])), self.options.act_limit);
-                    float up = std::max(-self.options.act_limit, std::min(self.options.act_limit, u[t]));
-                    float hidden = gate * up;
-                    require(std::isfinite(hidden), "nonfinite LUT hidden activation");
-                    s.hidden[(size_t(j) * 4 + t) * half + r] = hidden;
+                for (int r = begin; r < end; ++r) {
+                    if (self.workers.aborted()) break;
+                    float g[4], u[4]; int first = job.m == 3 ? 2 : job.m;
+                    dots(l.formats[0], l.nodes[group].row(0, job.expert, r), input, l.h, first, g);
+                    dots(l.formats[1], l.nodes[group].row(1, job.expert, r), input, l.h, first, u);
+                    if (job.m == 3) {
+                        dots(l.formats[0], l.nodes[group].row(0, job.expert, r), &s.input[job.tokens[2]], l.h, 1, g + 2);
+                        dots(l.formats[1], l.nodes[group].row(1, job.expert, r), &s.input[job.tokens[2]], l.h, 1, u + 2);
+                    }
+                    for (int t = 0; t < job.m; ++t) {
+                        require(std::isfinite(g[t]) && std::isfinite(u[t]), "nonfinite LUT gate/up projection");
+                        float gate = std::min(g[t] / (1.0f + std::exp(-g[t])), self.options.act_limit);
+                        float up = std::max(-self.options.act_limit, std::min(self.options.act_limit, u[t]));
+                        float hidden = gate * up;
+                        require(std::isfinite(hidden), "nonfinite LUT hidden activation");
+                        s.hidden[(size_t(j) * 4 + t) * half + r] = hidden;
+                    }
                 }
             }
         });
@@ -574,11 +580,16 @@ struct Backend::Impl {
         });
         self.workers.barrier(group);
         self.phase(3, group, local, [&] {
-            for (int r = local; r < l.h; r += nworkers) {
-                if (self.workers.aborted()) break;
+            const int begin = l.h * local / nworkers, end = l.h * (local + 1) / nworkers;
+            for (int r = begin; r < end; ++r)
                 for (int t = 0; t < self.ntok; ++t) s.partial[size_t(t) * l.h + r] = 0;
-                for (int j = 0; j < self.njobs; ++j) {
-                    const Job& job = self.jobs[j]; float values[4];
+            // Expert-major streaming preserves the same ascending expert
+            // addition order for every output while avoiding interleaved rows.
+            for (int j = 0; j < self.njobs; ++j) {
+                const Job& job = self.jobs[j];
+                for (int r = begin; r < end; ++r) {
+                    if (self.workers.aborted()) break;
+                    float values[4];
                     dots(l.formats[2], l.nodes[group].row(2, job.expert, r), s.hidden_q[j].data(), half, job.m, values);
                     for (int t = 0; t < job.m; ++t) {
                         float contribution = job.weights[t] * values[t];
