@@ -485,7 +485,7 @@ async def models():
 async def server_info():
     sa = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool, type(None)))}
     sa.update({"context_length": CTX, "max_running_requests": args.max_batch_size, "max_total_num_tokens": CTX,
-               "chunked_prefill_size": args.chunk_size, "kv_cache_dtype": args.cache_quant or "fp16",
+               "chunked_prefill_size": int(os.environ.get("GLM53_GEN_CHUNK_SIZE", "0") or 0) or args.chunk_size, "kv_cache_dtype": args.cache_quant or "fp16",
                "engine": "exllamav3", "env": {k: v for k, v in os.environ.items() if k.startswith(("GLM53_", "EXL3_"))}})
     return JSONResponse({"context_length": CTX, "server_args": sa, "load_seconds": round(t_load, 1)})
 
