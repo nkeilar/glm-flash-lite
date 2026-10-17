@@ -567,6 +567,9 @@ class StartupTests(unittest.TestCase):
         return module
 
     def test_native_lut_start_uses_full_descriptors_and_model_limit_without_trellis_registration(self):
+        job=type("Job",(),{"receive_sample":lambda self,*args,**kwargs:"token"});fake=SimpleNamespace(Job=job)
+        patcher=mock.patch.dict(sys.modules,{"exllamav3":SimpleNamespace(),"exllamav3.generator":SimpleNamespace(job=fake),"exllamav3.generator.job":fake})
+        patcher.start();self.addCleanup(patcher.stop)
         env=self.startup_environment();stage=self.stage()
         binary=self.root/"host.so";binary.write_bytes(b"structural native-build fixture")
         path=Path(env["GLM53_CT_LUT_COST"]);value=json.loads(path.read_text())
@@ -587,6 +590,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(args[-2:],(10,2000));host.tier_start.assert_called_once_with(0)
         host.tier_init.assert_not_called();host.tier_add_layer.assert_not_called();host.tier_set_act_limit.assert_not_called()
         self.assertTrue(module.S["started"]);self.assertFalse(module.S["selftest"]["trellis_correctness_comparison"])
+        self.assertTrue(job._glm53_lut_token_check)   # the per-token LUT check is installed at LUT start
         host.reset_mock();module.S["started"]=False
         def remote(modules):module.S["rt"]={"backend":"fixture"}
         with mock.patch.dict(os.environ,{**env,"GLM53_RT":"configured"},clear=True),mock.patch.object(module,"_cpus",return_value=list(range(2,44))),mock.patch.object(os,"sched_getaffinity",return_value=set(range(44))),mock.patch.object(module,"_rt_enable",side_effect=remote) as enable,mock.patch.object(module,"_rt_auto_b_start") as auto,mock.patch.object(lm,"validate_cost_hardware"),mock.patch("atexit.register"):
@@ -648,16 +652,42 @@ class StartupTests(unittest.TestCase):
         module.S["settings"]=SimpleNamespace(format="trellis")
         self.assertIn("check_rel_rms",module._rt_summary())
 
-    def test_lut_combine_error_is_checked_after_stream_completion_before_buffer_reuse(self):
+    def test_lut_failure_is_raised_once_per_token_without_a_stream_sync(self):
         events=[]
-        stream=SimpleNamespace(synchronize=lambda:events.append("stream_done"))
+        stream=SimpleNamespace(synchronize=lambda:events.append("stream_sync"))
         torch=SimpleNamespace(inference_mode=lambda:lambda function:function,cuda=SimpleNamespace(current_stream=lambda dev:stream))
         module=self.cpu_module(torch);module.S.update(dev="cuda:0",started=True)
         def failure():events.append("check");raise RuntimeError("native failed")
         module._H=SimpleNamespace(tier_lut_check=failure,tier_lut_abort=lambda:events.append("abort"))
-        with self.assertRaisesRegex(RuntimeError,"native failed"):module._lut_check()
-        self.assertEqual(events,["stream_done","check","abort"]);self.assertFalse(module.S["started"])
+        with self.assertRaisesRegex(RuntimeError,"native failed"):module._lut_token_check()
+        # The caller (iterate_gen / lookahead) has synchronized the token; the check itself must never sync.
+        self.assertEqual(events,["check","abort"]);self.assertFalse(module.S["started"])
         self.assertEqual(module.S["lut_error"],"native failed")
+
+    def test_lut_token_hook_refuses_the_token_before_delivery(self):
+        module=self.cpu_module();module.S.update(started=True)
+        delivered=[]
+        class Job:
+            def receive_sample(self,*args,**kwargs):delivered.append((args,kwargs));return "token"
+        fake=SimpleNamespace(Job=Job)
+        with mock.patch.dict(sys.modules,{"exllamav3":SimpleNamespace(),"exllamav3.generator":SimpleNamespace(job=fake),"exllamav3.generator.job":fake}):
+            module._H=SimpleNamespace(tier_lut_check=lambda:None,tier_lut_abort=lambda:None)
+            module._install_lut_token_hook();module._install_lut_token_hook()   # idempotent: wrapped once
+            self.assertEqual(Job().receive_sample(1,k=2),"token");self.assertEqual(delivered,[((1,),{"k":2})])
+            def failure():raise RuntimeError("combine timeout")
+            module._H=SimpleNamespace(tier_lut_check=failure,tier_lut_abort=lambda:None)
+            with self.assertRaisesRegex(RuntimeError,"combine timeout"):Job().receive_sample(3)
+            self.assertEqual(len(delivered),1)   # the failed token never reached the original receive_sample
+
+    def test_lut_combine_hook_no_longer_syncs_per_layer(self):
+        tree=ast.parse((ROOT/"glm53"/"cpu_tier.py").read_text())
+        wrap=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="wrap")
+        comb=next(node for node in ast.walk(wrap) if isinstance(node,ast.FunctionDef) and node.name=="comb")
+        names={n.attr if isinstance(n,ast.Attribute) else n.id for n in ast.walk(comb) if isinstance(n,(ast.Attribute,ast.Name))}
+        self.assertNotIn("synchronize",names);self.assertNotIn("_lut_token_check",names);self.assertNotIn("_lut_check",names)
+
+    def test_failed_lut_tier_never_falls_back_to_gpu_routing(self):
+        module=self.cpu_module();module.S.update(dev="cuda:0",started=False,lut_error="native failed")
         tree=ast.parse((ROOT/"glm53"/"cpu_tier.py").read_text())
         wrap=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="wrap")
         routed=next(node for node in ast.walk(wrap) if isinstance(node,ast.FunctionDef) and node.name=="routed")

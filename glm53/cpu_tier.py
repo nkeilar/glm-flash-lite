@@ -176,16 +176,34 @@ def _lut_policy(settings, layer, dev):
     return plans
 
 
-def _lut_check():
-    """A failed combine must raise before another layer can reuse pinned ingress."""
+def _lut_token_check():
+    """Once per decoded token, before the sampled token leaves the request: raise if any LUT combine or ingress
+    failed. The caller has already synchronized this token's work (stock iterate_gen: torch.cuda.synchronize;
+    k_lookahead: the token-k sampler event), so this must not synchronize again (under lookahead that would wait
+    for step k+1 too). A failure raised a step early (step k+1 failing before token k is checked) is a safe refusal.
+    Ingress reuse does not depend on this check: the worker publishes drained (ctrl[8]) before done (ctrl[1]), the
+    LUT combine waits for done, and the LUT ft_split refuses every handoff after a sticky failure."""
     try:
-        torch.cuda.current_stream(S["dev"]).synchronize()
         _H.tier_lut_check()
     except BaseException as error:
         S["lut_error"] = str(error) or type(error).__name__
         S["started"] = False
         _H.tier_lut_abort()
         raise
+
+
+def _install_lut_token_hook():
+    """Route every exllamav3 Job.receive_sample (the stock and lookahead paths both call it) through the check."""
+    from exllamav3.generator.job import Job
+    if getattr(Job, "_glm53_lut_token_check", False):
+        return
+    orig = Job.receive_sample
+
+    def receive_sample(self, *args, **kwargs):
+        _lut_token_check()
+        return orig(self, *args, **kwargs)
+    Job.receive_sample = receive_sample
+    Job._glm53_lut_token_check = True
 
 
 def wrap(model):
@@ -275,8 +293,8 @@ def wrap(model):
                 _m._ct_pending = False
                 f = fhs if fhs.is_contiguous() else fhs.contiguous()
                 _CU.ft_combine(f, S["dflag"], S["ctrl"].data_ptr(), S["hout"].data_ptr(), S["stats"], S["timeout_ns"])
-                if settings.format == "lut":
-                    _lut_check()
+                # LUT failures are checked once per token (_lut_token_check via Job.receive_sample), not per layer:
+                # a per-layer host sync stalled the stream 42x per token and made lookahead impossible.
                 fhs = f
             return _orig(fhs, cpu_partial, cpu_pending, shape)
         m.cpu_split_combine = comb
@@ -381,6 +399,7 @@ def _start_lut(settings):
         raise
     S["selftest"] = {"kind": "real_quality_admission", "reports": settings.admission["report_sha256"],
                      "trellis_correctness_comparison": False}
+    _install_lut_token_hook()
     S["started"] = True
     print(f" -- cpu_tier: LUT {settings.activation}, full bank, no CPU trellis copy; "
           f"{threads} workers, coordinator {coordinator}, act_limit {limit}", flush=True)
