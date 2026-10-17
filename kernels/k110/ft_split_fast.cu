@@ -31,6 +31,27 @@ __global__ void ft_split_fast_k(const int64_t* __restrict__ sel, const __half* _
     __shared__ int miss[MAXP], rmiss[MAXP], nm_s, nr_s, nh_s, best_s, publish, npk;
     __shared__ float pol[20];
     const int t = threadIdx.x;
+#ifdef FT_ENABLE_LUT
+    // Same ingress guard as the stock ft_split_k (kernels/cpu_avx2/ft_tier_cu.cu): one ingress generation owns
+    // hx/picks/hout until its CPU drain word is published, and a sticky failure refuses every later handoff
+    // (all picks stay on the GPU, dflag = -1) until restart.
+    __shared__ int ingress_failed;
+    if (t == 0)
+    {
+        ingress_failed = ctrl[5] || ctrl[6] || seq < 0 || (ctrl[0] != ctrl[8]) || (seq > 0 && seq <= ctrl[0]);
+        if (ingress_failed && !ctrl[6])
+        {
+            ctrl[5] = 1; ctrl[7] = seq; __threadfence_system(); ctrl[6] = 4; __threadfence_system();
+        }
+    }
+    __syncthreads();
+    if (ingress_failed)
+    {
+        for (int s = t; s < n; s += blockDim.x) { sel_out[s] = sel[s]; w_out[s] = w[s]; }
+        if (t == 0) dflag[0] = -1;
+        return;
+    }
+#endif
     for (int e = t; e < E; e += blockDim.x) { cnt[e] = 0; cpu[e] = 0; }
     if (t < 20) pol[t] = p[t];
     if (t == 0) nu = 0;
@@ -185,9 +206,27 @@ void ft_split(torch::Tensor sel, torch::Tensor w, torch::Tensor z, int64_t E, in
     TORCH_CHECK(rres.numel() == 0 || (rres.dtype() == at::kInt && rres.numel() >= E), "ft_split_fast: rres int32 [E] or empty");
     auto st = at::cuda::getCurrentCUDAStream(sel.device().index());
     TORCH_CHECK(sel.dtype() == at::kLong && w.dtype() == at::kHalf && z.dtype() == at::kHalf && z.is_contiguous(), "dtypes");
+#ifdef FT_ENABLE_LUT
+    // Same buffer/shape/generation admission as the stock LUT ft_split (kernels/cpu_avx2/ft_tier_cu.cu).
+    for (const auto& tensor : {w, z, slotof, score, pol, sel_out, w_out, dflag, stats})
+        TORCH_CHECK(tensor.device() == sel.device() && tensor.is_contiguous(), "LUT split buffers require one CUDA device and contiguous storage");
+    TORCH_CHECK(rres.numel() == 0 || (rres.device() == sel.device() && rres.is_contiguous()), "LUT remote residency device/layout mismatch");
+    TORCH_CHECK(z.dim() == 2 && z.size(0) >= 1 && z.size(0) <= 4 && z.size(1) == 4096 && sel.numel() == w.numel() && sel.numel() <= z.size(0) * 8,
+                "LUT split input shape mismatch");
+    TORCH_CHECK(sel.is_contiguous() && w.is_contiguous() && slotof.dtype() == at::kInt && slotof.numel() >= E &&
+                score.dtype() == at::kFloat && score.numel() >= E && pol.dtype() == at::kFloat &&
+                sel_out.dtype() == at::kLong && sel_out.numel() >= sel.numel() && w_out.dtype() == at::kHalf && w_out.numel() >= w.numel() &&
+                dflag.dtype() == at::kLong && dflag.numel() >= 1 && stats.dtype() == at::kLong && stats.numel() >= 8,
+                "LUT split buffer dtype/capacity mismatch");
+#endif
     const int bsz = (int) z.size(0), H = (int) z.size(1), n = (int) sel.numel(), topk = n / bsz;
     TORCH_CHECK(E <= 1024 && H % 8 == 0, "ft_split: E <= 1024");
     TORCH_CHECK(n <= MAXP, "ft_split_fast: <= 64 picks (the stock kernel serves larger calls)");
+#ifdef FT_ENABLE_LUT
+    TORCH_CHECK(bsz >= 1 && bsz <= 4 && topk >= 1 && topk <= 8 && n == bsz * topk && E >= 1 && E <= 288 && H == 4096,
+                "LUT split requires M=1..4, topk<=8 and model geometry");
+    TORCH_CHECK(seq >= 0 && seq < 0x7fffffffffffffffLL, "LUT job generation must be positive without wrap");
+#endif
     ft_split_fast_k<<<1, 256, 0, st>>>(sel.data_ptr<int64_t>(), (const __half*) w.data_ptr(), (const __half*) z.data_ptr(), n, bsz, topk, H,
         (int) E, (int) first, slotof.data_ptr<int>(), score.data_ptr<float>(), pol.data_ptr<float>(), (volatile long long*) ctrl,
         (__half*) hx, (int*) hpicks, seq, (int) li, (int) keep_ids, sel_out.data_ptr<int64_t>(), (__half*) w_out.data_ptr(),
