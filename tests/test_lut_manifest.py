@@ -258,6 +258,36 @@ class RealAdmissionTests(unittest.TestCase):
         with mock.patch.object(lm,"load_manifest",return_value=self.bank):
             return lm.preflight(env,require_production=False)
 
+    def s1_report(self):
+        report = real_report(self.bank)
+        report.update(scope="s1-real-check-only", full_bank_bound=False, production_ready=False)
+        b = report["binding"]
+        del b["bank_manifest_sha256"]
+        b.update(scope="s1-real-check-only", quant_manifest_sha256="7"*64, ud_manifest_sha256="8"*64)
+        for layer in (3, 11):
+            recipe = ",".join("^blk\\."+str(layer)+"\\.ffn_"+part+"_exps\\.weight$="+
+                              {138:"iq3_k",144:"iq4_ks",14:"q6_K"}[lm.recipe(layer,part)] for part in lm.PARTS)
+            b["layers"][str(layer)]["conversion_context"] = dict(imatrix=lm.IMATRIX_SHA256, layer=layer,
+                metadata_source="a"*64, normalized_imatrix_sha256="b"*64, quantizer={"quantizer":"c"*64},
+                recipe=recipe, revision=lm.SOURCE_REVISION, sources={"donor":"d"*64}, tools={"adapter":"e"*64})
+        report["binding_sha256"] = lm.json_digest(b)
+        return report
+
+    def test_s1_real_report_binds_unchanged_tested_layers_into_full_bank(self):
+        report = self.s1_report()
+        self.assertTrue(lm.validate_real_report(report,self.bank,"i16")["real_pass"])
+        mutations = [lambda b:b["layers"]["3"].__setitem__("ours_sha256","0"*64),
+                     lambda b:b["layers"]["11"]["conversion_context"].__setitem__("recipe","wrong"),
+                     lambda b:b["layers"]["3"]["conversion_context"].__setitem__("revision","0"*40),
+                     lambda b:b.__setitem__("scope","proxy"),
+                     lambda b:b.__setitem__("bank_manifest_sha256",self.bank.sha256),
+                     lambda b:b.__setitem__("quant_manifest_sha256","bad")]
+        for mutation in mutations:
+            changed = self.s1_report(); mutation(changed["binding"])
+            changed["binding_sha256"] = lm.json_digest(changed["binding"])
+            with self.assertRaises(ValueError): lm.validate_real_report(changed,self.bank,"i16")
+        with self.assertRaises(ValueError): lm.validate_real_report(report,self.bank,"q8")
+
     def test_real_quality_admits_but_measured_cost_gate_remains_separate(self):
         for activation in ("i16","q8"):
             env=self.environment(activation)
@@ -433,6 +463,21 @@ class StartupTests(unittest.TestCase):
         for index,change in enumerate(changes):
             value=measured_costs(self.bank);change(value)
             with self.subTest(index=index),self.assertRaises(ValueError):lm.validate_cost_table(value,self.bank,"i16")
+
+    def test_s1_recipe_costs_bind_every_tensor_donor_to_full_bank(self):
+        value = measured_costs(self.bank)
+        value.update(bank_manifest_sha256=None,s1_manifest_sha256="1"*64)
+        for name, profile in value["profiles"].items():
+            layers = (11,11,11) if name=="upgraded_gate" else (3,3,11) if name=="upgraded_down" else (3,3,3)
+            profile["source_parts"] = [dict(part=part,layer=layer,sha256="a"*64,type_id=typ)
+                for part,layer,typ in zip(lm.PARTS,layers,profile["types"])]
+        self.assertTrue(lm.validate_cost_table(value,self.bank,"i16")["complete"])
+        for field, replacement in (("sha256","b"*64),("layer",12),("type_id",144),("part","gate")):
+            changed=copy.deepcopy(value)
+            changed["profiles"]["upgraded_down"]["source_parts"][2][field]=replacement
+            with self.subTest(field=field),self.assertRaises(ValueError):lm.validate_cost_table(changed,self.bank,"i16")
+        changed=copy.deepcopy(value);changed["profiles"]["ordinary"]["source_parts"].pop()
+        with self.assertRaises(ValueError):lm.validate_cost_table(changed,self.bank,"i16")
 
     def test_cost_hardware_hash_and_exact_worker_topology_are_required(self):
         value=measured_costs(self.bank);cpus=value["measurement"]["cpus"]

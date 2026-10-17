@@ -381,8 +381,13 @@ def check_reported_metrics(saved, expected):
 
 def validate_real_report(value, bank, activation):
     """Recompute real gates; an operator-approved file SHA supplies acceptance."""
+    report_s1 = value.get("scope") == "s1-real-check-only"
+    report_scope_fields = ("scope", "full_bank_bound", "production_ready") if report_s1 else ()
     keys(value, ("schema", "state", "complete", "real_pass", "synthetic", "activation", "batch", "act_limit",
-                 "tp2", "binding", "binding_sha256", "layers", "aggregate"), "real quality report")
+                 "tp2", "binding", "binding_sha256", "layers", "aggregate", *report_scope_fields), "real quality report")
+    if report_s1:
+        require(value["full_bank_bound"] is False and value["production_ready"] is False,
+                "S1 real report must not claim completed-bank or production admission")
     require(value["schema"] == "e1-real-quality/v1" and value["state"] == "REAL-PASS" and
             value["complete"] is True and value["real_pass"] is True and value["synthetic"] is False,
             "complete REAL-PASS required; proxy and synthetic results cannot admit quality")
@@ -391,13 +396,22 @@ def validate_real_report(value, bank, activation):
     real_number(value["act_limit"], "model activation limit", positive=True)
     require(value["tp2"] == "split-intermediate-gate-up/down-columns-before-quantization", "real replay TP2 protocol mismatch")
     binding = value["binding"]
-    keys(binding, ("protocol", "bank_manifest_sha256", "source_revision", "imatrix_sha256", "capture_manifest_sha256",
+    s1_scope = binding.get("scope") == "s1-real-check-only"
+    require(s1_scope == report_s1, "real report and binding scope differ")
+    scope_fields = ("scope", "quant_manifest_sha256", "ud_manifest_sha256") if s1_scope else ("bank_manifest_sha256",)
+    keys(binding, ("protocol", *scope_fields, "source_revision", "imatrix_sha256", "capture_manifest_sha256",
                    "capture", "replay", "layers"), "real quality binding")
     require(digest(value["binding_sha256"], "quality binding") == json_digest(binding), "real quality binding SHA256 mismatch")
     require(binding["protocol"] == REAL_PROTOCOL and binding["source_revision"] == SOURCE_REVISION and
             binding["imatrix_sha256"] == IMATRIX_SHA256, "real quality source/imatrix/protocol mismatch")
-    require(digest(binding["bank_manifest_sha256"], "quality bank manifest") == bank.sha256,
-            "real quality report belongs to another bank manifest")
+    if s1_scope:
+        # The approved report predates bank publication. Its exact tested layer
+        # artifacts must survive unchanged in the complete validated bank below.
+        for field in ("quant_manifest_sha256", "ud_manifest_sha256"):
+            digest(binding[field], field)
+    else:
+        require(digest(binding["bank_manifest_sha256"], "quality bank manifest") == bank.sha256,
+                "real quality report belongs to another bank manifest")
     digest(binding["capture_manifest_sha256"], "capture manifest")
     capture = binding["capture"]
     capture_hashes = ("model_ledger_sha256", "runtime_ledger_sha256", "corpus_sha256", "stats_sha256", "inputs_sha256",
@@ -423,9 +437,26 @@ def validate_real_report(value, bank, activation):
     by_layer = {row["layer"]: row for row in bank.value["layers"]}
     for layer in (3, 11):
         weights = binding["layers"][str(layer)]
-        keys(weights, ("q8_sha256", "ours_sha256", "unsloth_sha256"), "real weight binding")
-        for key in weights:
+        keys(weights, ("q8_sha256", "ours_sha256", "unsloth_sha256", *(["conversion_context"] if s1_scope else [])),
+             "real weight binding")
+        for key in ("q8_sha256", "ours_sha256", "unsloth_sha256"):
             digest(weights[key], key)
+        if s1_scope:
+            context = weights["conversion_context"]
+            keys(context, ("imatrix", "layer", "metadata_source", "normalized_imatrix_sha256", "quantizer", "recipe",
+                           "revision", "sources", "tools"), "tested conversion context")
+            require(context["revision"] == SOURCE_REVISION and context["imatrix"] == IMATRIX_SHA256 and
+                    type(context["layer"]) is int and context["layer"] == layer, "tested conversion provenance mismatch")
+            expected_recipe = ",".join("^blk\\." + str(layer) + "\\.ffn_" + part + "_exps\\.weight$=" +
+                                       {138: "iq3_k", 144: "iq4_ks", 14: "q6_K"}[recipe(layer, part)] for part in PARTS)
+            require(context["recipe"] == expected_recipe, "tested conversion recipe differs from bank")
+            for field in ("metadata_source", "normalized_imatrix_sha256"):
+                digest(context[field], field)
+            for field in ("quantizer", "sources", "tools"):
+                require(isinstance(context[field], dict) and bool(context[field]), "tested conversion hash inventory missing")
+                for name, sha in context[field].items():
+                    require(isinstance(name, str) and bool(name), "invalid tested conversion inventory name")
+                    digest(sha, field)
         require(weights["ours_sha256"] == by_layer[layer]["artifact"]["sha256"], "real replay LUT weight hash differs from bank")
     keys(value["layers"], ("3", "11"), "real quality layers")
     pooled = {"ours": [], "unsloth": []}
@@ -515,8 +546,12 @@ def validate_cost_table(value, bank, activation):
     require(isinstance(value, dict) and value.get("schema") == "e1-lut-cost/v1", "measured LUT cost artifact required")
     require(value.get("complete") is True, "complete measured LUT costs required for all three layer profiles")
     require(value.get("activation") == activation, "measured LUT cost activation mismatch")
-    require(digest(value.get("bank_manifest_sha256"), "cost bank manifest") == bank.sha256,
-            "measured LUT costs belong to another bank manifest")
+    s1_cost = value.get("bank_manifest_sha256") is None and "s1_manifest_sha256" in value
+    if s1_cost:
+        digest(value["s1_manifest_sha256"], "cost S1 manifest")
+    else:
+        require(digest(value.get("bank_manifest_sha256"), "cost bank manifest") == bank.sha256,
+                "measured LUT costs belong to another bank manifest")
     measurement = value.get("measurement")
     require(isinstance(measurement, dict) and measurement.get("kind") == "hardware" and
             measurement.get("placement_verified") is True and measurement.get("clock") == "perf_counter_ns",
@@ -551,11 +586,25 @@ def validate_cost_table(value, bank, activation):
         require(isinstance(profile, dict) and profile.get("types") == types and
                 all(type(item) is int for item in profile["types"]), "measured LUT profile recipe mismatch")
         digest(profile.get("fixture_sha256"), "cost fixture")
-        digest(profile.get("source_artifact_sha256"), "cost source artifact")
-        # Each measurement must use bytes from this exact full bank.
-        matching = [row for row in bank.value["layers"] if cost_profile(row["layer"]) == name]
-        require(profile["source_artifact_sha256"] in {row["artifact"]["sha256"] for row in matching},
-                "measured LUT fixture does not belong to the admitted bank/profile")
+        if s1_cost:
+            # Timing a recipe may combine actual already-tested tensors. Every
+            # donor still must be byte-identical to its full-bank artifact.
+            parts = profile.get("source_parts")
+            require(isinstance(parts, list) and len(parts) == 3, "three measured tensor source parts required")
+            expected_layers = (11, 11, 11) if name == "upgraded_gate" else (3, 3, 11) if name == "upgraded_down" else (3, 3, 3)
+            bank_layers = {row["layer"]: row for row in bank.value["layers"]}
+            for source, part, source_layer, typ in zip(parts, PARTS, expected_layers, types):
+                keys(source, ("part", "layer", "sha256", "type_id"), "measured tensor source")
+                require(source["part"] == part and type(source["layer"]) is int and source["layer"] == source_layer and
+                        type(source["type_id"]) is int and source["type_id"] == typ and recipe(source_layer, part) == typ,
+                        "measured tensor source recipe mismatch")
+                require(digest(source["sha256"], "measured tensor source") == bank_layers[source_layer]["artifact"]["sha256"],
+                        "measured tensor source differs from admitted bank")
+        else:
+            digest(profile.get("source_artifact_sha256"), "cost source artifact")
+            matching = [row for row in bank.value["layers"] if cost_profile(row["layer"]) == name]
+            require(profile["source_artifact_sha256"] in {row["artifact"]["sha256"] for row in matching},
+                    "measured LUT fixture does not belong to the admitted bank/profile")
         rows = profile.get("rows")
         keys(rows, (str(m) for m in range(1, 5)), "measured M grid")
         for m, cells in rows.items():
