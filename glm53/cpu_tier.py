@@ -157,23 +157,52 @@ def _lut_model_layout(settings, mods):
 
 
 def _lut_policy(settings, layer, dev):
-    """Full-shared-M measurements price each bounded union of <=8 experts.
+    """K counts distinct experts in the batch union, not experts per token.
 
-    Nonuniform routes use the same full-work estimate, which is a split-policy
-    heuristic, not an exact measurement of that route. No K>8 extrapolation.
+    K<=8 retains full-shared-M measurements. Opt-in bounded mode extends K>8
+    with an EST conservative heuristic: C_M(8) + max_k(C_M(k)/k)*(K-8).
+    This is neither a measured disjoint-route cost nor a proven upper bound.
     """
-    from lut_manifest import cost_profile, require
+    from lut_manifest import cost_profile, lut_batch_policy
+    mode, maxn, force_n = lut_batch_policy({**os.environ,
+        "GLM53_CT_LUT_BATCH_POLICY": getattr(settings, "batch_policy", os.environ.get("GLM53_CT_LUT_BATCH_POLICY", "shared"))})
     base = _policy(dev)
-    require(0 <= float(base[5]) <= 8, "LUT GLM53_CT_MAXN must be between 0 and 8")
-    require(-1 <= float(base[6]) <= 8, "LUT GLM53_CT_FORCE_N must be between -1 and 8")
+    base[5], base[6] = maxn, force_n
     base[4] = 0.0  # M is already represented by its measured row.
     plans = {}
     for m, cells in settings.costs["profiles"][cost_profile(layer)]["rows"].items():
+        m = int(m)
         plan = base.clone()
+        if mode == "bounded":
+            plan[5] = min(maxn, 8 * m)
+            if m > 1:
+                plan[3] = max(cells[str(k)]["median_ms"] / k for k in range(1, 9))
         plan[12:20] = torch.tensor([cells[str(k)]["median_ms"] for k in range(1, 9)],
                                    dtype=torch.float32, device=dev)
-        plans[int(m)] = plan
+        plans[m] = plan
     return plans
+
+
+def _lut_policy_summary(requested_maxn):
+    """Reconstruct effective plans from admitted CPU data, without CUDA reads.
+
+    The caller supplies MAXN from its existing policy copy. _write_policy keeps
+    every per-M cap clamped and preserves these derived slopes at runtime.
+    """
+    mode = getattr(S["settings"], "batch_policy", "shared")
+    maxn = int(requested_maxn)
+    caps = {str(m): min(maxn, 8 * m) if mode == "bounded" else maxn for m in range(1, 5)}
+    profiles = {}
+    for name, profile in S["settings"].costs["profiles"].items():
+        profiles[name] = {m: max(cells[str(k)]["median_ms"] / k for k in range(1, 9))
+                          for m, cells in profile["rows"].items() if mode == "bounded" and int(m) > 1}
+    return dict(mode=mode, k_semantics="distinct CPU-assigned experts in the batch union",
+                requested_maxn=maxn, maxn_by_m=caps,
+                cap_scope="cost-model search; force_n overrides MAXN and remains limited to -1..8",
+                measured_rows="shared-M measurements, K=1..8; nonuniform routes estimated",
+                tail_model=("EST conservative heuristic, not a proven upper bound or measured K>8: "
+                            "C_M(8) + max_k=1..8(C_M(k)/k)*(K-8)" if mode == "bounded" else "disabled"),
+                tail_ms_per_expert_by_profile=profiles)
 
 
 def _lut_token_check():
@@ -591,6 +620,7 @@ def summary():
     if not S["mods"]:
         return None
     st = S["stats"].tolist()
+    policy = S["pol"].tolist()
     h = _H.tier_stats() if _H else []
     calls = max(1, st[3])
     result = {"calls": st[3], "unique_hits": st[0], "unique_misses": st[1], "cpu_experts": st[2],
@@ -599,7 +629,7 @@ def summary():
             "gpu_wait_ms_per_job": round(st[4] / 1e6 / max(1, st[5]), 4), "gpu_waits": st[5], "timeouts": st[6],
             "host_jobs": h[0] if h else None, "host_busy_ms_per_job": round(h[4] / 1e6 / max(1, h[0]), 4) if h else None,
             "host_empty_jobs": h[3] if h else None, "cpu_copy_gb": round(h[5] / 1e9, 1) if h else None, "selftest": S["selftest"],
-            "policy": S["pol"].tolist(),
+            "policy": policy,
             # [bdw-opt] per-job wall ms: prep (fp16->fp32 + route), then moe_forward steps (each incl. its pool barrier).
             # stock: [prep, p0 in, p1 gate+up+act, p2 down, p3 sum, 0]; split1: [prep, p0 in, gate|up, act, down, sum]
             "split1": os.environ.get("GLM53_CT_SPLIT1") == "1",
@@ -612,9 +642,10 @@ def summary():
     if S.get("settings") and S["settings"].format == "lut":
         result.update(format="lut", activation=S["settings"].activation, act_limit=S["act_limit"],
                       admission=S["settings"].admission, lut=_H.tier_lut_stats(),
-                      measured_cost_policy="profile/M grid, K<=8; nonuniform routes use full-shared-M workload estimate",
+                      measured_cost_policy="profile/M shared grid K<=8; see lut_batch_policy for caps and EST tails",
+                      lut_batch_policy=_lut_policy_summary(policy[5]),
                       measured_cost_sha256=S["settings"].cost_sha256,
-                      combine_error_check="current-stream synchronize before ingress reuse",
+                      combine_error_check="once-per-decoded-token sticky failure check; guarded combine and ingress reuse",
                       fatal_error=S.get("lut_error"), remote_plan_error=S.get("rt_plan_error"))
     return result
 
@@ -637,8 +668,14 @@ _POL = {"tzc": 0, "thit": 1, "a": 2, "b": 3, "tok": 4, "maxn": 5, "force_n": 6, 
 def _write_policy(index, value):
     S["pol"][index] = value
     if S.get("settings") and S["settings"].format == "lut":
+        bounded = getattr(S["settings"], "batch_policy", "shared") == "bounded"
         for module in S["mods"]:
-            for plan in module._ct_pol.values():
+            for m, plan in module._ct_pol.items():
+                if bounded and index == 3 and m > 1:
+                    continue  # Manual and remote auto-B must not replace the derived K>8 slope.
+                if bounded and index == 5:
+                    plan[index] = min(value, 8 * m)
+                    continue
                 plan[index] = value
 
 
@@ -648,15 +685,17 @@ def set_policy(rt=None, check=None, b_rt=None, auto_b=None, e4=None, fuse=None, 
     kernel every call) and the remote tier on/off + numerics-check period. Returns the current values."""
     is_lut = bool(S.get("settings") and S["settings"].format == "lut")
     if is_lut:
-        from lut_manifest import real_number, require
+        from lut_manifest import lut_policy_count, real_number, require
         for key, value in kw.items():
             if value is not None and key != "force_n":
                 require(real_number(float(value), key) <= 3600000, "LUT policy cost exceeds supported duration")
         if b_rt is not None:
             real_number(float(b_rt), "remote cost")
         require(lut is None, "LUT measured costs cannot be replaced by an unverified runtime table")
-        require(kw.get("maxn") is None or 0 <= float(kw["maxn"]) <= 8, "LUT maxn must stay in measured K<=8")
-        require(kw.get("force_n") is None or -1 <= float(kw["force_n"]) <= 8, "LUT force_n must stay in measured K<=8")
+        if kw.get("maxn") is not None:
+            lut_policy_count(kw["maxn"], "maxn", 0, 32 if getattr(S["settings"], "batch_policy", "shared") == "bounded" else 8)
+        if kw.get("force_n") is not None:
+            lut_policy_count(kw["force_n"], "force_n", -1, 8)
         require(kw.get("tok") is None or float(kw["tok"]) == 0, "LUT M costs already include token multiplicity")
     if b_rt is not None:
         S["b_rt"] = float(b_rt)                              # B used while the 3090s are attached (auto mode)
@@ -687,7 +726,8 @@ def set_policy(rt=None, check=None, b_rt=None, auto_b=None, e4=None, fuse=None, 
             "e6": {"fuse": e6[0], "fuse_maxn": e6[1], "pf_lean": e6[2]}, "lut": [round(x, 3) for x in p[12:20]],
             "ovl_after": after,
             "remote_on": S.get("rt_on"), "auto_b": S.get("b_auto"),
-            "b_rt": S.get("b_rt"), "b_base": S.get("b_base"), "remote": _rt_summary()}
+            "b_rt": S.get("b_rt"), "b_base": S.get("b_base"), "remote": _rt_summary(),
+            **({"lut_batch_policy": _lut_policy_summary(p[5])} if is_lut else {})}
 
 
 def _rt_sync_masks():

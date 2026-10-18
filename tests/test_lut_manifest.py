@@ -559,6 +559,27 @@ class StartupTests(unittest.TestCase):
         with mock.patch.object(lm,"load_manifest",return_value=self.bank),mock.patch.object(lm,"verify_bank",return_value=dict(manifest_sha256="0"*64)),mock.patch.object(lm,"load_precompiled",return_value=self.precompiled()):
             with self.assertRaisesRegex(ValueError,"manifest changed"):lm.preflight(env)
 
+    def test_batch_policy_rejects_invalid_mode_and_counts_before_bank_reads(self):
+        env=dict(GLM53_CT_FORMAT="lut",GLM53_CT_LUT_MANIFEST="unopened.json")
+        cases=[{"GLM53_CT_LUT_BATCH_POLICY":mode} for mode in ("", "disjoint", "BOUNDED")]
+        cases += [dict(GLM53_CT_LUT_BATCH_POLICY="bounded",GLM53_CT_MAXN=value)
+                  for value in ("33", "-1", "7.5", "nan", "inf")]
+        cases += [dict(GLM53_CT_LUT_BATCH_POLICY="bounded",GLM53_CT_FORCE_N=value)
+                  for value in ("9", "-2", "1.5")]
+        with mock.patch.object(lm,"load_manifest") as load:
+            for changed in cases:
+                with self.subTest(changed=changed),self.assertRaises(ValueError):lm.preflight({**env,**changed})
+            load.assert_not_called()
+        self.assertEqual(lm.parse_env(env).batch_policy,"shared")
+        self.assertEqual(lm.parse_env({**env,"GLM53_CT_LUT_BATCH_POLICY":"bounded","GLM53_CT_MAXN":"32"}).batch_policy,"bounded")
+
+    def test_batch_policy_is_preserved_through_production_admission(self):
+        env=dict(self.startup_environment(),GLM53_CT_LUT_BATCH_POLICY="bounded",GLM53_CT_MAXN="32")
+        with mock.patch.object(lm,"load_manifest",return_value=self.bank),\
+             mock.patch.object(lm,"verify_bank",return_value=self.stage()),\
+             mock.patch.object(lm,"load_precompiled",return_value=self.precompiled()):
+            self.assertEqual(lm.preflight(env).batch_policy,"bounded")
+
     def test_lut_admits_gpu_features_and_fast_split_only_with_its_guarded_module(self):
         env=dict(self.startup_environment(),GLM53_LA="1",GLM53_K_HCFUSE="1",GLM53_K_OVL="1")
         with_split=dict(modules={"ft_tier_host.so":dict(sha256="9"*64),lm.SPLIT_MODULE:dict(sha256="8"*64)})
@@ -821,19 +842,92 @@ class StartupTests(unittest.TestCase):
             (self.root/"ft_tier_host.so").write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError,"changed before import"):module._build_lut()
 
-    def test_measured_policy_selects_profile_and_m_without_extra_token_or_k_extrapolation(self):
+    def policy_torch(self):
         class Tensor:
             def __init__(self,values):self.values=list(values)
             def clone(self):return Tensor(self.values)
+            def tolist(self):return list(self.values)
             def __getitem__(self,key):return self.values[key]
             def __setitem__(self,key,value):self.values[key]=value.values if isinstance(value,Tensor) else value
-        torch=SimpleNamespace(inference_mode=lambda:lambda function:function,tensor=lambda values,**kw:Tensor(values),float32=object())
-        module=self.cpu_module(torch);settings=SimpleNamespace(costs=measured_costs(self.bank))
+        return SimpleNamespace(inference_mode=lambda:lambda function:function,tensor=lambda values,**kw:Tensor(values),float32=object())
+
+    def test_measured_policy_selects_profile_and_m_without_extra_token_or_k_extrapolation(self):
+        module=self.cpu_module(self.policy_torch());settings=SimpleNamespace(costs=measured_costs(self.bank))
         with mock.patch.dict(os.environ,{"GLM53_CT_MAXN":"8"},clear=True):
             plans=module._lut_policy(settings,11,"cpu")
         self.assertEqual(set(plans),{1,2,3,4});self.assertEqual(plans[4][12:20],[8+k*.1 for k in range(1,9)])
         self.assertEqual(plans[4][4],0)
         with mock.patch.dict(os.environ,{"GLM53_CT_MAXN":"9"},clear=True),self.assertRaisesRegex(ValueError,"MAXN"):module._lut_policy(settings,3,"cpu")
+
+    def test_shared_defaults_are_float32_byte_equivalent_and_bounded_preserves_m1(self):
+        module=self.cpu_module(self.policy_torch());costs=measured_costs(self.bank)
+        for layer in (3,11,12):
+            with self.subTest(layer=layer),mock.patch.dict(os.environ,{"GLM53_CT_MAXN":"8","GLM53_CT_B":".31"},clear=True):
+                base=module._policy("cpu");base[4]=0.0
+                shared=module._lut_policy(SimpleNamespace(costs=costs,batch_policy="shared"),layer,"cpu")
+                bounded=module._lut_policy(SimpleNamespace(costs=costs,batch_policy="bounded"),layer,"cpu")
+                for m in range(1,5):
+                    expected=base.tolist()
+                    expected[12:20]=[costs["profiles"][lm.cost_profile(layer)]["rows"][str(m)][str(k)]["median_ms"] for k in range(1,9)]
+                    self.assertEqual(struct.pack("20f",*shared[m].tolist()),struct.pack("20f",*expected))
+                self.assertEqual(struct.pack("20f",*bounded[1].tolist()),struct.pack("20f",*shared[1].tolist()))
+
+    def test_bounded_policy_caps_union_by_m_and_derives_each_profile_tail(self):
+        module=self.cpu_module(self.policy_torch());settings=SimpleNamespace(costs=measured_costs(self.bank),batch_policy="bounded")
+        # A nonlinear structural fixture makes a middle K determine the slope.
+        settings.costs["profiles"]["ordinary"]["rows"]["2"]["3"]["median_ms"]=30.0
+        for requested in (0,5,8,12,24,32):
+            for layer in (3,11,12):
+                with self.subTest(requested=requested,layer=layer),mock.patch.dict(os.environ,{"GLM53_CT_MAXN":str(requested)},clear=True):
+                    plans=module._lut_policy(settings,layer,"cpu")
+                for m,plan in plans.items():
+                    row=settings.costs["profiles"][lm.cost_profile(layer)]["rows"][str(m)]
+                    self.assertEqual(plan[5],min(requested,8*m))
+                    self.assertEqual(plan[4],0)
+                    self.assertEqual(plan[12:20],[row[str(k)]["median_ms"] for k in range(1,9)])
+                    self.assertEqual(plan[3],.104 if m==1 else max(row[str(k)]["median_ms"]/k for k in range(1,9)))
+
+    def test_bounded_runtime_and_remote_updates_keep_caps_and_derived_tails(self):
+        torch=self.policy_torch();module=self.cpu_module(torch)
+        settings=SimpleNamespace(format="lut",costs=measured_costs(self.bank),batch_policy="bounded")
+        with mock.patch.dict(os.environ,{"GLM53_CT_MAXN":"32"},clear=True):
+            mods=[SimpleNamespace(key=f"model.layers.{layer}.mlp",_ct_pol=module._lut_policy(settings,layer,"cpu")) for layer in (3,11,12)]
+            module.S.update(settings=settings,pol=module._policy("cpu"),mods=mods)
+        tails=[[plan[3] for m,plan in mod._ct_pol.items()] for mod in mods]
+        rows=[[plan[12:20] for plan in mod._ct_pol.values()] for mod in mods]
+        module._H=SimpleNamespace(tier_set_e6=lambda *args:[0,0,0])
+        with mock.patch.dict(sys.modules,{"k_overlap":SimpleNamespace(set_after=lambda value:False)}):
+            result=module.set_policy(maxn=24,b=.25,b_rt=.15)
+            self.assertEqual(result["lut_batch_policy"]["maxn_by_m"],{"1":8,"2":16,"3":24,"4":24})
+            self.assertIn("not a proven upper bound",result["lut_batch_policy"]["tail_model"])
+            self.assertEqual(set(result["lut_batch_policy"]["tail_ms_per_expert_by_profile"]),set(lm.COST_PROFILES))
+            module._write_policy(3,.15)  # The remote auto-B thread uses this same entry point.
+            for index,mod in enumerate(mods):
+                self.assertEqual(mod._ct_pol[1][3],.15)
+                self.assertEqual([plan[3] for m,plan in mod._ct_pol.items() if m>1],tails[index][1:])
+                self.assertEqual([plan[12:20] for plan in mod._ct_pol.values()],rows[index])
+            result=module.set_policy(maxn=5,force_n=8)
+            self.assertEqual(result["lut_batch_policy"]["maxn_by_m"],dict.fromkeys(("1","2","3","4"),5))
+            before=module.S["pol"].tolist()
+            for change in (dict(maxn=33),dict(maxn=7.5),dict(force_n=9),dict(force_n=-1.5),dict(maxn=float("nan"))):
+                with self.subTest(change=change),self.assertRaises(ValueError):module.set_policy(**change)
+                self.assertEqual(module.S["pol"].tolist(),before)
+
+    def test_policy_diagnostics_use_cpu_metadata_without_reading_layer_tensors(self):
+        class NoDeviceRead:
+            def __getitem__(self,key):raise AssertionError("unexpected device scalar read")
+            def tolist(self):raise AssertionError("unexpected device tensor copy")
+            def items(self):raise AssertionError("unexpected per-layer plan access")
+        module=self.cpu_module(self.policy_torch())
+        costs=measured_costs(self.bank)
+        module.S.update(settings=SimpleNamespace(format="lut",costs=costs,batch_policy="bounded"),
+                        pol=NoDeviceRead(),mods=[SimpleNamespace(_ct_pol=NoDeviceRead())])
+        result=module._lut_policy_summary(24)
+        self.assertEqual(result["maxn_by_m"],{"1":8,"2":16,"3":24,"4":24})
+        for name,profile in costs["profiles"].items():
+            self.assertEqual(result["tail_ms_per_expert_by_profile"][name],
+                             {m:max(cells[str(k)]["median_ms"]/k for k in range(1,9))
+                              for m,cells in profile["rows"].items() if int(m)>1})
 
 
 class IntegrationTests(unittest.TestCase):

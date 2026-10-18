@@ -38,6 +38,36 @@ Runtime endpoints added: `GET /ct_policy` (cost-model knobs without a restart), 
 check of the expert cache tables), `GET /ct_trace`, `GET /prof`, `GET /la`. Comment tags such as `[bdw-opt]`, `[E3]`,
 and `[E4]` name the experiment each change came from.
 
+### Experimental E1 multi-user split policy (T-82)
+
+For an already admitted LUT deployment, the default `GLM53_CT_LUT_BATCH_POLICY=shared` retains the existing
+measured profile/M rows and `GLM53_CT_MAXN<=8`. K is the number of distinct CPU-assigned experts across the
+whole batch, so that cap is shared by all users. The measured M rows reuse the same K experts for every token;
+they are a workload estimate when users route to different experts.
+
+Opt in to the Python-only A/B with the following environment additions to the existing E1 launch command:
+
+```bash
+export GLM53_CT_LUT_BATCH_POLICY=bounded GLM53_CT_MAXN=32
+```
+
+With `e1-entry.py`, set these values in `recipe.environment`; the entry point clears the inherited environment.
+
+The effective cap becomes `min(MAXN,8*M)` for M=1..4. M=1 retains its original row, B and cap of at most 8;
+all K<=8 rows remain unchanged. For M>1, the existing GPU split extrapolation prices K>8 as
+`C_M(8) + B_M*(K-8)`, where `B_M=max(C_M(k)/k for k=1..8)` is derived separately for each admitted recipe/M.
+This tail is an **EST conservative heuristic**, not a measured K>8 cost or a proven upper bound.
+No native arithmetic or extension code changes are required. Startup requires `HEAD == receipt.source_revision`,
+so applying this Python-only commit still requires a reviewed revision-bound precompile receipt and recipe;
+the existing receipt does not work unchanged. Larger union caps change which experts run
+on the CPU, so full-model throughput and quality still need an A/B on the serving hardware.
+
+`/stats` and `/ct_policy` expose `lut_batch_policy` with the effective caps, profile/M tail slopes and model
+label. These are cost-model search caps: `force_n>=0` overrides `maxn`, as before, and remains limited to 0..8
+(-1 enables the cost model). Runtime `maxn` updates retain the per-M cap; manual or remote auto-B updates
+preserve the derived M>1 slopes. To restore the baseline, restart with
+`GLM53_CT_LUT_BATCH_POLICY=shared GLM53_CT_MAXN=8`.
+
 ## The measured profile
 
 Upstream's `docker/entrypoint.sh` sets the base `fast`-mode settings (first block). Run natively, the measured
@@ -103,4 +133,3 @@ for swz in 0 1; do HARNESS_SWZ=$swz ./base a$swz.bin; HARNESS_SWZ=$swz ./n32 b$s
 ```
 
 Repeat with `-ffp-contract=off` added to both; GCC's default contraction can move last bits after any header edit.
-

@@ -745,6 +745,28 @@ class TierSettings:
     precompile_path: Path | None = None
     precompile_sha256: str | None = None
     precompiled: dict | None = None
+    batch_policy: str = "shared"
+
+
+def lut_policy_count(value, label, minimum, maximum):
+    """Reject fractional route counts before they can be truncated by the GPU."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"LUT {label} must be an integer between {minimum} and {maximum}") from None
+    require(not isinstance(value, bool) and math.isfinite(number) and number.is_integer()
+            and minimum <= number <= maximum,
+            f"LUT {label} must be an integer between {minimum} and {maximum}")
+    return int(number)
+
+
+def lut_batch_policy(environ=None):
+    env = os.environ if environ is None else environ
+    mode = env.get("GLM53_CT_LUT_BATCH_POLICY", "shared")
+    require(mode in ("shared", "bounded"), "GLM53_CT_LUT_BATCH_POLICY must be shared or bounded")
+    maxn = lut_policy_count(env.get("GLM53_CT_MAXN", "8"), "GLM53_CT_MAXN", 0, 32 if mode == "bounded" else 8)
+    force_n = lut_policy_count(env.get("GLM53_CT_FORCE_N", "-1"), "GLM53_CT_FORCE_N", -1, 8)
+    return mode, maxn, force_n
 
 
 def parse_env(environ=None):
@@ -752,6 +774,8 @@ def parse_env(environ=None):
     fmt, activation = env.get("GLM53_CT_FORMAT", "trellis"), env.get("GLM53_CT_LUT_ACT", "i16")
     require(fmt in ("trellis", "lut"), "GLM53_CT_FORMAT must be trellis or lut")
     require(activation in ("i16", "q8"), "GLM53_CT_LUT_ACT must be i16 or q8")
+    # Reject experimental policy mistakes before opening or hashing the bank.
+    batch_policy = lut_batch_policy(env)[0] if fmt == "lut" else "shared"
     manifest, quality = env.get("GLM53_CT_LUT_MANIFEST"), env.get("GLM53_CT_LUT_QUALITY")
     require(fmt != "lut" or bool(manifest), "GLM53_CT_LUT_MANIFEST is required for LUT format")
     q8_quality = env.get("GLM53_CT_LUT_Q8_QUALITY")
@@ -761,7 +785,7 @@ def parse_env(environ=None):
                         cost_path=Path(env["GLM53_CT_LUT_COST"]) if env.get("GLM53_CT_LUT_COST") else None,
                         cost_sha256=env.get("GLM53_CT_LUT_COST_SHA256"),
                         precompile_path=Path(env["GLM53_CT_LUT_PRECOMPILE"]) if env.get("GLM53_CT_LUT_PRECOMPILE") else None,
-                        precompile_sha256=env.get("GLM53_CT_LUT_PRECOMPILE_SHA256"))
+                        precompile_sha256=env.get("GLM53_CT_LUT_PRECOMPILE_SHA256"), batch_policy=batch_policy)
 
 
 def preflight(environ=None, *, require_production=True):
@@ -798,8 +822,6 @@ def preflight(environ=None, *, require_production=True):
         require(env.get("GLM53_CT_VALIDATE", "0") != "1", "LUT quality uses real replay and the normal full-model panel; GLM53_CT_VALIDATE is trellis-only")
         maxbsz = int(env.get("GLM53_CT_MAXBSZ", "4096" if env.get("GLM53_CT_VALIDATE") == "1" else "4"))
         require(1 <= maxbsz <= 4, "LUT supports M=1..4; set GLM53_CT_MAXBSZ accordingly")
-        require(0 <= int(env.get("GLM53_CT_MAXN", "8")) <= 8, "LUT GLM53_CT_MAXN must be between 0 and 8")
-        require(-1 <= int(env.get("GLM53_CT_FORCE_N", "-1")) <= 8, "LUT GLM53_CT_FORCE_N must be between -1 and 8")
         timeout = real_number(float(env.get("GLM53_CT_TIMEOUT_S", "2")), "LUT request timeout", positive=True)
         require(.001 <= timeout <= 3600, "LUT request timeout must be .001..3600 seconds")
         for name, default in (("GLM53_CT_TZC", ".40"), ("GLM53_CT_THIT", ".023"),
@@ -827,7 +849,7 @@ def preflight(environ=None, *, require_production=True):
     return TierSettings(settings.format, settings.activation, settings.manifest, settings.quality,
                         settings.quality_sha256, settings.q8_quality, settings.q8_quality_sha256, admission,
                         settings.cost_path, settings.cost_sha256, costs, staged,
-                        settings.precompile_path, settings.precompile_sha256, precompiled)
+                        settings.precompile_path, settings.precompile_sha256, precompiled, settings.batch_policy)
 
 
 def main(argv=None):
