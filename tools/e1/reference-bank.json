@@ -1,0 +1,2127 @@
+{
+  "accepted_proxy_sha256": [
+    "58bc916f3162fe5ef41e72a8d8cc0d997683c526a1ed5b015febe0898d99df9a",
+    "15fdf90f839fb7107cf098d35c806bbf8aa419cd19df981c1f71a72f7d73cc23"
+  ],
+  "accepted_quality_verdict": "PROXY-PASS",
+  "ik_revision": "5bf8f0fe4db98e9560de0f495232f8d3a733c678",
+  "imatrix_sha256": "27d2ef6b6be0e314b373080f96322a1e4668b09b192664f3edc231c3b7c2d749",
+  "layers": [
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.03.lut.gguf",
+        "sha256": "2faa9a83a4064f010d26e68473f60563288d4c67c4ea231a3ec4a406095b4a6c"
+      },
+      "layer": 3,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.3.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.3.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.3.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.04.lut.gguf",
+        "sha256": "0a1131eb14297e0528d18f26eef13ec55eb5837048b0921d453ac15ec4a046c6"
+      },
+      "layer": 4,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.4.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.4.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.4.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.05.lut.gguf",
+        "sha256": "3657006d2f8687b04d3ab4cff9328f270295ff70805db96a9e74e56e25651186"
+      },
+      "layer": 5,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.5.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.5.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.5.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.06.lut.gguf",
+        "sha256": "6b68a93754516feeda738642ac0ad71b9969f779c0bbf8e206cf95fe4ffb0d8d"
+      },
+      "layer": 6,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.6.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.6.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.6.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.07.lut.gguf",
+        "sha256": "9bee2557612edef619be786830a602c1112ec5a604a9ee49d09284ef7eefd248"
+      },
+      "layer": 7,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.7.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.7.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.7.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.08.lut.gguf",
+        "sha256": "da97487dc63651460d69aea31829708f7efa1658a3b52d647e04cdb8e8d563e8"
+      },
+      "layer": 8,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.8.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.8.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.8.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.09.lut.gguf",
+        "sha256": "f4dfd3859c069c31ca749e00d8093bfa4a6a4e6cff8603561317ac3aa43cb796"
+      },
+      "layer": 9,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.9.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.9.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.9.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.10.lut.gguf",
+        "sha256": "6e0329bae13a982fb5178cc1d2d4eeb6ad0b61532f78c2bc46ea77bf6323baa3"
+      },
+      "layer": 10,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.10.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.10.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.10.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 4562871424,
+        "data_start": 9430144,
+        "path": "blk.11.lut.gguf",
+        "sha256": "9670cb4702e653df82fb43544171cd6f9f94feddd13d9c11c059b2a0b7e6a8cf"
+      },
+      "layer": 11,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.11.ffn_gate_exps.weight",
+          "nbytes": 1285816320,
+          "offset": 0,
+          "row_stride": 2180,
+          "type": "IQ4_KS",
+          "type_id": 144
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.11.ffn_up_exps.weight",
+          "nbytes": 1285816320,
+          "offset": 1285816320,
+          "row_stride": 2180,
+          "type": "IQ4_KS",
+          "type_id": 144
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.11.ffn_down_exps.weight",
+          "nbytes": 1981808640,
+          "offset": 2571632640,
+          "row_stride": 1680,
+          "type": "Q6_K",
+          "type_id": 14
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 4067419264,
+        "data_start": 9430144,
+        "path": "blk.12.lut.gguf",
+        "sha256": "0297bf8d6fe8cbd87ff3a7a5ee2bca63da6da7165f6404c54428940a98c5bcf8"
+      },
+      "layer": 12,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.12.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.12.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.12.ffn_down_exps.weight",
+          "nbytes": 1981808640,
+          "offset": 2076180480,
+          "row_stride": 1680,
+          "type": "Q6_K",
+          "type_id": 14
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.13.lut.gguf",
+        "sha256": "e2f00e87913e8c638520d620c5f8afdb6e587437f521c9403364ef5bfc0c9fa8"
+      },
+      "layer": 13,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.13.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.13.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.13.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.14.lut.gguf",
+        "sha256": "808ee7f5d31c0e349d9bf17b0bfa28801af1de7b7f513a4e1dd0460a194f58bf"
+      },
+      "layer": 14,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.14.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.14.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.14.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.15.lut.gguf",
+        "sha256": "cc236f2cb4d7fd348699fee47b23cbfe9129b3f672faf24b5833937a85fb7df0"
+      },
+      "layer": 15,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.15.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.15.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.15.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.16.lut.gguf",
+        "sha256": "983d8c28fb746cbc4c1abe2a797b34c5ad3948668199729afc4b3934cde6c833"
+      },
+      "layer": 16,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.16.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.16.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.16.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.17.lut.gguf",
+        "sha256": "839dad78902e5cfd89b9fd572c2fb92960b37ba12b3ad51a7be742548ce4dc1f"
+      },
+      "layer": 17,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.17.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.17.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.17.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.18.lut.gguf",
+        "sha256": "1b0bfe6829e04140fe0d8721ca26cf1958510199d3fe8e9d000216f464860c3b"
+      },
+      "layer": 18,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.18.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.18.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.18.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.19.lut.gguf",
+        "sha256": "81b04a3ebc46e2764454038293c4f2dd44eee54143cd115d91a6e9fe3095a907"
+      },
+      "layer": 19,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.19.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.19.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.19.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.20.lut.gguf",
+        "sha256": "bc5d665a41c6327b6abdac704ca22066cf34f66962a4905915fb3e19128aaa68"
+      },
+      "layer": 20,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.20.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.20.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.20.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.21.lut.gguf",
+        "sha256": "ce5a8877cbff780c8562ea5841179728f79edc5846c29e72a029f13c2e3e3679"
+      },
+      "layer": 21,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.21.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.21.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.21.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.22.lut.gguf",
+        "sha256": "a892ff04ac5eb9154c6b3503bfdfaa18fce72816376a67e1baf5b767215c0e36"
+      },
+      "layer": 22,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.22.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.22.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.22.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.23.lut.gguf",
+        "sha256": "09a5adb20b28a55f58d931883212d177f5a0ad4a68bf2cc042c47aab353ee662"
+      },
+      "layer": 23,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.23.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.23.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.23.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.24.lut.gguf",
+        "sha256": "ee0a07db0a89ed68ff9f9d95f76fee3e51cdf95ca6fdbbbaeb45f9967b40d8fd"
+      },
+      "layer": 24,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.24.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.24.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.24.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.25.lut.gguf",
+        "sha256": "139b657774cc31b8e0001eec113c4469174cf89625c1ec8d6ed5a8877654b9f7"
+      },
+      "layer": 25,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.25.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.25.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.25.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.26.lut.gguf",
+        "sha256": "0dac0932ab816eb93ef6fc87802aef308c06dc2c8ca6de5cc83762ad6130345e"
+      },
+      "layer": 26,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.26.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.26.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.26.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.27.lut.gguf",
+        "sha256": "5572df2a75feb85ece8ccd284fa9ca6befdd3fe8b3f6fe78737ae4d22e117272"
+      },
+      "layer": 27,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.27.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.27.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.27.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.28.lut.gguf",
+        "sha256": "8437c00202b2dd9290fb3470e28f0093638f1acd9b4c781c42db167959a5cce4"
+      },
+      "layer": 28,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.28.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.28.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.28.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.29.lut.gguf",
+        "sha256": "8641edd116cb1c461e10ab0e1312052fa4bd9a7f4165dcb9612ff30e1ddcb78d"
+      },
+      "layer": 29,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.29.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.29.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.29.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.30.lut.gguf",
+        "sha256": "71f42fd75b1be0bc2867053432148b59afe7e12f6434528a7545631e10aa46e0"
+      },
+      "layer": 30,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.30.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.30.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.30.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.31.lut.gguf",
+        "sha256": "83012c75c6fb4afbb5e16861cf55c0a7d9bec8608d5048cb5aaffec9afde7e46"
+      },
+      "layer": 31,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.31.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.31.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.31.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.32.lut.gguf",
+        "sha256": "461405e7d338e185810147316974053f0857f131d972d25262552bbaf05a870b"
+      },
+      "layer": 32,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.32.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.32.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.32.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.33.lut.gguf",
+        "sha256": "979d3bcc14f49ea42e6b6c8d736796a5db7df0716991131c3f3685b5b7040478"
+      },
+      "layer": 33,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.33.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.33.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.33.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.34.lut.gguf",
+        "sha256": "eba1a3ac00204516e8bc8a101673a2e0fb0331f27c8b05854f0cbf58fff9c202"
+      },
+      "layer": 34,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.34.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.34.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.34.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.35.lut.gguf",
+        "sha256": "2e5439e4c6d34588fd3171ca67a63f3727fe487e22aac801c124f776360fadcf"
+      },
+      "layer": 35,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.35.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.35.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.35.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.36.lut.gguf",
+        "sha256": "5e5124a8e0e1ec85aa7c93a0505f865646f718c806f4d54015eea557137b673e"
+      },
+      "layer": 36,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.36.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.36.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.36.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.37.lut.gguf",
+        "sha256": "28e5e6de1b837bdca1447d3de87195f253f0132c7a6ae865cdbc254ab7e94ac8"
+      },
+      "layer": 37,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.37.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.37.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.37.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.38.lut.gguf",
+        "sha256": "fd71557e84bc3ec8b1f77fdd71648dc51a339595e601f63860c11bc23de3be69"
+      },
+      "layer": 38,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.38.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.38.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.38.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.39.lut.gguf",
+        "sha256": "f62155bff1cf78557f1b2c1629a8503f05a0942609287667457e61cf891ab657"
+      },
+      "layer": 39,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.39.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.39.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.39.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.40.lut.gguf",
+        "sha256": "c47a95fba84c607a5a5d21c8d89b4f4f44f50c22a031d2ee87eb7a4df7e3e912"
+      },
+      "layer": 40,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.40.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.40.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.40.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.41.lut.gguf",
+        "sha256": "74ac52aa38c044ce07121f316f3ae287924aedf774dc58e1211de6566644facf"
+      },
+      "layer": 41,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.41.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.41.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.41.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.42.lut.gguf",
+        "sha256": "1e917aafd1979d58857ee810ffc69d9d3a4116848e1c9abf637fb6eaf533946d"
+      },
+      "layer": 42,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.42.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.42.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.42.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 3373786240,
+        "data_start": 9430144,
+        "path": "blk.43.lut.gguf",
+        "sha256": "5fef85915a54e4b1d033230ff4bee6ded9507cb51fae7f0f54b1705b7ab8b679"
+      },
+      "layer": 43,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.43.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.43.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.43.ffn_down_exps.weight",
+          "nbytes": 1288175616,
+          "offset": 2076180480,
+          "row_stride": 1092,
+          "type": "IQ4_KS",
+          "type_id": 144
+        }
+      ]
+    },
+    {
+      "artifact": {
+        "bytes": 4067419264,
+        "data_start": 9430144,
+        "path": "blk.44.lut.gguf",
+        "sha256": "5dec3c07a5758ad30c09848170d4955f0204fcb63372a24c40632b3277887545"
+      },
+      "layer": 44,
+      "tensors": [
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.44.ffn_gate_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 0,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            4096,
+            2048,
+            288
+          ],
+          "name": "blk.44.ffn_up_exps.weight",
+          "nbytes": 1038090240,
+          "offset": 1038090240,
+          "row_stride": 1760,
+          "type": "IQ3_K",
+          "type_id": 138
+        },
+        {
+          "dims": [
+            2048,
+            4096,
+            288
+          ],
+          "name": "blk.44.ffn_down_exps.weight",
+          "nbytes": 1981808640,
+          "offset": 2076180480,
+          "row_stride": 1680,
+          "type": "Q6_K",
+          "type_id": 14
+        }
+      ]
+    }
+  ],
+  "ledger": {
+    "canonical_payload_bytes": 143879307264,
+    "completed_canonical_payload_bytes": 143879307264,
+    "completed_layers": 42,
+    "completed_tensors": 126,
+    "per_node_tp2_payload_bytes": 72031666176,
+    "target_layers": 42,
+    "target_tensors": 126,
+    "tp2_payload_bytes": 144063332352
+  },
+  "offset_convention": "tensor offset is relative to artifact.data_start; row_stride includes IQ4_KS scale",
+  "private_manifest_sha256": "4746bd102db5f08725964fa8163586bb8d79f2bd968f3e3b636ed11783ad0d34",
+  "real_pass": false,
+  "revision": "a38483c8cd5df544f53d70fb281afe97369d5ab6",
+  "schema": "e1-lut-bank/v1",
+  "state": "S2_READY"
+}
