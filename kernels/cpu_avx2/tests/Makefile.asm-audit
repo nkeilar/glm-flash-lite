@@ -1,0 +1,63 @@
+# From the repository root: make -f kernels/cpu_avx2/tests/Makefile.asm-audit test
+# External auditors' harnesses stay in their original evidence tree.
+SHELL := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+CXX := g++
+AUDIT ?= ./asm-audit   # external audit harnesses (work-A, work-C): set AUDIT=<dir>
+OUT ?= build/iq3-asm-audit
+CAPTURE ?= ./activation   # real-activation capture dir: set CAPTURE=<dir>
+SRC := kernels/cpu_avx2/lut/kernels.cpp
+HDR := kernels/cpu_avx2/lut/kernels.h
+FLAGS := -O3 -mavx2 -mfma -mf16c -std=c++17 -fPIC -Ikernels/cpu_avx2
+BDW := -mtune=broadwell -fno-semantic-interposition -flto
+SYMBOLS := _ZN8lutbench10dot_iq3_q8EPKvRKNS_10ActivationEi _ZN8lutbench23dot_iq3_q8_optimized_m2EPKvPKNS_10ActivationEiPf _ZN8lutbench23dot_iq3_q8_optimized_m4EPKvPKNS_10ActivationEiPf
+.PHONY: all test differential audit-a bench sweep disassemble clean
+all: $(OUT)/reference.so $(OUT)/asm.so $(OUT)/asm-bdw-lto.so $(OUT)/rawcheck
+$(OUT):
+	mkdir -p $@
+$(OUT)/reference.so: $(SRC) $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) -mtune=znver3 -DFT_IQ3_Q8_ASM=0 -shared $< -o $@
+$(OUT)/asm.so: $(SRC) $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) -mtune=znver3 -shared $< -o $@
+$(OUT)/asm-bdw-lto.so: $(SRC) $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) $(BDW) -shared $< -o $@
+$(OUT)/rawcheck: kernels/cpu_avx2/tests/iq3_asm_audit.cpp $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) $< -ldl -o $@
+test: all disassemble
+	$(OUT)/rawcheck $(abspath $(OUT))/reference.so $(abspath $(OUT))/asm.so $(abspath $(OUT))/asm-bdw-lto.so
+# Match C's entry, including prepare_range and M=3's production 2+1 split.
+$(OUT)/shim-asm.so: $(SRC) $(HDR) $(AUDIT)/work-C/bench/shim.cpp | $(OUT)
+	$(CXX) $(FLAGS) -mtune=znver3 -shared $(SRC) $(AUDIT)/work-C/bench/shim.cpp -o $@
+$(OUT)/shim-asm-bdw-lto.so: $(SRC) $(HDR) $(AUDIT)/work-C/bench/shim.cpp | $(OUT)
+	$(CXX) $(FLAGS) $(BDW) -shared $(SRC) $(AUDIT)/work-C/bench/shim.cpp -o $@
+$(OUT)/diffcheck: $(AUDIT)/work-C/bench/diffcheck.cpp $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) $< -ldl -o $@
+$(OUT)/bench: $(AUDIT)/work-C/bench/bench.cpp $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) $< -ldl -o $@
+$(OUT)/stacksweep: $(AUDIT)/work-C/bench/stacksweep.cpp $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) $< -ldl -o $@
+differential: $(OUT)/diffcheck $(OUT)/shim-asm.so $(OUT)/shim-asm-bdw-lto.so
+	$(OUT)/diffcheck 20000 $(AUDIT)/work-C/bench/so/prod.so $(abspath $(OUT))/shim-asm.so $(abspath $(OUT))/shim-asm-bdw-lto.so | tee $(OUT)/differential.txt
+	! grep -q 'NOT BIT-EXACT' $(OUT)/differential.txt
+# A's independent captured-weight gate, adding the candidate namespace only.
+$(OUT)/a-kernel.o: $(SRC) $(HDR) | $(OUT)
+	$(CXX) $(FLAGS) -mtune=broadwell -Dlutbench=lutasm -c $< -o $@
+$(OUT)/a-bench3.cpp: $(AUDIT)/work-A/proto/bench3.cpp $(AUDIT)/work-A/proto/kernels.h | $(OUT)
+	python3 -c 'from pathlib import Path; import sys; a=Path(sys.argv[1])/"work-A/proto"; o=Path(sys.argv[2]); (o/"h_lutasm.h").write_text((a/"kernels.h").read_text().replace("namespace lutbench", "namespace lutasm")); (o/"a-bench3.cpp").write_text((a/"bench3.cpp").read_text().replace("#include \"h_lutnew.h\"", "#include \"h_lutasm.h\"\n#include \"h_lutnew.h\"").replace("IMPL(lutnew, \"v4\"),", "IMPL(lutasm, \"asm\"), IMPL(lutnew, \"v4\"),"))' "$(AUDIT)" "$(OUT)"
+$(OUT)/a-bench3: $(OUT)/a-bench3.cpp $(OUT)/a-kernel.o
+	$(CXX) $(FLAGS) -I$(AUDIT)/work-A/proto $^ $(addprefix $(AUDIT)/work-A/proto/,kprod_nopic.o b_v4.o b_v5.o b_v5b.o b_v5m3.o) -o $@
+audit-a: $(OUT)/a-bench3
+	$(OUT)/a-bench3 $(CAPTURE) exact | tee $(OUT)/a-exact.txt
+	! grep -q MISMATCH $(OUT)/a-exact.txt
+	grep -q 'asm_mismatch=0' $(OUT)/a-exact.txt
+bench: $(OUT)/bench $(OUT)/shim-asm.so $(OUT)/shim-asm-bdw-lto.so
+	$(OUT)/bench 301 0 $(AUDIT)/work-C/bench/so/prod.so $(abspath $(OUT))/shim-asm.so $(abspath $(OUT))/shim-asm-bdw-lto.so
+sweep: $(OUT)/stacksweep $(OUT)/shim-asm.so $(OUT)/shim-asm-bdw-lto.so
+	$(OUT)/stacksweep $(abspath $(OUT))/shim-asm.so 16 9
+	$(OUT)/stacksweep $(abspath $(OUT))/shim-asm-bdw-lto.so 16 9
+disassemble: $(OUT)/asm.so $(OUT)/asm-bdw-lto.so
+	for symbol in $(SYMBOLS); do objdump -d -Mintel --disassemble=$$symbol $(OUT)/asm.so; done > $(OUT)/asm.txt
+	for symbol in $(SYMBOLS); do objdump -d -Mintel --disassemble=$$symbol $(OUT)/asm-bdw-lto.so; done > $(OUT)/asm-bdw-lto.txt
+	! grep -E '\[(r|e)(sp|bp)' $(OUT)/asm.txt $(OUT)/asm-bdw-lto.txt
+clean:
+	rm -rf $(OUT)
