@@ -334,8 +334,40 @@ static int rt_connect(const std::string& host, int port, int* version = nullptr)
     return fd;
 }
 
-// Compute `route` on the CPU into out (zeroing it when the route is empty)
-static void local_forward(int li, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route, int nr, float* out, PhaseTimes* lp)
+#ifdef FT_ENABLE_LUT
+static bool lut_convert_finite(const uint16_t* hx, float* xf, size_t n)
+{
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    __m256 bad = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+    {
+        const __m256 value = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(hx + i)));
+        _mm256_storeu_ps(xf + i, value);
+        bad = _mm256_or_ps(bad, _mm256_cmp_ps(_mm256_and_ps(value, absmask), inf, _CMP_NLT_UQ));
+    }
+    bool ok = _mm256_movemask_ps(bad) == 0;
+    for (; i < n; ++i) { xf[i] = h2f(hx[i]); ok &= std::isfinite(xf[i]); }
+    return ok;
+}
+static bool lut_all_finite(const float* x, size_t n)
+{
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    __m256 bad = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        bad = _mm256_or_ps(bad, _mm256_cmp_ps(_mm256_and_ps(_mm256_loadu_ps(x + i), absmask), inf, _CMP_NLT_UQ));
+    bool ok = _mm256_movemask_ps(bad) == 0;
+    for (; i < n; ++i) ok &= std::isfinite(x[i]);
+    return ok;
+}
+#endif
+
+// Compute `route` on the CPU into out (zeroing it when the route is empty).
+// finite_input is used only after run_job's checked ingress conversion.
+static void local_forward(int li, int ntok, const std::vector<std::vector<std::pair<int, float>>>& route, int nr, float* out, PhaseTimes* lp, bool finite_input = false)
 {
 #ifdef FT_ENABLE_LUT
     if (T->lut)
@@ -343,7 +375,8 @@ static void local_forward(int li, int ntok, const std::vector<std::vector<std::p
         const bool active = T->lut_active.load(std::memory_order_acquire);
         if (active) lut_checkpoint();
         const uint64_t remaining_ms = active ? uint64_t(std::max(1.0, std::ceil((T->lut_deadline - now()) * 1000.0))) : 0;
-        T->lut->forward(li, T->xf.data(), ntok, route, out, remaining_ms);
+        if (finite_input) T->lut->forward_finite_input(li, T->xf.data(), ntok, route, out, remaining_ms);
+        else T->lut->forward(li, T->xf.data(), ntok, route, out, remaining_ms);
         if (active) lut_checkpoint();
         return;
     }
@@ -380,10 +413,14 @@ void run_job(int li, int ntok, int np)
     }
 #endif
     T->xf.resize(size_t(std::max(ntok, 1)) * H);
-    for (size_t i = 0; i < size_t(ntok) * H; ++i) T->xf[i] = h2f(T->hx[i]);
 #ifdef FT_ENABLE_LUT
-    if (T->lut) for (float value : T->xf) TORCH_CHECK(std::isfinite(value), "LUT ingress contains nonfinite activation");
+    if (T->lut)
+    {
+        TORCH_CHECK(lut_convert_finite(T->hx, T->xf.data(), size_t(ntok) * H), "LUT ingress contains nonfinite activation");
+    }
+    else
 #endif
+    for (size_t i = 0; i < size_t(ntok) * H; ++i) T->xf[i] = h2f(T->hx[i]);
     if (np == 0)
     {
         std::memset(T->hout, 0, size_t(ntok) * H * 4); T->st.empty++;
@@ -447,7 +484,7 @@ void run_job(int li, int ntok, int np)
     T->prep_ns.fetch_add(int64_t((now() - tp0) * 1e9), std::memory_order_relaxed);
     PhaseTimes lp;   // [bdw-opt] job-local, then published atomically
     const double tl0 = now();
-    local_forward(li, ntok, route, nl, T->hout, &lp);
+    local_forward(li, ntok, route, nl, T->hout, &lp, true);
     const double tl1 = now();
     double twait = 0;
     if (nr)
@@ -524,7 +561,7 @@ void run_job(int li, int ntok, int np)
                 if (chk > 0 && rmask == 0 && R->calls.load(std::memory_order_relaxed) % chk == 0)
                 {
                     R->tmp.resize(size_t(ntok) * H);
-                    local_forward(li, ntok, rroute, nr, R->tmp.data(), nullptr);
+                    local_forward(li, ntok, rroute, nr, R->tmp.data(), nullptr, true);
 #ifdef FT_ENABLE_LUT
                     std::lock_guard<std::mutex> diagnostic_lock(R->chk_mu);
 #endif
@@ -556,7 +593,7 @@ void run_job(int li, int ntok, int np)
             if (nf)
             {
                 R->tmp.resize(size_t(ntok) * H);
-                local_forward(li, ntok, fr, nf, R->tmp.data(), nullptr);
+                local_forward(li, ntok, fr, nf, R->tmp.data(), nullptr, true);
                 for (size_t i = 0; i < size_t(ntok) * H; ++i) T->hout[i] += R->tmp[i];
                 if (ok) R->partial++; else { R->fallbacks++; R->fallback_picks += nf; }
             }
@@ -566,7 +603,9 @@ void run_job(int li, int ntok, int np)
     if (T->lut)
     {
         lut_checkpoint();
-        for (size_t n = 0; n < size_t(ntok) * H; ++n) TORCH_CHECK(std::isfinite(T->hout[n]), "nonfinite LUT routed result");
+        // The backend already validated a local-only result. Remote/fallback
+        // additions need their own check because the final add can overflow.
+        if (nr) TORCH_CHECK(lut_all_finite(T->hout, size_t(ntok) * H), "nonfinite LUT routed result");
     }
 #endif
     for (int k = 0; k < 5; ++k) T->pt_ns[k].fetch_add(int64_t(lp.t[k] * 1e9), std::memory_order_relaxed);

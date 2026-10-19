@@ -213,8 +213,48 @@ void numeric(ft_lut::Backend& backend, const Fixture& f, lutbench::Path path, in
         auto expected = reference(f, x, routes, path, limit);
         std::vector<float> got(expected.size(), 123.f);
         backend.forward(f.input.internal_li, x.data(), m, routes, got.data());
+        std::vector<float> prechecked(got.size(), 123.f);
+        backend.forward_finite_input(f.input.internal_li, x.data(), m, routes, prechecked.data());
+        check(std::memcmp(got.data(), prechecked.data(), got.size() * sizeof(float)) == 0,
+              "prechecked ingress changed backend output bits");
         double error = relative(got, expected); worst = std::max(worst, error);
         check(error <= 1e-5, "TP2 output differs from canonical packed-weight reference"); ++cases;
+    }
+}
+void merged_overflow_checks(const std::vector<int>& workers) {
+    Temporary temp;
+    Fixture fixture(temp, 3, 1);
+    // Uniform positive projections make each half's weighted result finite,
+    // while their final sum overflows. Exercise the merge admission itself.
+    {
+        std::fstream file(fixture.input.path, std::ios::in | std::ios::out | std::ios::binary);
+        for (int matrix = 0; matrix < 3; ++matrix) {
+            const auto& tensor = fixture.input.tensors[matrix];
+            std::vector<float> row(tensor.width, .01f);
+            for (int r = 0; r < tensor.rows; ++r)
+                lutbench::quantize(fmt(tensor.type_id), row.data(), fixture.packed[matrix].data() + size_t(r) * fixture.stride[matrix], tensor.width);
+            file.seekp(std::streamoff(tensor.offset));
+            file.write(reinterpret_cast<const char*>(fixture.packed[matrix].data()), std::streamsize(tensor.nbytes));
+        }
+        check(bool(file), "cannot write merge-overflow fixture");
+    }
+    fixture.input.identity = ft_lut::file_identity(fixture.input.path);
+    for (const std::string activation : {"i16", "q8"}) {
+        ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true; options.activation = activation;
+        auto backend = ft_lut::Backend::offline_fixture(options); backend->add_layer(fixture.input);
+        std::vector<float> input(fixture.h, .25f), output(fixture.h);
+        for (bool finite_input : {false, true}) {
+            std::fill(output.begin(), output.end(), 123.f);
+            ft_lut::Routes routes{{{0, std::numeric_limits<float>::max()}}};
+            rejects_with([&] {
+                if (finite_input) backend->forward_finite_input(0, input.data(), 1, routes, output.data());
+                else backend->forward(0, input.data(), 1, routes, output.data());
+            }, "nonfinite merged LUT result");
+            check(std::all_of(output.begin(), output.end(), [](float v) { return v == 123.f; }), "merge overflow published caller output");
+            routes[0][0].second = 1.f;
+            backend->forward(0, input.data(), 1, routes, output.data());
+            check(std::all_of(output.begin(), output.end(), [](float v) { return std::isfinite(v) && v > 0; }), "backend did not recover after merge overflow");
+        }
     }
 }
 void mapping_allocator_checks() {
@@ -361,6 +401,7 @@ int main(int argc, char** argv) {
         rejects([&] { ft_lut::check_memory_limit(200, 101, 100); });
         rejects([&] { ft_lut::check_memory_limit(200, 201, 0); });
         Temporary temp; auto workers = cpus();
+        merged_overflow_checks(workers);
         ft_lut::Options rejected_bank; rejected_bank.cpus = workers; rejected_bank.virtual_tp2 = true;
         rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, bank); });
         rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, broken); });
@@ -603,8 +644,16 @@ int main(int argc, char** argv) {
                 std::fill(x.begin(), x.end(), .25f);
                 backend->forward(0, x.data(), 4, route, out.data());
             }
-            x[0] = std::numeric_limits<float>::infinity();
-            rejects([&] { backend->forward(0, x.data(), 4, route, out.data()); });
+            for (float invalid_value : {std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                                        std::numeric_limits<float>::quiet_NaN()}) {
+                for (size_t position : {size_t(0), size_t(7), size_t(8), x.size() - 1}) {
+                    std::fill(x.begin(), x.end(), .25f); std::fill(out.begin(), out.end(), 123.f);
+                    x[position] = invalid_value;
+                    auto invalid_route = route; invalid_route[0][0].first = ordinary.experts;
+                    rejects_with([&] { backend->forward(0, x.data(), 4, invalid_route, out.data()); }, "nonfinite LUT input");
+                    check(std::all_of(out.begin(), out.end(), [](float v) { return v == 123.f; }), "invalid input published caller output");
+                }
+            }
             rejects([&] { backend->forward(0, x.data(), 5, route, out.data()); });
             rejects([&] { backend->add_layer(ordinary.input); });
             std::fill(x.begin(), x.end(), .25f); std::fill(out.begin(), out.end(), 123.f);

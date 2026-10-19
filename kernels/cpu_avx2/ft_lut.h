@@ -146,6 +146,9 @@ public:
     Backend& operator=(const Backend&) = delete;
     void add_layer(const LayerInput& input);
     void forward(int internal_li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms = 0);
+    // Ingress-only fast path: the caller must have checked every x element for
+    // finiteness without changing x since that check. Other validation is unchanged.
+    void forward_finite_input(int internal_li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms = 0);
     Receipt receipt() const;
     // Sticky cooperative cancellation; current generations still drain before
     // forward returns, and later jobs are rejected. Safe from another thread.
@@ -172,6 +175,7 @@ public:
 private:
     struct Impl;
     explicit Backend(const Options& options, bool fixture = true);
+    void forward_impl(int internal_li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms, bool finite_input);
     std::unique_ptr<Impl> impl_;
 };
 

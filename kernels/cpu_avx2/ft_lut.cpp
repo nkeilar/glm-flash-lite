@@ -602,6 +602,31 @@ struct Scratch {
         h = width; half = ihalf;
     }
 };
+bool all_finite(const float* x, size_t n) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    __m256 bad = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        bad = _mm256_or_ps(bad, _mm256_cmp_ps(_mm256_and_ps(_mm256_loadu_ps(x + i), absmask), inf, _CMP_NLT_UQ));
+    bool ok = _mm256_movemask_ps(bad) == 0;
+    for (; i < n; ++i) ok &= std::isfinite(x[i]);
+    return ok;
+}
+bool merge_finite(float* p0, const float* p1, size_t n) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    __m256 bad = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 sum = _mm256_add_ps(_mm256_loadu_ps(p0 + i), _mm256_loadu_ps(p1 + i));
+        bad = _mm256_or_ps(bad, _mm256_cmp_ps(_mm256_and_ps(sum, absmask), inf, _CMP_NLT_UQ));
+        _mm256_storeu_ps(p0 + i, sum);
+    }
+    bool ok = _mm256_movemask_ps(bad) == 0;
+    for (; i < n; ++i) { p0[i] = p0[i] + p1[i]; ok &= std::isfinite(p0[i]); }
+    return ok;
+}
 int pair_index(int a, int b) {
     int index = 0;
     for (int x = 0; x < 4; ++x) for (int y = x + 1; y < 4; ++y, ++index) if (x == a && y == b) return index;
@@ -1016,6 +1041,12 @@ void Backend::add_layer(const LayerInput& in) {
 }
 
 void Backend::forward(int li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms) {
+    forward_impl(li, x, ntok, routes, output, remaining_ms, false);
+}
+void Backend::forward_finite_input(int li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms) {
+    forward_impl(li, x, ntok, routes, output, remaining_ms, true);
+}
+void Backend::forward_impl(int li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms, bool finite_input) {
     std::unique_lock<std::mutex> lock(impl_->mutex, std::try_to_lock);
     require(lock.owns_lock(), "LUT supports one in-flight coordinator job");
     require(remaining_ms <= 3600000, "LUT remaining deadline budget exceeds one hour");
@@ -1023,7 +1054,7 @@ void Backend::forward(int li, const float* x, int ntok, const Routes& routes, fl
     auto found = impl_->layers.find(li); require(found != impl_->layers.end(), "LUT layer is not loaded");
     Layer& layer = *found->second;
     require(impl_->report.offline_fixture || impl_->report.bank_complete, "full LUT bank is not ready");
-    for (size_t n = 0; n < size_t(ntok) * layer.h; ++n) require(std::isfinite(x[n]), "nonfinite LUT input");
+    if (!finite_input) require(all_finite(x, size_t(ntok) * layer.h), "nonfinite LUT input");
     int picks = 0;
     for (const auto& row : routes) {
         require(row.size() <= 8, "LUT supports at most eight routes per token");
@@ -1050,9 +1081,12 @@ void Backend::forward(int li, const float* x, int ntok, const Routes& routes, fl
     impl_->workers.run(&Impl::compute, impl_.get(), remaining_ms);
     if (impl_->failed.load(std::memory_order_acquire)) std::rethrow_exception(impl_->failure);
     // Both release completions have been acquired before any caller output write.
-    for (int n = 0; n < ntok * layer.h; ++n)
-        require(std::isfinite(impl_->scratch[0].partial[n] + impl_->scratch[1].partial[n]), "nonfinite merged LUT result");
-    for (int n = 0; n < ntok * layer.h; ++n) output[n] = impl_->scratch[0].partial[n] + impl_->scratch[1].partial[n];
+    // Fuse the single fp32 add with validation in owned scratch; a rejected
+    // merge still leaves the caller's entire output untouched.
+    float* merged = impl_->scratch[0].partial.data();
+    const size_t count = size_t(ntok) * layer.h;
+    require(merge_finite(merged, impl_->scratch[1].partial.data(), count), "nonfinite merged LUT result");
+    std::memcpy(output, merged, count * sizeof(float));
 }
 
 void Backend::request_abort() { impl_->workers.request_abort(); }
