@@ -1,0 +1,384 @@
+{
+ "schema": "e1-bank-payload-hashes/v1",
+ "note": "sha256 of each per-layer GGUF from its data_start to EOF (tensor data only; excludes GGUF metadata, which embeds a build-specific imatrix path)",
+ "layers": [
+  {
+   "layer": 3,
+   "path": "blk.03.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "2faa9a83a4064f010d26e68473f60563288d4c67c4ea231a3ec4a406095b4a6c",
+   "payload_sha256": "7f2e3c1fb93cb1bb191e5c040708e5029b983b40f1487e598b5b77d477bea5cd"
+  },
+  {
+   "layer": 4,
+   "path": "blk.04.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "0a1131eb14297e0528d18f26eef13ec55eb5837048b0921d453ac15ec4a046c6",
+   "payload_sha256": "64b178b1a645cfff429996f20db0c5cc3fc357c3477ef6e7e8069a953cd9052e"
+  },
+  {
+   "layer": 5,
+   "path": "blk.05.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "3657006d2f8687b04d3ab4cff9328f270295ff70805db96a9e74e56e25651186",
+   "payload_sha256": "48284cb265df5c56bae7b69fc2905c53a426ccf8128562ad6be80e5614056125"
+  },
+  {
+   "layer": 6,
+   "path": "blk.06.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "6b68a93754516feeda738642ac0ad71b9969f779c0bbf8e206cf95fe4ffb0d8d",
+   "payload_sha256": "a32d5487cd90c423608251d73e9e42a91a8ee08dfbe8be3b23eb456a3eca92f1"
+  },
+  {
+   "layer": 7,
+   "path": "blk.07.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "9bee2557612edef619be786830a602c1112ec5a604a9ee49d09284ef7eefd248",
+   "payload_sha256": "e39058f624c414be54bf4652cc963293ea7f6997c6aca8141edf6f014c6c104f"
+  },
+  {
+   "layer": 8,
+   "path": "blk.08.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "da97487dc63651460d69aea31829708f7efa1658a3b52d647e04cdb8e8d563e8",
+   "payload_sha256": "3830aa82094e388844f99cb8857a0ee89c12db4c4309bb428d8e4ead04c1d427"
+  },
+  {
+   "layer": 9,
+   "path": "blk.09.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "f4dfd3859c069c31ca749e00d8093bfa4a6a4e6cff8603561317ac3aa43cb796",
+   "payload_sha256": "661985a11bd64e354be41b8a6309807c376955f22ab73adfc19637817c7bf986"
+  },
+  {
+   "layer": 10,
+   "path": "blk.10.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "6e0329bae13a982fb5178cc1d2d4eeb6ad0b61532f78c2bc46ea77bf6323baa3",
+   "payload_sha256": "0b29d9d9fb19ed17589df4fbdb9fce7176ac632556db194b48dd585fef28c9b0"
+  },
+  {
+   "layer": 11,
+   "path": "blk.11.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 4562871424,
+   "payload_bytes": 4553441280,
+   "file_sha256": "9670cb4702e653df82fb43544171cd6f9f94feddd13d9c11c059b2a0b7e6a8cf",
+   "payload_sha256": "37f0353faf264f140d2af99a4f9023c71a12d98d1d94acb15062ccc10b1223fa"
+  },
+  {
+   "layer": 12,
+   "path": "blk.12.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 4067419264,
+   "payload_bytes": 4057989120,
+   "file_sha256": "0297bf8d6fe8cbd87ff3a7a5ee2bca63da6da7165f6404c54428940a98c5bcf8",
+   "payload_sha256": "e848e9fefc62694d77fc04b8f2fbeecba245a68d48b897f2b66accae1879e960"
+  },
+  {
+   "layer": 13,
+   "path": "blk.13.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "e2f00e87913e8c638520d620c5f8afdb6e587437f521c9403364ef5bfc0c9fa8",
+   "payload_sha256": "a6128cbb40146baabd5e60b88c6ded0010dd1543e1426ef9df143d1e7ad18826"
+  },
+  {
+   "layer": 14,
+   "path": "blk.14.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "808ee7f5d31c0e349d9bf17b0bfa28801af1de7b7f513a4e1dd0460a194f58bf",
+   "payload_sha256": "c5823e476d30852da127e2ca554719f4e96138d2ea90bd713185613c2b2938ba"
+  },
+  {
+   "layer": 15,
+   "path": "blk.15.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "cc236f2cb4d7fd348699fee47b23cbfe9129b3f672faf24b5833937a85fb7df0",
+   "payload_sha256": "2ab01a1d186cd3e097755bde78dfc3eb9b572ca9c7f2cbc3ab4eae0cdb68ef5f"
+  },
+  {
+   "layer": 16,
+   "path": "blk.16.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "983d8c28fb746cbc4c1abe2a797b34c5ad3948668199729afc4b3934cde6c833",
+   "payload_sha256": "0387c250b0d57466566c25c6cc3c97979d6e9c692511731a02cfb0e517cc8cd4"
+  },
+  {
+   "layer": 17,
+   "path": "blk.17.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "839dad78902e5cfd89b9fd572c2fb92960b37ba12b3ad51a7be742548ce4dc1f",
+   "payload_sha256": "55612744f44c3f9089095292e44539378e5ac03af8c19a9bb21d37e700992572"
+  },
+  {
+   "layer": 18,
+   "path": "blk.18.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "1b0bfe6829e04140fe0d8721ca26cf1958510199d3fe8e9d000216f464860c3b",
+   "payload_sha256": "3578403f27c17d41c81dfa9f061613b064a5a89ea24ce8812e4a33aac6fd1deb"
+  },
+  {
+   "layer": 19,
+   "path": "blk.19.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "81b04a3ebc46e2764454038293c4f2dd44eee54143cd115d91a6e9fe3095a907",
+   "payload_sha256": "99d03ee0b349705a3f6eb730d6339aeec01044a065cd06f99308d3aba580459c"
+  },
+  {
+   "layer": 20,
+   "path": "blk.20.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "bc5d665a41c6327b6abdac704ca22066cf34f66962a4905915fb3e19128aaa68",
+   "payload_sha256": "0e1c7fcb78a9b0d6287f760ec680ae3c1a7460a760b222c33ff4b0fe7b53f96f"
+  },
+  {
+   "layer": 21,
+   "path": "blk.21.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "ce5a8877cbff780c8562ea5841179728f79edc5846c29e72a029f13c2e3e3679",
+   "payload_sha256": "a74d8120485a44aec0ce41075b524ea6213e57c2cd36e21d5eed81844f1a2df8"
+  },
+  {
+   "layer": 22,
+   "path": "blk.22.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "a892ff04ac5eb9154c6b3503bfdfaa18fce72816376a67e1baf5b767215c0e36",
+   "payload_sha256": "0d12977022b56bde82dfb852c58c41d17a996e9e59a5fe9f921af72ffbb34c93"
+  },
+  {
+   "layer": 23,
+   "path": "blk.23.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "09a5adb20b28a55f58d931883212d177f5a0ad4a68bf2cc042c47aab353ee662",
+   "payload_sha256": "f2b30024c966190ebbcad57b3fef5a61a92922474e66fbda5237d2d3c1545803"
+  },
+  {
+   "layer": 24,
+   "path": "blk.24.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "ee0a07db0a89ed68ff9f9d95f76fee3e51cdf95ca6fdbbbaeb45f9967b40d8fd",
+   "payload_sha256": "e2567842d9a55ed615e57e1d5ac56d39e86d964c3b15b262f49a11e27a10c379"
+  },
+  {
+   "layer": 25,
+   "path": "blk.25.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "139b657774cc31b8e0001eec113c4469174cf89625c1ec8d6ed5a8877654b9f7",
+   "payload_sha256": "6dbf15f4782c44b0e42427b05bd0d8bb114e7cd62d812f50db48d3fae0d72a0d"
+  },
+  {
+   "layer": 26,
+   "path": "blk.26.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "0dac0932ab816eb93ef6fc87802aef308c06dc2c8ca6de5cc83762ad6130345e",
+   "payload_sha256": "247a4fcb7e0a107db5b5229f8969627a45ecc9b48d305f14c38d048b28569a16"
+  },
+  {
+   "layer": 27,
+   "path": "blk.27.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "5572df2a75feb85ece8ccd284fa9ca6befdd3fe8b3f6fe78737ae4d22e117272",
+   "payload_sha256": "a4eb3d63bbaccd9cfc15f35d7783ff48edd234fd01a3b59f31f4be9db78678c8"
+  },
+  {
+   "layer": 28,
+   "path": "blk.28.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "8437c00202b2dd9290fb3470e28f0093638f1acd9b4c781c42db167959a5cce4",
+   "payload_sha256": "6c383ecceba75c2a7a7ab570b0c780b544a5c63ee1d5dd8da18df2b0a6ef2972"
+  },
+  {
+   "layer": 29,
+   "path": "blk.29.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "8641edd116cb1c461e10ab0e1312052fa4bd9a7f4165dcb9612ff30e1ddcb78d",
+   "payload_sha256": "ca9aedb94419facc6eb507fc0b26142d6d6f290bb6dfd8cd9683c91cd4012eda"
+  },
+  {
+   "layer": 30,
+   "path": "blk.30.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "71f42fd75b1be0bc2867053432148b59afe7e12f6434528a7545631e10aa46e0",
+   "payload_sha256": "a81a3fc62cb28eef2527c9f367fb2e2e02ac6e4135f81c60cccbe694d913b655"
+  },
+  {
+   "layer": 31,
+   "path": "blk.31.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "83012c75c6fb4afbb5e16861cf55c0a7d9bec8608d5048cb5aaffec9afde7e46",
+   "payload_sha256": "5121dc9d74a80dab26e2ef07d4a72e39eb991798219a3a30cbe1a90ad1e4096a"
+  },
+  {
+   "layer": 32,
+   "path": "blk.32.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "461405e7d338e185810147316974053f0857f131d972d25262552bbaf05a870b",
+   "payload_sha256": "66f26283127899d68ba3df6cf30a5ec8ed7485c00d3006cea1091c162990f855"
+  },
+  {
+   "layer": 33,
+   "path": "blk.33.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "979d3bcc14f49ea42e6b6c8d736796a5db7df0716991131c3f3685b5b7040478",
+   "payload_sha256": "a9c72cb1723dc11fee2855bd3ca11b9747ff82171bf8a0cce399811416f71649"
+  },
+  {
+   "layer": 34,
+   "path": "blk.34.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "eba1a3ac00204516e8bc8a101673a2e0fb0331f27c8b05854f0cbf58fff9c202",
+   "payload_sha256": "00a5e503d50a526e97e240c519c0aea24662d147bb9ba74a36ba99a639cc9fa3"
+  },
+  {
+   "layer": 35,
+   "path": "blk.35.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "2e5439e4c6d34588fd3171ca67a63f3727fe487e22aac801c124f776360fadcf",
+   "payload_sha256": "b0d4664034043d6b87640b09265aa3cd35314818c06926a2d373dc2e68a989ba"
+  },
+  {
+   "layer": 36,
+   "path": "blk.36.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "5e5124a8e0e1ec85aa7c93a0505f865646f718c806f4d54015eea557137b673e",
+   "payload_sha256": "83f9c135884e167ca4ef25005fb6be6dfa04229bad96d95e19e819d9cad8dbe6"
+  },
+  {
+   "layer": 37,
+   "path": "blk.37.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "28e5e6de1b837bdca1447d3de87195f253f0132c7a6ae865cdbc254ab7e94ac8",
+   "payload_sha256": "a9fd50849ced50a4fe8eee58fa1e127342b55f3fc2ba2660bc05ed5a8175aa9d"
+  },
+  {
+   "layer": 38,
+   "path": "blk.38.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "fd71557e84bc3ec8b1f77fdd71648dc51a339595e601f63860c11bc23de3be69",
+   "payload_sha256": "254c2ee6474c879e5313a6f7895cba6327c48587a3db0fb9f47ffa02f7fb87e7"
+  },
+  {
+   "layer": 39,
+   "path": "blk.39.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "f62155bff1cf78557f1b2c1629a8503f05a0942609287667457e61cf891ab657",
+   "payload_sha256": "58111773b3690e7e8cbc80e2e2f63c439ca72ceae7bd14caf27293f249cf307b"
+  },
+  {
+   "layer": 40,
+   "path": "blk.40.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "c47a95fba84c607a5a5d21c8d89b4f4f44f50c22a031d2ee87eb7a4df7e3e912",
+   "payload_sha256": "7ff24c8903a6f5590e139d60424c6c7903141b096d4601cd128c678a393c4ac2"
+  },
+  {
+   "layer": 41,
+   "path": "blk.41.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "74ac52aa38c044ce07121f316f3ae287924aedf774dc58e1211de6566644facf",
+   "payload_sha256": "c66d286cdfa2d563bc73cdf7949ed1b2ffbc99373c744ae5cd780eaf750b90fa"
+  },
+  {
+   "layer": 42,
+   "path": "blk.42.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "1e917aafd1979d58857ee810ffc69d9d3a4116848e1c9abf637fb6eaf533946d",
+   "payload_sha256": "0005602d2f72492bda4240f8a54bb73e141b34d144366c612d32ec7aadd9e836"
+  },
+  {
+   "layer": 43,
+   "path": "blk.43.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 3373786240,
+   "payload_bytes": 3364356096,
+   "file_sha256": "5fef85915a54e4b1d033230ff4bee6ded9507cb51fae7f0f54b1705b7ab8b679",
+   "payload_sha256": "65d1a37f1f550b3657f68fe3082d402a5cbbab4a7e51570c62203120e468c4e0"
+  },
+  {
+   "layer": 44,
+   "path": "blk.44.lut.gguf",
+   "data_start": 9430144,
+   "bytes": 4067419264,
+   "payload_bytes": 4057989120,
+   "file_sha256": "5dec3c07a5758ad30c09848170d4955f0204fcb63372a24c40632b3277887545",
+   "payload_sha256": "c7cb56d02825f30dd4c8ce0e25f8604ae0ea4cb62b2c588bd5d9fda5a66d8246"
+  }
+ ]
+}

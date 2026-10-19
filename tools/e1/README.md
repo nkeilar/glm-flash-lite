@@ -29,8 +29,16 @@ For example, historical `blk.03.lut.gguf` is
 `2faa9a83a4064f010d26e68473f60563288d4c67c4ea231a3ec4a406095b4a6c`.
 Use the **newly generated** manifest for a public rebuild and generate new real
 quality reports bound to that bank. Do not substitute the reference manifest
-for files with different hashes. A future public reference build or independently
-published tensor-payload hashes is needed to close the historical comparison.
+for files with different hashes.
+
+**Tensor payloads are comparable.**
+- [`reference-payload.json`](reference-payload.json) has, for all 42 historical layers, the SHA-256 of each file
+  from its `data_start` to the end. That covers the tensor data only and excludes the GGUF metadata that carries
+  the imatrix filename.
+- The 42 payloads sum to exactly 143,879,307,264 bytes, the canonical bank size the preflight pins.
+- A rebuild whose payload hashes all match has the same quantised weights as the historical bank.
+- Determinism of the full public rebuild has not been demonstrated yet, so treat a match as confirmation and a
+  mismatch as a reason to investigate. Either way, serve with your own manifest and your own bank-bound reports.
 
 ## Prerequisites and capacity
 
@@ -202,17 +210,26 @@ python3 -m glm53.lut_manifest \
 This streams every file, checks its complete SHA against **its own generated
 manifest**, and verifies tensor names, types, dimensions, offsets, canonical
 bytes and TP2 row-scale arithmetic. It grants no quality or serving admission.
-Print the historical comparison hashes with:
+Compare your tensor payloads with the historical bank's (each file is hashed from its own `data_start`):
 
 ```bash
-python3 - <<'PY'
-import json
+python3 - <<'EOF'
+import hashlib, json
 from pathlib import Path
-reference = json.loads(Path('tools/e1/reference-bank.json').read_text())
-for row in reference['layers']:
-    a = row['artifact']
-    print(a['sha256'], a['path'])
-PY
+bank = Path('./e1-work/bank')
+mine = {row['layer']: row['artifact'] for row in json.loads((bank / 'e1-lut-bank.json').read_text())['layers']}
+ref = {row['layer']: row for row in json.loads(Path('tools/e1/reference-payload.json').read_text())['layers']}
+bad = 0
+for layer, r in sorted(ref.items()):
+    a = mine[layer]; h = hashlib.sha256()
+    with open(bank / a['path'], 'rb') as f:
+        f.seek(a['data_start'])
+        while chunk := f.read(64 << 20):
+            h.update(chunk)
+    ok = h.hexdigest() == r['payload_sha256']; bad += not ok
+    print('OK ' if ok else 'DIFF', layer, a['path'])
+print('all 42 tensor payloads match the historical bank' if not bad else f'{bad} layer(s) differ')
+EOF
 ```
 
 ## 5. Prepare real capture and the comparison weights
