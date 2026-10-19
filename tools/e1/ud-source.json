@@ -1,0 +1,89 @@
+{
+  "expert_tensors": [
+    {
+      "data_relative_offset": 2243121280,
+      "ggml_dimensions": [
+        2048,
+        4096,
+        288
+      ],
+      "name": "blk.3.ffn_down_exps.weight",
+      "shard": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "tensor_bytes": 1283457024,
+      "type_id": 23
+    },
+    {
+      "data_relative_offset": 3535491200,
+      "ggml_dimensions": [
+        4096,
+        2048,
+        288
+      ],
+      "name": "blk.3.ffn_gate_exps.weight",
+      "shard": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "tensor_bytes": 1038090240,
+      "type_id": 21
+    },
+    {
+      "data_relative_offset": 4587229312,
+      "ggml_dimensions": [
+        4096,
+        2048,
+        288
+      ],
+      "name": "blk.3.ffn_up_exps.weight",
+      "shard": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "tensor_bytes": 1038090240,
+      "type_id": 21
+    },
+    {
+      "data_relative_offset": 30524991104,
+      "ggml_dimensions": [
+        2048,
+        4096,
+        288
+      ],
+      "name": "blk.11.ffn_down_exps.weight",
+      "shard": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "tensor_bytes": 1981808640,
+      "type_id": 14
+    },
+    {
+      "data_relative_offset": 32515712640,
+      "ggml_dimensions": [
+        4096,
+        2048,
+        288
+      ],
+      "name": "blk.11.ffn_gate_exps.weight",
+      "shard": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "tensor_bytes": 1283457024,
+      "type_id": 23
+    },
+    {
+      "data_relative_offset": 33812817536,
+      "ggml_dimensions": [
+        4096,
+        2048,
+        288
+      ],
+      "name": "blk.11.ffn_up_exps.weight",
+      "shard": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "tensor_bytes": 1283457024,
+      "type_id": 23
+    }
+  ],
+  "original_summary_sha256": "4ad4aec5224b6db634ea05a81755a595fdcf13335ca449ce8bc9ac3fdef4b5a2",
+  "revision": "a38483c8cd5df544f53d70fb281afe97369d5ab6",
+  "schema": "e1-ud-source/v1",
+  "shards": [
+    {
+      "etag": "\"5df1eb43c672b2cafa4e3914e01c5eedeb1bf0101d9c0a70ea093b9eb2f11837\"",
+      "file": "UD-IQ4_XS/GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf",
+      "file_size": 49989334176,
+      "lfs_sha256": "7d64cf0395672c4322012841abec502ea7e20518299bb5e3069003f06f9e6de9",
+      "tensor_data_start": 30240
+    }
+  ],
+  "source_url": "https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/tree/a38483c8cd5df544f53d70fb281afe97369d5ab6/UD-IQ4_XS"
+}
