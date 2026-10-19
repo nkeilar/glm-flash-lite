@@ -8,8 +8,9 @@ which explains the design, the measurements and their limits. It is **not** reba
 
 On that box: `exact` mode 4.13 tok/s, upstream `fast` settings ~13.1-13.3 tok/s, this branch with the profile below
 **15.2 tok/s** decode (single stream, short prose prompt, greedy, thinking off, 131k context configured), and **~16.6 tok/s**
-with the N32CTRL decode flags and `GLM53_CT_TZC=1.3` (2026-10-16, 60 s greedy windows, ten alone). Your numbers will
-differ with your CPU, RAM channels and PCIe generation.
+with the N32CTRL decode flags and `GLM53_CT_TZC=1.3` (2026-10-16, 60 s greedy windows). With the opt-in **E1 lookup-table
+CPU tier** described below: **25.6-26.3 tok/s** (2026-10-19). Your numbers will differ with your CPU, RAM channels and
+PCIe generation.
 
 Every switch added here defaults to off (upstream behaviour). In the table, the bold value is the one in the measured profile.
 
@@ -38,35 +39,99 @@ Runtime endpoints added: `GET /ct_policy` (cost-model knobs without a restart), 
 check of the expert cache tables), `GET /ct_trace`, `GET /prof`, `GET /la`. Comment tags such as `[bdw-opt]`, `[E3]`,
 and `[E4]` name the experiment each change came from.
 
-### Experimental E1 multi-user split policy (T-82)
+## E1: lookup-table CPU expert tier (opt-in)
 
-For an already admitted LUT deployment, the default `GLM53_CT_LUT_BATCH_POLICY=shared` retains the existing
-measured profile/M rows and `GLM53_CT_MAXN<=8`. K is the number of distinct CPU-assigned experts across the
-whole batch, so that cap is shared by all users. The measured M rows reuse the same K experts for every token;
-they are a workload estimate when users route to different experts.
+The default CPU tier decodes each cold expert from the 3.05-bit EXL3 trellis copy. On Broadwell that decode, not RAM,
+is the bottleneck: it takes longer than reading the bytes. E1 replaces only the CPU's copy of the routed experts.
+- **Format:** IQ3_K gate/up and IQ4_KS down, quantised from Unsloth's Q8_0 GGUF with a per-expert importance matrix;
+  ~3.7 bits per weight.
+- **Decode:** the experts decode with small lookup tables.
+- **Layout:** half of every expert sits on each socket, with one worker pool per NUMA node, so both memory systems
+  stream at once.
 
-Opt in to the Python-only A/B with the following environment additions to the existing E1 launch command:
+The GPU path, the home copy the GPU reads, attention and the expert cache are unchanged. The trellis path compiles
+identically when `GLM53_CT_FORMAT` is unset.
+
+### Measured on the test box (2026-10-19)
+
+Decode, greedy, thinking off, 512-token essays; total tok/s with per-user in brackets:
+
+| Users at once | trellis (profile below) | E1, 8-bit activations, batch cap 32 |
+|---|---|---|
+| 1 | 16.7 | **25.6-26.3** |
+| 2 | 17.0 (8.5) | 22.4 (11.2) |
+| 4 | 17.1 (4.3) | **18.6 (4.7)** |
+
+- **Prefill, 8.5k prompt:** ~410 tok/s trellis, 442-446 E1.
+- **Long chats:** a soak of up to 97.5k-token chats with tool calls passed at ~21 tok/s.
+- **Errors:** 0 CPU-job timeouts and 0 failures over 111k calls.
+- **Accuracy:** per-expert output error against the Q8_0 model, on real decode activations:
+
+| Layer | trellis (median / weighted) | E1 (median / weighted) |
+|---|---|---|
+| 3 (ordinary recipe) | 0.0275 / 0.0271 | 0.0248 / 0.0240 (16-bit), 0.0253 / 0.0245 (8-bit) |
+| 11 (upgraded recipe) | 0.0390 / 0.0377 | 0.0082 / 0.0080 (16-bit), 0.0085 / 0.0083 (8-bit) |
+
+- A teacher-forced full-model panel against the trellis model's own answers scores top-1 0.942, KL 0.037. That panel's
+  reference was produced by trellis, so it can't rank the two formats; it only guards against breakage.
+- **Limits:**
+  - Only 2 of 42 layers have the Q8_0 comparison.
+  - The 8-bit numbers ran on a newer host kernel than the 16-bit ones.
+  - Everything was tuned on one Broadwell box; timings are measured there and will differ elsewhere.
+
+### Running it
+
+E1 needs four artifacts, and startup refuses without each one and its SHA-256 (no silent fallback):
+- the 42-layer bank and its `e1-lut-bank/v1` manifest;
+- a REAL-PASS quality report from replaying real activations;
+- a cost table measured on your own machine;
+- a receipt for the precompiled LUT modules. LUT serving never JIT-compiles.
+
+`tools/e1/README.md` is the end-to-end runbook to build them from Unsloth's public Q8_0 release; the bank is
+byte-reproducible and checkable against the published per-layer SHAs. The serving profile differs from the trellis
+profile below only in the CPU tier:
 
 ```bash
-export GLM53_CT_LUT_BATCH_POLICY=bounded GLM53_CT_MAXN=32
+# base (as below): GLM53_MODE=fast GLM53_CPU_TIER=1 GLM53_EC=1 GLM53_K_FTSPLIT=1 GLM53_K_HCFUSE=1 GLM53_K_OVL=1 GLM53_LA=1 ...
+export GLM53_CT_FORMAT=lut GLM53_CT_LUT_ACT=q8 \
+  GLM53_CT_LUT_MANIFEST=/path/e1-lut-bank.json \
+  GLM53_CT_LUT_QUALITY=/path/real-i16-bank.json   GLM53_CT_LUT_QUALITY_SHA256=<sha256> \
+  GLM53_CT_LUT_Q8_QUALITY=/path/real-q8-bank.json GLM53_CT_LUT_Q8_QUALITY_SHA256=<sha256> \
+  GLM53_CT_LUT_COST=/path/lut-cost-q8.json        GLM53_CT_LUT_COST_SHA256=<sha256> \
+  GLM53_CT_LUT_PRECOMPILE=/path/lut/reviewed-precompile.json GLM53_CT_LUT_PRECOMPILE_SHA256=<sha256> \
+  GLM53_CT_LUT_BATCH_POLICY=bounded GLM53_CT_MAXN=32 \
+  GLM53_ZC_HOME_NODE=0 GLM53_ZC_NODE1_ARENAS=10 \
+  GLM53_CT_CPUS=2-43 GLM53_CT_THREADS=0 GLM53_CT_COORD_CPU=0 GLM53_CT_MAXBSZ=4 GLM53_CT_SWIGLU_CLAMP=1 \
+  GLM53_CT_B=0.31 GLM53_CT_TZC=1.3 GLM53_CT_FORCE_N=-1
+# not used with E1: GLM53_CT_SWZ, GLM53_CT_SPLIT1, GLM53_CT_SOCKQ, GLM53_CT_P0BLK, GLM53_CT_CFLAGS (trellis-only)
 ```
 
-With `e1-entry.py`, set these values in `recipe.environment`; the entry point clears the inherited environment.
+RAM: the pinned home copy (~108 GB) plus the bank (134 GiB, half per socket); each NUMA node needs ~80 GB free when the
+bank loads. Load takes ~8 min.
 
-The effective cap becomes `min(MAXN,8*M)` for M=1..4. M=1 retains its original row, B and cap of at most 8;
-all K<=8 rows remain unchanged. For M>1, the existing GPU split extrapolation prices K>8 as
-`C_M(8) + B_M*(K-8)`, where `B_M=max(C_M(k)/k for k=1..8)` is derived separately for each admitted recipe/M.
-This tail is an **EST conservative heuristic**, not a measured K>8 cost or a proven upper bound.
-No native arithmetic or extension code changes are required. Startup requires `HEAD == receipt.source_revision`,
-so applying this Python-only commit still requires a reviewed revision-bound precompile receipt and recipe;
-the existing receipt does not work unchanged. Larger union caps change which experts run
-on the CPU, so full-model throughput and quality still need an A/B on the serving hardware.
+### E1 switches
 
-`/stats` and `/ct_policy` expose `lut_batch_policy` with the effective caps, profile/M tail slopes and model
-label. These are cost-model search caps: `force_n>=0` overrides `maxn`, as before, and remains limited to 0..8
-(-1 enables the cost model). Runtime `maxn` updates retain the per-M cap; manual or remote auto-B updates
-preserve the derived M>1 slopes. To restore the baseline, restart with
-`GLM53_CT_LUT_BATCH_POLICY=shared GLM53_CT_MAXN=8`.
+| env | values | what it does |
+|---|---|---|
+| `GLM53_CT_FORMAT` | (unset) · **`lut`** | `lut` loads the bank instead of the trellis CPU copy |
+| `GLM53_CT_LUT_ACT` | `i16` · **`q8`** | activations: exact two-part 16-bit dot, or 8-bit (15% cheaper per 3-expert call; needs a bank-bound Q8 report whose binding equals the I16 one) |
+| `GLM53_CT_LUT_MANIFEST`, `_QUALITY`, `_Q8_QUALITY`, `_COST`, `_PRECOMPILE` (+ `_SHA256`) | path + sha | the four admission artifacts; any mismatch refuses startup |
+| `GLM53_CT_LUT_BATCH_POLICY` | `shared` · **`bounded`** | how many distinct experts per *batch* the split may give the CPU (next section) |
+| `GLM53_CT_MAXN` | ≤ 8 (`shared`) · **32** (`bounded`) | that per-batch cap; runtime `GET /ct_policy?maxn=N` |
+| `GLM53_ZC_HOME_NODE` | -1 · **0** | pin the GPU's pinned home copy to the GPU's NUMA node (first touch otherwise follows the loader thread) |
+| `GLM53_ZC_NODE1_ARENAS` | **10** | the first N layers' home arenas prefer node 1, leaving room on node 0 for its half of the bank |
+| `GLM53_TF_DECODE` | 0 · 1 | `/generate` teacher-forced logprobs through decode steps (quality panels that must exercise the CPU tier) |
+
+### The batch policy (why multi-user needs `bounded`)
+
+The split counts K, the distinct CPU-assigned experts across the **whole batch**.
+- **`shared` caps K at 8 for the batch.** With 4 users there are up to 32 cold misses per layer, so ~24 of them go over
+  PCIe at ~1.3 ms each. The GPU lane becomes the bottleneck while the CPU idles. Measured: 4 users 6.6 tok/s total,
+  where trellis, uncapped, did 17.1.
+- **`bounded`** lets the cap be `min(MAXN, 8*M)` for M tokens per step. M=1 keeps its measured rows and a cap ≤ 8.
+- **Costs beyond K=8** are extrapolated per recipe and M as `C_M(8) + B_M*(K-8)`, with `B_M = max_k C_M(k)/k`. That's a
+  conservative estimate, not a measured cost. The live result at 4 users was 6.6 → 17.6 tok/s total with 16-bit
+activations (18.6 with 8-bit), with 1 user unchanged.
 
 ## The measured profile
 
