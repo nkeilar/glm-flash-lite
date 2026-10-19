@@ -8,8 +8,9 @@ which explains the design, the measurements and their limits. It is **not** reba
 
 On that box: `exact` mode 4.13 tok/s, upstream `fast` settings ~13.1-13.3 tok/s, this branch with the profile below
 **15.2 tok/s** decode (single stream, short prose prompt, greedy, thinking off, 131k context configured), and **~16.6 tok/s**
-with the N32CTRL decode flags and `GLM53_CT_TZC=1.3` (2026-10-16, 60 s greedy windows). With the opt-in **E1 lookup-table
-CPU tier** described below: **25.6-26.3 tok/s** (2026-10-19). Your numbers will differ with your CPU, RAM channels and
+with the N32CTRL decode flags and `GLM53_CT_TZC=1.3` (2026-10-16, 60 s greedy windows; 16.6 on the 512-token essay
+benchmark used for E1). With the opt-in **E1 lookup-table
+CPU tier** described below: **25.8 tok/s** (median of 3, 2026-10-19). Your numbers will differ with your CPU, RAM channels and
 PCIe generation.
 
 Every switch added here defaults to off (upstream behaviour). In the table, the bold value is the one in the measured profile.
@@ -58,7 +59,7 @@ Decode, greedy, thinking off, 512-token essays; total tok/s with per-user in bra
 
 | Users at once | trellis (profile below) | E1, 8-bit activations, batch cap 32 |
 |---|---|---|
-| 1 | 16.7 | **25.6-26.3** |
+| 1 | 16.6 (median of 3) | **25.8** (median; 25.6-26.3) |
 | 2 | 17.0 (8.5) | 22.4 (11.2) |
 | 4 | 17.1 (4.3) | **18.6 (4.7)** |
 
