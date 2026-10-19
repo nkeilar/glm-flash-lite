@@ -142,10 +142,10 @@ with everything else E1 needed), the batch cap and 8-bit activations.
 
 | # | Change | Hardware constraint it works around | Measured effect | Reusable for |
 |---|---|---|---|---|
-| 1 | **Table-lookup expert formats** (IQ3_K/IQ4_KS) instead of decoding the EXL3 trellis on the CPU | On AVX2 the trellis decode is compute-bound: ~0.84 cycles/weight against a 0.56 port bound, with the CPU lane reading only ~30 of 136 GB/s | Screen: 0.880 → 0.537 ms (16-bit), 0.428 ms (8-bit). Whole server: 16.7 → 21.7 tok/s in the first A/B; 16.6 → 25.8 today | Any AVX2-only CPU expert/GEMV path |
+| 1 | **Table-lookup expert formats** (IQ3_K/IQ4_KS) instead of decoding the EXL3 trellis on the CPU | On AVX2 the trellis decode is compute-bound (perf: ~0.84 cycles/weight against a 0.56 port bound), so a CPU job moved only ~30 GB/s | Screen: 0.880 → 0.537 ms (16-bit), 0.428 ms (8-bit). Whole server: 16.7 → 21.7 tok/s in the first A/B; 16.6 → 25.8 today | Any AVX2-only CPU expert/GEMV path |
 | 2 | **Split every expert across sockets** (TP=2: each node owns half the intermediate rows), one worker pool per NUMA node, memory bound with `MPOL_PREFERRED` | QPI: on this box, one pool spanning both sockets read 49 GB/s vs 95 GB/s for per-socket pools | 0.520 ms vs 0.574 interleaved vs 0.784 on one node (16-bit). Pitfall: an off-by-one in `maxnode` silently made "preferred" act as "local"; check placement with `get_mempolicy`/sampled pages | Any 2-socket host |
 | 3 | **Scale the CPU's per-batch expert cap with the batch** (`min(MAXN, 8·M)`, cap 32) | PCIe 3.0: each cold expert the cap pushes to the GPU costs ~1.3 ms of zero-copy reads (estimate), so a cap of 8 per batch starved the CPU with several users | 4 users 6.6 → 17.6 tok/s total, 2 users 15.4 → 22.7 (16-bit) | Any hybrid split that caps CPU work per batch rather than per token |
-| 4 | **Spin ~50 ms before sleeping** (was 2 ms), then futex | Deep C-states: a napping core wakes slowly, and the slowest of 42 workers gates every barrier | 1.10-1.30 ms napping vs 0.81 ms never napping | Any fork-join pool called every few ms |
+| 4 | **Spin ~50 ms before sleeping** (was 2 ms), then futex | Napping workers wake late (deep C-states are the likely cause; not measured), and the slowest of 42 workers gates the barrier | 1.10-1.30 ms napping vs 0.81 ms never napping | Any fork-join pool called every few ms |
 | 5 | **Software prefetch 16 rows ahead** (gate/up) and 48 (down) | Intel's L2 streamer stops at every 4 KiB page, so cold streams re-ramp | 0.880 → 0.745 ms (−15%); 24/72 rows gave 0.739 | Any cold streaming GEMV on Intel |
 | 6 | **Expert-major contiguous rows** | Long sequential streams for the prefetchers | 1.677 → 1.162 ms (integrated harness) | Any weight layout read by experts |
 | 7 | **8-bit activations** (Q8_K) | Fewer multiply/widen uops per weight | −15% at 3 experts, −33% at 8; live +2-4% at 1 user, 17.6 → 18.6 at 4 users. Accuracy still beats trellis on the measured layers | General |
@@ -155,8 +155,8 @@ with everything else E1 needed), the batch cap and 8-bit activations.
 
 **Measurement lessons that changed conclusions:**
 - **Flush caches on the node that owns the memory.** A benchmark fixture where a node-0 thread flushed node 1's lines
-  made node-1 workers 1.6× slower: 0.744 → 0.462 ms once fixed. That turned E1's cost gate from a fail (1.193 ms) into
-  a pass (0.587 ms).
+  made node-1 workers 1.6× slower: 0.744 → 0.462 ms once fixed, with prefetch held constant. Together with row prefetch,
+  it took E1's cost gate from a fail (1.193 ms) to a pass (0.587 ms).
 - **Measure at the real call cadence, with enough samples.** Calls were spaced 1.5 ms apart like decode. 31 samples per
   cell, because 7 samples gave non-monotonic curves (K=5 cheaper than K=4).
 - **Idle neighbours.** An idle trellis server's polling threads (~4 cores) contaminated CPU benchmarks on shared cores.
