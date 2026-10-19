@@ -2179,14 +2179,73 @@ void prepare_storage(Path path, int n, Activation &out, Kernel kernel) {
         }
     }
 }
+// Preserve the reference's first-maximum tie rule and separate multiply/add
+// roundings without disabling assertions elsewhere in this translation unit.
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+static void quantize_block_q8_K_avx2(const float *x, block_q8_K *y) {
+    const __m256 absmask=_mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    __m256 m0=_mm256_setzero_ps(),m1=m0,m2=m0,m3=m0;
+    __m256 invalid=m0;
+    const __m256 finite_max=_mm256_set1_ps(FLT_MAX);
+    for(int j=0;j<256;j+=32) {
+        const __m256 a0=_mm256_and_ps(_mm256_loadu_ps(x+j),absmask);
+        const __m256 a1=_mm256_and_ps(_mm256_loadu_ps(x+j+8),absmask);
+        const __m256 a2=_mm256_and_ps(_mm256_loadu_ps(x+j+16),absmask);
+        const __m256 a3=_mm256_and_ps(_mm256_loadu_ps(x+j+24),absmask);
+        m0=_mm256_max_ps(a0,m0); m1=_mm256_max_ps(a1,m1);
+        m2=_mm256_max_ps(a2,m2); m3=_mm256_max_ps(a3,m3);
+        invalid=_mm256_or_ps(invalid,_mm256_or_ps(
+            _mm256_or_ps(_mm256_cmp_ps(a0,finite_max,_CMP_NLE_UQ),_mm256_cmp_ps(a1,finite_max,_CMP_NLE_UQ)),
+            _mm256_or_ps(_mm256_cmp_ps(a2,finite_max,_CMP_NLE_UQ),_mm256_cmp_ps(a3,finite_max,_CMP_NLE_UQ))));
+    }
+    if(_mm256_movemask_ps(invalid)) {
+        // Retain the scalar reference's assertions and handling of all-NaN blocks.
+        std::memset(y,0,sizeof(*y)); quantize_row_q8_K_ref(x,y,256); return;
+    }
+    const __m256 m=_mm256_max_ps(_mm256_max_ps(m0,m1),_mm256_max_ps(m2,m3));
+    __m128 h=_mm_max_ps(_mm256_castps256_ps128(m),_mm256_extractf128_ps(m,1));
+    h=_mm_max_ps(h,_mm_movehl_ps(h,h)); h=_mm_max_ss(h,_mm_shuffle_ps(h,h,1));
+    const float amax=_mm_cvtss_f32(h);
+    y->sum=0;
+    if(!amax) { y->d=0; std::memset(y->qs,0,sizeof(y->qs)); std::memset(y->bsums,0,sizeof(y->bsums)); return; }
+    const __m256 vmax=_mm256_set1_ps(amax);
+    int first=0;
+    for(int j=0;j<256;j+=8) {
+        const int mask=_mm256_movemask_ps(_mm256_cmp_ps(_mm256_and_ps(_mm256_loadu_ps(x+j),absmask),vmax,_CMP_EQ_OQ));
+        if(mask) { first=j+__builtin_ctz(unsigned(mask)); break; }
+    }
+    const float iscale=-127.f/x[first];
+    if(!std::isfinite(iscale)) {
+        // Very small finite maxima can overflow the reciprocal scale.
+        std::memset(y,0,sizeof(*y)); quantize_row_q8_K_ref(x,y,256); return;
+    }
+    const __m256 vs=_mm256_set1_ps(iscale),magic=_mm256_set1_ps(12582912.f);
+    const __m256i low=_mm256_set1_epi32(0x007fffff),bias=_mm256_set1_epi32(0x00400000),cap=_mm256_set1_epi32(127);
+    const __m256i order=_mm256_setr_epi32(0,4,1,5,2,6,3,7),flip=_mm256_set1_epi8(char(0x80)),zero=_mm256_setzero_si256();
+    alignas(32) uint64_t sad[32];
+    for(int j=0;j<256;j+=32) {
+        __m256i q[4];
+        for(int k=0;k<4;++k) {
+            const __m256 v=_mm256_add_ps(_mm256_mul_ps(vs,_mm256_loadu_ps(x+j+8*k)),magic);
+            q[k]=_mm256_min_epi32(_mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(v),low),bias),cap);
+        }
+        __m256i b=_mm256_packs_epi16(_mm256_packs_epi32(q[0],q[1]),_mm256_packs_epi32(q[2],q[3]));
+        b=_mm256_permutevar8x32_epi32(b,order);
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(y->qs+j),b);
+        _mm256_store_si256(reinterpret_cast<__m256i *>(sad+j/8),_mm256_sad_epu8(_mm256_xor_si256(b,flip),zero));
+    }
+    for(int g=0;g<16;++g) y->bsums[g]=int16_t(int(sad[2*g]+sad[2*g+1])-2048);
+    y->d=1/iscale;
+}
+#pragma GCC pop_options
 void prepare_range(Path path, const float *x, int n, int begin, int end, Activation &out) {
     const int block=path==Path::Q8 ? 256 : 128;
     if(out.n!=n || out.path!=path || begin<0 || end>n || begin>end || begin%block || end%block)
         throw std::invalid_argument("invalid activation preparation range");
     if(path==Path::Q8) {
         auto *dst=reinterpret_cast<block_q8_K *>(out.q8.data())+begin/256;
-        std::memset(dst,0,size_t((end-begin)/256)*sizeof(block_q8_K));
-        quantize_row_q8_K_ref(x+begin,dst,end-begin);
+        for(int b=0;b<(end-begin)/256;++b) quantize_block_q8_K_avx2(x+begin+256*b,dst+b);
     } else {
         for(int b=begin/128;b<end/128;++b) {
             float amax=0;
