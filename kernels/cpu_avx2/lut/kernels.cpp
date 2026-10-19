@@ -720,9 +720,9 @@ struct Q4Bits {
         values[3] = dequant16(q4 + 64*j + 48);
     }
     inline __m256i dequant16(const uint8_t * qs) const {
-        const __m128i aux128 = _mm_loadu_si128((const __m128i *)qs);
-        const __m256i aux256 = MM256_SET_M128I(_mm_srli_epi16(aux128, 4), aux128);
-        return _mm256_and_si256(ml, aux256);
+        // Broadcast both lanes, then select the high nibbles in the upper lane.
+        const __m256i packed = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)qs));
+        return _mm256_and_si256(ml, _mm256_blend_epi32(packed, _mm256_srli_epi16(packed, 4), 0xF0));
     }
     __m256i values[4];
     const __m256i ml = _mm256_set1_epi8(0xf);
@@ -3043,8 +3043,8 @@ __attribute__((always_inline)) inline void optimized_impl(const void *row,const 
                     } else v=_mm256_shuffle_epi8(iq3unsigned,idx);
                 } else {
                     const int g=4*h+k;
-                    auto packed=_mm_loadu_si128(reinterpret_cast<const __m128i *>(deq.x[b].qs+16*g));
-                    auto idx=_mm256_and_si256(MM256_SET_M128I(_mm_srli_epi16(packed,4),packed),_mm256_set1_epi8(15));
+                    auto packed=_mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i *>(deq.x[b].qs+16*g)));
+                    auto idx=_mm256_and_si256(_mm256_blend_epi32(packed,_mm256_srli_epi16(packed,4),0xF0),_mm256_set1_epi8(15));
                     v=_mm256_shuffle_epi8(deq.values[deq.x[b].scales[g]&1],idx);
                 }
                 auto scales=_mm256_shuffle_epi8(all_scales[IQ3 ? h : 0],scale_shuffle);
@@ -3086,6 +3086,7 @@ __attribute__((always_inline)) inline void optimized_impl(const void *row,const 
                         if constexpr(IQ3) pairs=_mm256_maddubs_epi16(v,a);
                         else pairs=_mm256_maddubs_epi16(magnitude,_mm256_sign_epi8(a,v));
                         q8sum[m]=_mm256_add_epi32(q8sum[m],_mm256_madd_epi16(scales,pairs));
+                        if constexpr(!IQ3 && M>=2) asm("" : "+x"(q8sum[m]));
                     }
                 }
             }
@@ -3152,7 +3153,8 @@ void dot_multi(Format format,const void *row,const Activation *inputs,int n,int 
         throw std::invalid_argument("activation shape or path mismatch");
     if(kernel==Kernel::Baseline) { for(int t=0;t<m;++t) outputs[t]=dot(format,row,inputs[t],n); return; }
     const bool i16=inputs[0].path==Path::I16;
-    if(!i16 && m==1) { outputs[0]=dot(format,row,inputs[0],n); return; }
+    // IQ4 M1 has the same integer lanes and FMA order in the shared loop.
+    if(!i16 && m==1 && format!=Format::IQ4_KS) { outputs[0]=dot(format,row,inputs[0],n); return; }
     if(i16) for(int t=0;t<m;++t) if(inputs[t].kernel!=Kernel::Optimized)
         throw std::invalid_argument("optimized i16 kernel requires optimized activation preparation");
     if(format==Format::Q3_K || format==Format::Q4_K) {

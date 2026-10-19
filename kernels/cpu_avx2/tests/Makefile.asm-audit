@@ -8,7 +8,9 @@ OUT ?= build/iq3-asm-audit
 CAPTURE ?= ./activation   # real-activation capture dir: set CAPTURE=<dir>
 SRC := kernels/cpu_avx2/lut/kernels.cpp
 HDR := kernels/cpu_avx2/lut/kernels.h
-FLAGS := -O3 -mavx2 -mfma -mf16c -std=c++17 -fPIC -Ikernels/cpu_avx2
+FLAGS := -O3 -mavx2 -mfma -mf16c -std=c++17 -fPIC -Ikernels/cpu_avx2 \
+         -DFT_ENABLE_LUT=1 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1 \
+         -DFT_OPT_EXP_EXTRACT=1 -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1
 BDW := -mtune=broadwell -fno-semantic-interposition -flto
 SYMBOLS := _ZN8lutbench10dot_iq3_q8EPKvRKNS_10ActivationEi _ZN8lutbench23dot_iq3_q8_optimized_m2EPKvPKNS_10ActivationEiPf _ZN8lutbench23dot_iq3_q8_optimized_m4EPKvPKNS_10ActivationEiPf
 .PHONY: all test differential audit-a bench sweep disassemble clean
