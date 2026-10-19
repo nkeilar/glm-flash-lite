@@ -235,7 +235,9 @@ uint64_t trace_clock_ns() {
 }
 #endif
 struct Barrier {
-    std::atomic<unsigned> count{0}, epoch{0};
+    // Arrivals must not invalidate the separate cache line polled by waiters.
+    alignas(64) std::atomic<unsigned> count{0};
+    alignas(64) std::atomic<unsigned> epoch{0};
     unsigned n;
     explicit Barrier(unsigned size) : n(size) {}
     void wait() {
