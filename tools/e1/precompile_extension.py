@@ -27,9 +27,13 @@ from quantize_s1 import atomic_json
 
 REPOSITORY = Path(__file__).absolute().parents[2]
 SPLIT_SOURCE = 'kernels/k110/ft_split_fast.cu'
-FLAGS = ['-O3', '-mavx2', '-mfma', '-mf16c', '-mtune=generic', '-std=c++17',
+# Tuned for the Broadwell test box. -mtune changes speed only, never results (verified bit-exact); set it to your
+# CPU. LTO + -fno-semantic-interposition remove the per-row PLT dispatch. Never add -march=native, -DNDEBUG or
+# -ffp-contract: GCC would contract the Q8 activation quantiser into FMAs and change results.
+FLAGS = ['-O3', '-mavx2', '-mfma', '-mf16c', '-mtune=broadwell', '-fno-semantic-interposition', '-flto', '-std=c++17',
          '-DFT_OPT_BSUM_SHUF=1', '-DFT_OPT_FLOAT_EXTRACT=1',
          '-DFT_OPT_EXP_EXTRACT=1', '-DFT_OPT_BSUM_MADD_N=32', '-DFT_OPT_CTRL_REUSE=1']
+LDFLAGS = ['-lpthread', '-flto=auto', '-O3', '-mavx2', '-mfma', '-mf16c', '-mtune=broadwell', '-fno-semantic-interposition']
 
 
 def digest(path):
@@ -147,7 +151,7 @@ def compile_plan(spec):
             guard.enter_context(mock.patch.object(torch.cuda, name, side_effect=RuntimeError('precompile must not access CUDA')))
         from torch.utils import cpp_extension
         options = dict(name='ft_tier_host', sources=spec['sources'], build_directory=str(directory),
-                       extra_cflags=spec['flags'], extra_ldflags=['-lpthread'], with_cuda=False, verbose=True)
+                       extra_cflags=spec['flags'], extra_ldflags=LDFLAGS, with_cuda=False, verbose=True)
         if 'with_sycl' in inspect.signature(cpp_extension.load).parameters:
             options['with_sycl'] = False
         if spec['variant'] != 'capture':

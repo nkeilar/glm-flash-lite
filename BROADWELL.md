@@ -64,6 +64,20 @@ Decode, greedy, thinking off, 512-token essays; total tok/s with per-user in bra
 | 4 | 17.1 (4.3) | **18.6 (4.7)** |
 
 - **Prefill, 8.5k prompt:** ~410 tok/s trellis, 442-446 E1.
+
+**Assembly-level pass (2026-10-20).** A same-day A/B of the E1 build before and after the assembly pass described
+below. Same scripts, both measured that day:
+
+| Users at once | E1 before | E1 after (current code) |
+|---|---|---|
+| 1 | 25.3 (median of 3) | 25.3 (median of 5) |
+| 2 | 21.6 | 22.0 / 21.5 |
+| 4 | 18.3 | **21.85 / 21.83 (+19.6%)** |
+
+- **Prefill:** 435-441 before vs 420-434 after, which is within E1's day-to-day spread. Prefill doesn't use the
+  changed code.
+- **Day-to-day drift:** the 1-user medians differ from the 2026-10-19 table above (25.3 vs 25.8) between days, on the
+  unchanged build too.
 - **Long chats:** a soak of up to 97.5k-token chats with tool calls passed at ~21 tok/s.
 - **Errors:** 0 CPU-job timeouts and 0 failures over 111k calls.
 - **Accuracy:** per-expert output error against the Q8_0 model, on real decode activations:
@@ -171,6 +185,35 @@ with everything else E1 needed), the batch cap and 8-bit activations.
 - **IQ3_KS gate/up and Hadamard rotation:** fail the quality gate (layer 3 0.028-0.031 and 0.042 vs trellis 0.0275).
 - **Cross-token weight reuse:** decode is one token per sequence, and the experts of different users barely overlap.
 - **Row-interleaved repack and a fused per-expert kernel:** no gain while the batch cap or the formats limited.
+
+### Assembly-level pass (2026-10-20)
+
+The production `ft_tier_host.so` was disassembled and audited at the instruction level, using Ghidra, the uiCA
+Broadwell port model and timing on one spare core. The same GCC 13.3 reproduced it instruction for instruction, so
+every finding was checked against the real binary. Every change below is bit-exact against the previous binary, gated
+on 40,000 activation vectors, 512,000 dot products, millions of raw bit patterns and real-weight output hashes.
+
+| Finding | Fix | Effect |
+|---|---|---|
+| A finiteness check called a non-inlined function **per element**, and some checks ran twice | one vector compare per call, each check once | part of halving the fixed per-call path (57 → 27 µs at 42 cores) |
+| fp16 → fp32 input converted one element at a time | F16C, 8 at a time | same |
+| The Q8 activation quantiser stayed scalar: an `assert` (no `-DNDEBUG` in extension builds) blocked vectorisation | hand-written AVX2 version | 2295 → 279 cycles per 256 values |
+| Barrier arrival counter and release word shared a cache line with 20+ spinning threads | separate cache lines (ordering unchanged) | small |
+| IQ3 inner loop: two register spills per iteration plus stack-reloaded constants, which made it vulnerable to **4K aliasing** (at ~2% of stack layouts it ran 30-39% slower) | hand-written spill-free Broadwell assembly with **no stack access**, a 6-shift index unpack and a one-broadcast header | −11% / −20% / −21% cycles at 1/2/4 tokens per call |
+| IQ4 path: scalar per-group table select and duplicated loads | the optimised path for M=1, broadcast + blend nibble split | −5 to −10% |
+| Built with `-mtune=znver3` (inherited) on Broadwell; 3 PLT hops per row from default visibility | `-mtune=broadwell -fno-semantic-interposition -flto` | −3.5% kernel |
+
+**Lessons:**
+- **At 1 user the CPU job is not the bottleneck:** halving its fixed cost did not move 1-user tok/s. The gains show up
+  once several users keep the CPUs busy (+19.6% at 4 users).
+- **Never add `-DNDEBUG` or `-ffp-contract` to get vectorisation.** GCC 13 contracts `a*b+c` into FMA in C++ even with
+  `-std=c++17`, and that changed 6,416 of 40,000 quantised vectors in testing.
+- **A test whose reference calls the same kernels can't catch kernel changes.** Use a differential harness against the
+  previous binary.
+- **Single cost-table cells vary ±15-30% between repeats at K≥3.** Judge builds by live A/B, not by a cell.
+- **Ruled out on this CPU:** activation-side lookup tables (T-MAC style) and precomputed codebook-product tables, 8-13×
+  slower than `vpmaddubsw` on Broadwell's single shuffle port; and a transposed 3-bit trellis, whose port-throughput
+  floor is above the break-even point in every case.
 
 ## The measured profile
 
