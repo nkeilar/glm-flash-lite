@@ -10,7 +10,8 @@ On that box: `exact` mode 4.13 tok/s, upstream `fast` settings ~13.1-13.3 tok/s,
 **15.2 tok/s** decode (single stream, short prose prompt, greedy, thinking off, 131k context configured), and **~16.6 tok/s**
 with the N32CTRL decode flags and `GLM53_CT_TZC=1.3` (2026-10-16, 60 s greedy windows; 16.6 on the 512-token essay
 benchmark used for E1). With the opt-in **E1 lookup-table
-CPU tier** described below: **25.8 tok/s** (median of 3, 2026-10-19). Your numbers will differ with your CPU, RAM channels and
+CPU tier** described below: **29 tok/s** at one user and 30 total across four users (2026-10-20, two configuration
+fixes on top of E1). Your numbers will differ with your CPU, RAM channels and
 PCIe generation.
 
 Every switch added here defaults to off (upstream behaviour). In the table, the bold value is the one in the measured profile.
@@ -78,9 +79,21 @@ below. Same scripts, both measured that day:
   changed code.
 - **Day-to-day drift:** the 1-user medians differ from the 2026-10-19 table above (25.3 vs 25.8) between days, on the
   unchanged build too.
-- **Long chats:** a soak of up to 97.5k-token chats with tool calls passed at ~21 tok/s.
-- **Errors:** 0 CPU-job timeouts and 0 failures over 111k calls.
-- **Accuracy:** per-expert output error against the Q8_0 model, on real decode activations:
+
+**Two configuration fixes (2026-10-20, current).** The same E1 build, plus the server's main thread pinned to a free
+core and `GLM53_CT_TZC=3.0` (both explained below). Measured the same day after a restart, with the same scripts:
+
+| Users at once | E1 build as above | **+ pinned main thread + `GLM53_CT_TZC=3.0`** |
+|---|---|---|
+| 1 | 25.3 | **28.2 / 29.3 / 29.9 / 28.6** (median 29.0) |
+| 2 | 22.0 / 21.5 | **27.5 / 28.0** |
+| 4 | 21.85 / 21.83 | **30.1 / 30.4** |
+
+- **Prefill:** 438-445.
+- **Current-run checks:** 0 CPU-job timeouts and 0 failures.
+- **Earlier soak (2026-10-18, before these fixes):** chats of up to 97.5k tokens with tool calls passed at ~21 tok/s.
+- **Earlier error check (2026-10-19, before these fixes):** 0 CPU-job timeouts and 0 failures over 111k calls.
+- **Earlier accuracy replays (unchanged by the 2026-10-20 fixes, which are bit-exact or scheduling-only):** per-expert output error against the Q8_0 model, on real decode activations:
 
 | Layer | trellis (median / weighted) | E1 (median / weighted) |
 |---|---|---|
@@ -117,12 +130,19 @@ export GLM53_CT_FORMAT=lut GLM53_CT_LUT_ACT=q8 \
   GLM53_CT_LUT_BATCH_POLICY=bounded GLM53_CT_MAXN=32 \
   GLM53_ZC_HOME_NODE=0 GLM53_ZC_NODE1_ARENAS=10 \
   GLM53_CT_CPUS=2-43 GLM53_CT_THREADS=0 GLM53_CT_COORD_CPU=0 GLM53_CT_MAXBSZ=4 GLM53_CT_SWIGLU_CLAMP=1 \
-  GLM53_CT_B=0.31 GLM53_CT_TZC=1.3 GLM53_CT_FORCE_N=-1
+  GLM53_CT_B=0.31 GLM53_CT_TZC=3.0 GLM53_CT_FORCE_N=-1   # TZC 3.0, not 1.3, with the bounded policy: see "Two configuration fixes"
 # not used with E1: GLM53_CT_SWZ, GLM53_CT_SPLIT1, GLM53_CT_SOCKQ, GLM53_CT_P0BLK, GLM53_CT_CFLAGS (trellis-only)
 ```
 
 RAM: the pinned home copy (~108 GB) plus the bank (134 GiB, half per socket); each NUMA node needs ~80 GB free when the
 bank loads. Load takes ~8 min.
+
+Once `/health` answers, pin the server's main thread to a core outside `GLM53_CT_CPUS` and the coordinator CPU. On the
+test box that's core 1 (CPUs 1 and 45). The main thread queues every GPU kernel:
+
+```bash
+taskset -p -c 1,45 <server pid>     # the main thread's TID is the PID; threads created earlier keep their affinity
+```
 
 ### E1 switches
 
@@ -204,8 +224,12 @@ on 40,000 activation vectors, 512,000 dot products, millions of raw bit patterns
 | Built with `-mtune=znver3` (inherited) on Broadwell; 3 PLT hops per row from default visibility | `-mtune=broadwell -fno-semantic-interposition -flto` | −3.5% kernel |
 
 **Lessons:**
-- **At 1 user the CPU job is not the bottleneck:** halving its fixed cost did not move 1-user tok/s. The gains show up
-  once several users keep the CPUs busy (+19.6% at 4 users).
+- **Halving the CPU job's fixed cost did not move 1-user tok/s, but the CPU is still on the 1-user critical path.**
+  - Before the configuration fixes, the GPU waited 15.3 ms of a 39.1 ms token for the CPU's result.
+  - A typical 1-user job used about 4 cold experts and mostly streamed weights from RAM. Some larger cost-table cells
+    measured slower in this build, amid substantial repeat noise.
+  - My explanation for the +19.6% at 4 users is that cheaper cost-table cells shifted more work to the CPU (next
+    section). I did not measure the policy's contribution separately.
 - **Never add `-DNDEBUG` or `-ffp-contract` to get vectorisation.** GCC 13 contracts `a*b+c` into FMA in C++ even with
   `-std=c++17`, and that changed 6,416 of 40,000 quantised vectors in testing.
 - **A test whose reference calls the same kernels can't catch kernel changes.** Use a differential harness against the
@@ -214,6 +238,44 @@ on 40,000 activation vectors, 512,000 dot products, millions of raw bit patterns
 - **Ruled out on this CPU:** activation-side lookup tables (T-MAC style) and precomputed codebook-product tables, 8-13×
   slower than `vpmaddubsw` on Broadwell's single shuffle port; and a transposed 3-bit trellis, whose port-throughput
   floor is above the break-even point in every case.
+
+### Two configuration fixes (2026-10-20)
+Both came from reading the combine kernel's counters (`/stats`: `gpu_wait_ms_per_job` = GPU time spent waiting for the
+CPU's partial result; `gpu_late` = layers where the CPU was already done) instead of guessing.
+
+**1. Give the GPU's launch thread its own core.**
+- **The problem:** the server's main thread queues every GPU kernel, but its affinity covered all 88 CPUs. I found it
+  on CPU 22, alongside a spinning CPU-tier worker.
+- **The test:** I ran unpinned, pinned, unpinned, then pinned, with two 1-user runs in each round:
+
+  | Round | Main thread | tok/s |
+  |---|---|---|
+  | 1 | unpinned | 25.47 / 25.38 |
+  | 2 | pinned | 28.27 / 28.73 |
+  | 3 | unpinned | 24.58 / 23.07 |
+  | 4 | pinned | 28.81 / 28.68 |
+
+  The pinned runs stayed between 28.27 and 28.81 tok/s in this test.
+
+**2. Don't price the CPU as if users share experts.**
+- **The measurement:** four single-user decodes with different prompts were traced and overlaid layer by layer, as if
+  batched.
+  - 96.2% of the cold experts four users need are needed by only one of them; sharing saves 4% of the weight bytes.
+  - The policy's M=2/4 cost rows were measured with all tokens using the same experts, which is far costlier per
+    expert. So the policy over-priced the CPU.
+- **The effect:** at 4 users it shipped ~2.3 experts per layer over PCIe (the policy prices each at 1.3 ms, from an earlier estimate), and the GPU
+  was the slower side in 92% of measured MoE-layer combines while the CPUs had slack.
+- **The workaround:** `GLM53_CT_TZC`, the policy's assumed PCIe cost per expert. Raising it moves those experts back to
+  the CPU.
+- **One user:** in the tested workload I saw no PCIe spills at either setting. With the launch thread pinned, TZC 1.3
+  gave 28.62/29.23 tok/s and 3.0 gave 29.28/28.72, with no clear change.
+- **4 users:** one unpinned run per setting gave the totals below. The 2-user sweep did not show the same trend.
+
+  | `GLM53_CT_TZC` | 1.3 | 2.0 | 2.5 | 3.0 | 4.0 |
+  |---|---|---|---|---|---|
+  | 4 users | 21.22 | 26.89 | 27.47 | 29.33 | 29.25 |
+
+- **The proper fix** is cost rows measured with realistic (disjoint) routing; until then 3.0 compensates.
 
 ## The measured profile
 
