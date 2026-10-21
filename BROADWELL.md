@@ -28,6 +28,7 @@ Every switch added here defaults to off (upstream behaviour). In the table, the 
 | `GLM53_CT_BUILD` | path | separate JIT build dir per flag set, so variants don't overwrite each other | |
 | `GLM53_ZC_THP` | 0 · **1** | pinned expert arena backed by 2 MB pages (mmap + `MADV_HUGEPAGE` before first touch) | prefill +4-5%, decode tie; needs THP `madvise` or `always` |
 | `GLM53_LA` | 0 · **1** | decode lookahead (ported from upstream `1f6d74e`); runtime `GET /la?on=0\|1` | +3.3%; greedy-identical in `exact` mode |
+| `GLM53_RC_PAGE` | 0 · **1** | one prefill forward per agent turn: snapshot the KDA state at every page during decode and drop exllamav3's separate last-page prefill forward; runtime `GET /rc?mode=page\|stock`; serve with `-rcs 24` | time to first token after a tool result 18.9 → 9.3 s (see "Agent turns") |
 | `GLM53_CT_SWIGLU_CLAMP` | 0 · **1** | apply the model's `swiglu_limit` (10) in the CPU path, as the GPU path does | correctness: CPU-path panel top-1 0.9842 → 0.9865 |
 | `GLM53_EC_BG` | 0 · **1** | background admission into the VRAM expert cache on a copy stream (`GLM53_EC_BG_*` tune it) | flat on one GPU; +10% with the remote tier |
 | `GLM53_CT_FUSE`, `GLM53_CT_FUSE_MAXN`, `GLM53_CT_PF_LEAN` | 0 · **1** | CPU job overhead trims (1-expert fused jobs, lean prefetch) | CPU job −1.5%, < 1% tok/s |
@@ -40,6 +41,7 @@ Every switch added here defaults to off (upstream behaviour). In the table, the 
 Runtime endpoints added: `GET /ct_policy` (cost-model knobs without a restart), `GET /ec_verify` (exact consistency
 check of the expert cache tables), `GET /ct_trace`, `GET /prof`, `GET /la`. Comment tags such as `[bdw-opt]`, `[E3]`,
 and `[E4]` name the experiment each change came from.
+`GET /rc?mode=page|stock` switches `GLM53_RC_PAGE` at runtime.
 
 ## E1: lookup-table CPU expert tier (opt-in)
 
@@ -131,6 +133,7 @@ export GLM53_CT_FORMAT=lut GLM53_CT_LUT_ACT=q8 \
   GLM53_ZC_HOME_NODE=0 GLM53_ZC_NODE1_ARENAS=10 \
   GLM53_CT_CPUS=2-43 GLM53_CT_THREADS=0 GLM53_CT_COORD_CPU=0 GLM53_CT_MAXBSZ=4 GLM53_CT_SWIGLU_CLAMP=1 \
   GLM53_CT_B=0.31 GLM53_CT_TZC=3.0 GLM53_CT_FORCE_N=-1   # TZC 3.0, not 1.3, with the bounded policy: see "Two configuration fixes"
+export GLM53_RC_PAGE=1      # agent turns: one prefill forward instead of two; add -rcs 24 to the serve.py arguments
 # not used with E1: GLM53_CT_SWZ, GLM53_CT_SPLIT1, GLM53_CT_SOCKQ, GLM53_CT_P0BLK, GLM53_CT_CFLAGS (trellis-only)
 ```
 
@@ -276,6 +279,70 @@ CPU's partial result; `gpu_late` = layers where the CPU was already done) instea
   | 4 users | 21.22 | 26.89 | 27.47 | 29.33 | 29.25 |
 
 - **The proper fix** is cost rows measured with realistic (disjoint) routing; until then 3.0 compensates.
+
+### Agent turns: one prefill pass instead of two (2026-10-21)
+The benchmarks above are decode speed and one long prompt. A coding agent works differently: every turn resends the
+whole conversation (70-80k tokens for mine) with a short tool result appended, and waits for the first token of the
+reply. I fitted the logged duration of 216 such turns as `fixed + output / decode rate + new prompt / prefill rate`.
+The fixed term was **15.6 s per turn**, 26% of all wall time, although the median turn added only 222 new tokens.
+
+**Where it went.** One small prefill pass on this box reads nearly the whole non-cached expert bank over PCIe. The new
+tokens touch almost every expert of every layer, and the bank is in host RAM.
+- **Prefill size vs time** (time to first token, after a cached 32k-token context):
+
+  | New tokens | 4 | 64 | 256 |
+  |---|---|---|---|
+  | Time to first token | 0.31 s | 4.8 s | 8.2-8.4 s |
+
+  - The 4-token case fits the CPU tier's M ≤ 4, so nothing streams.
+  - `nvidia-smi dmon` showed the 256-token pass reading over PCIe at 10-11 GB/s for its whole duration, about 90 GB.
+- **And a turn ran two such passes.** GLM-5.3's 34 KDA (linear attention) layers keep a running state instead of a KV
+  cache, so exllamav3 can only resume a prompt from a snapshot of that state taken at a page boundary.
+  - To keep one at the end of every prompt, it prefills the last partial page as a separate forward pass
+    (`Job.prefill`: "a separate forward pass for the last page").
+  - Its other snapshots land every 2,048 tokens.
+  - So a turn restored the previous prompt's last page and re-prefilled the previous reply plus the tool result in two
+    passes, each reading the bank over PCIe.
+- **Two realistic back-to-back turns took 16.2 and 15.4 s**, with PCIe saturated throughout.
+
+**The fix** (`GLM53_RC_PAGE=1`, `glm53/k_rcpage.py`): take the snapshot at every page boundary while the reply is
+generated (interval 256), and drop the separate last-page pass.
+- **One pass per turn:** the next turn restores within 255 tokens of where its prompt changes and prefills in one pass.
+- **Snapshot cost:** about 145 MB of state each (34 layers × 64 heads × 128×128 fp32). Copying one costs nothing
+  measurable in decode.
+- **Snapshot cache:** the default 4 GB cache holds only ~27, so I serve with `-rcs 24`.
+- **Lookahead safety:** decode lookahead never runs across a page boundary, so a snapshot always matches its position.
+- **Same-server A/B:** `GET /rc?mode=page|stock` switches it live.
+
+**Measured (one user):**
+
+| | Before (stock) | After (page) |
+|---|---|---|
+| Time to first token after a tool result, 10 replayed agent sessions (26-58k context), n = 18 / 19 | 18.9 s | **9.3 s** |
+| The same, a live coding agent (pi) writing and editing files, same task per mode, n = 11 / 13 | 17.3 s | **9.5 s** |
+| Decode | 25.4 tok/s | 25.2 tok/s (no difference beyond noise) |
+| Greedy tokens of a restored turn matching a cache-free reference forward | 96.3% | **96.6%** (unrestored control: 96.5%) |
+
+The ~3.5% of misses is the CPU tier's LUT quantisation against the reference's GPU experts. A snapshot from the wrong
+position would collapse that number.
+
+**Where it doesn't help.**
+- **A user message right after a reply that was cut short:** the prompt changes just after the previous prompt's end,
+  so the turn restores from further back, ~2-3 s slower.
+- **A user message after a long tool loop:** GLM's template drops the earlier reasoning, so both modes re-prefill tens
+  of thousands of tokens.
+- **Unchanged:** the first turn of a conversation, and the decode benchmarks.
+
+**What's left:** each turn is still one pass over the cold bank on PCIe, ~8 s. Computing those experts on the CPU from
+RAM, as the decode path already does, is the next lever.
+
+**A negative result on the way: prompt-lookup speculative decoding.**
+- **The replay:** I replayed 1,672 logged agent requests (1.64M output tokens) through a suffix-matching drafter that
+  needs no VRAM, priced with this box's measured verify cost.
+- **The result:** **+3% decode at best; a perfect-knowledge oracle only +16%.**
+- **Why:** verifying k drafted tokens costs ~0.5 token each here. The CPU lane is bandwidth-bound, and the distinct cold
+  experts grow almost linearly with the window, so even a perfect 8-token copy gains only 1.7× per step. Most output is
+  reasoning, which rarely repeats the context.
 
 ## The measured profile
 

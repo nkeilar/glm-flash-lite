@@ -11,6 +11,8 @@ Offload stack (each piece is a monkeypatch around stock exllamav3, enabled by en
   k_overlap.py     GLM53_K_OVL=1        shared expert on a side stream in decode (not bitwise: ~2e-3 rel per layer)
   k_lookahead.py   GLM53_LA=1           C1 decode lookahead: next step enqueued on the device token (bit-exact)
                                         [ported from upstream glm-flash-lite 1f6d74e]
+  k_rcpage.py      GLM53_RC_PAGE=1      one prefill forward per agent turn: KDA snapshots at every page in decode, no
+                                        separate last-page prefill forward (serve with -rcs 24)
 
 Endpoints
   GET  /health, /v1/models, /server_info, /stats
@@ -95,6 +97,10 @@ def load():
     if os.environ.get("GLM53_LA") == "1":   # N136: decode lookahead (next forward enqueued before the token is read)
         k_lookahead.install(model)
         k_lookahead.set_enabled(os.environ.get("GLM53_LA_ON", "1") == "1")
+    if os.environ.get("GLM53_RC_PAGE") == "1":   # one prefill forward per agent turn (before the generator exists)
+        import k_rcpage
+        k_rcpage.set_mode("page" if os.environ.get("GLM53_RC_PAGE_ON", "1") == "1" else "stock")
+        k_rcpage.install()
     t_load = time.time() - t_load
     print(f" -- loaded in {t_load:.1f} s", flush=True)
 
@@ -580,6 +586,9 @@ async def stats():
     if os.environ.get("GLM53_LA") == "1":
         import k_lookahead
         st["k_lookahead"] = k_lookahead.summary()
+    if os.environ.get("GLM53_RC_PAGE") == "1":
+        import k_rcpage
+        st["k_rcpage"] = k_rcpage.summary()
     return JSONResponse(st)
 
 
@@ -650,6 +659,20 @@ async def prof(seconds: float = 4.0, tag: str = "prof"):
     with open(os.path.join(d, tag + ".txt"), "w") as f:
         f.write(f"window {dt:.2f} s, CPU-tier calls {calls} (~{calls / 42:.0f} decode tokens)\n{table}\n")
     return JSONResponse({"seconds": round(dt, 2), "tokens_approx": round(calls / 42), "trace": os.path.join(d, tag + ".json")})
+
+
+@app.get("/rc")
+async def rc(mode: str = "page"):
+    """Runtime switch of k_rcpage (GLM53_RC_PAGE=1): page = one prefill forward per agent turn, stock = exllamav3's
+    snapshots, for same-server A/B. Refused while a job is running."""
+    import k_rcpage
+    if not k_rcpage.summary()["installed"]:
+        return JSONResponse({"error": "start the server with GLM53_RC_PAGE=1"}, status_code=400)
+    if mode not in ("page", "stock"):
+        return JSONResponse({"error": "mode must be page or stock"}, status_code=400)
+    if len(G["gen"].jobs):
+        return JSONResponse({"error": "busy: switch /rc only while no job is running", **k_rcpage.summary()}, status_code=409)
+    return JSONResponse({"mode": k_rcpage.set_mode(mode), **k_rcpage.summary()})
 
 
 @app.get("/la")
