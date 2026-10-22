@@ -129,12 +129,18 @@ void check_startup_headroom(uint64_t host_available, const std::array<uint64_t, 
                             const std::array<uint64_t, 2>& remaining_mapped);
 void check_memory_limit(uint64_t limit, uint64_t current, uint64_t additional);
 using Routes = std::vector<std::vector<std::pair<int, float>>>;
+inline constexpr int kGroupedMaxTokens = 1024;
+inline constexpr int kGroupedMaxRowsPerExpert = 64;
+inline constexpr int kGroupedChunkRows = 512;
 
 class Backend {
 public:
     // Offline fixtures have at most eight experts and 256 MiB aggregate payload.
     // This API never starts a GPU ingress coordinator or authorizes serving.
     static std::unique_ptr<Backend> offline_fixture(const Options& options);
+    // Explicit timing-only fixture: one layer, Q8, virtual TP2, <=288 experts,
+    // and <=4 GiB aggregate weight payload. Never authorizes serving.
+    static std::unique_ptr<Backend> grouped_benchmark_fixture(const Options& options);
     // Descriptors must come from independently SHA-verified manifest/GGUF bytes.
     // The native loader rechecks open-file/path identities and every extent.
     // This factory does not admit real quality or start a GPU coordinator.
@@ -149,6 +155,21 @@ public:
     // Ingress-only fast path: the caller must have checked every x element for
     // finiteness without changing x since that check. Other validation is unchanged.
     void forward_finite_input(int internal_li, const float* x, int ntok, const Routes& routes, float* output, uint64_t remaining_ms = 0);
+    // Expert-major Q8 prefill. Caller arrays remain immutable until return.
+    // Validation/busy failures do not publish work or change output. Runtime
+    // failures drain the pools and permanently cancel this backend. A zero
+    // budget uses the configured job timeout; otherwise one budget covers the
+    // entire call. chunks, if supplied, counts attempted nonempty chunks.
+    bool forward_grouped(int internal_li, const uint16_t* x_f16, int ntok,
+                         int nexp, const int32_t* experts, const int32_t* offsets,
+                         const int32_t* row_token, const float* row_weight,
+                         float* output, double remaining_ms, std::string* why);
+    bool forward_grouped(int internal_li, const uint16_t* x_f16, int ntok,
+                         int nexp, const int32_t* experts, const int32_t* offsets,
+                         const int32_t* row_token, const float* row_weight,
+                         float* output, double remaining_ms, std::string* why, int* chunks);
+    bool grouped_ready() const;
+    bool grouped_runtime_failed() const;
     Receipt receipt() const;
     // Sticky cooperative cancellation; current generations still drain before
     // forward returns, and later jobs are rejected. Safe from another thread.
@@ -159,6 +180,8 @@ public:
     void inject_failure(int phase, int group = 1);
     void inject_delay(int phase, int group, unsigned milliseconds);
     void fixture_set_timeout(uint64_t milliseconds);
+    // Whole experts are never split, even when one exceeds this test cap.
+    void fixture_set_grouped_chunk_rows(int rows);
     // Flush only owned loaded fixture weight cache lines (<=256 MiB total).
     // Serialized with forward/load/shutdown; returns flushed payload bytes.
     uint64_t fixture_flush_weights();

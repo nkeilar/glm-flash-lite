@@ -155,7 +155,9 @@ root (no Torch or CUDA required):
 
 ```bash
 g++ -std=c++17 -O3 -Wall -Wextra -Werror -mavx2 -mfma -mf16c \
-  -mtune=znver3 -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1 -pthread \
+  -mtune=broadwell -fno-semantic-interposition -flto \
+  -DFT_OPT_BSUM_SHUF=1 -DFT_OPT_FLOAT_EXTRACT=1 -DFT_OPT_EXP_EXTRACT=1 \
+  -DFT_OPT_BSUM_MADD_N=32 -DFT_OPT_CTRL_REUSE=1 -pthread \
   kernels/cpu_avx2/tests/lut_backend_test.cpp kernels/cpu_avx2/ft_lut.cpp \
   kernels/cpu_avx2/lut/kernels.cpp -o /tmp/lut-backend-test
 /tmp/lut-backend-test
@@ -171,9 +173,68 @@ preserved in `kernels/cpu_avx2/lut/LICENSE`. The serving copy's aligned allocato
 uses fresh anonymous mappings with normal-page first touch, retaining the worker's
 preferred NUMA policy; this prevents reused libc heap pages from inheriting another
 node's residency across backend resets. Codec arithmetic is unchanged. Scratch
-receipts distinguish payload from page-rounded mapped bytes; the 32 MiB per-node
-scratch bound applies to mapped bytes. No page migration or global policy changes
+receipts distinguish payload from page-rounded mapped bytes; the mapped scratch
+bound is 48 MiB per group for Q8 (including grouped prefill) and 32 MiB for I16.
+No page migration or global policy changes
 are used.
+
+The Q8 LUT backend also accepts expert-major CPU prefill through
+`tier_lut_forward_grouped(layer, x_f16, experts, offsets, row_token, row_weight,
+out, timeout_ms)`, returning `(ok, why, ms, chunks)`. All tensors are contiguous
+CPU tensors: input is fp16 `[T,H]`, output is fp32 `[T,H]`, routing indices are
+int32 vectors, and routing weights are fp32. `offsets` has one more element than
+`experts`, starts at zero, and ends at the number of routing rows. Experts ascend
+strictly, as do token IDs within each expert. Limits are 1,024 tokens, 64 rows per
+expert, and 512 rows per chunk; each expert stays in one chunk. Tiles contain four
+rows followed by the remainder, with three rows evaluated as two plus one.
+Both TP2 partials accumulate across chunks and merge once, preserving decode bits
+when expert tile shapes match. Tokens without routes receive zeros.
+
+`tier_lut_build_grouped_rows(sel, w, take, E)` builds the four routing vectors in
+`O(T*K + E)` time from CPU int64 selections, fp16/fp32 weights, and a uint8 expert
+mask. Half weights convert to float with F16C, matching decode ingress.
+`tier_lut_grouped_ready()` observes backend readiness without waiting; it does
+not reserve execution. A concurrent coordinator returns `busy`. Grouped calls
+release the GIL and share arbitration with the whole decode coordinator job.
+Invalid input and busy calls leave output untouched. Runtime failures and
+timeouts drain both pools, leave output untouched, and remain sticky until reset.
+One absolute deadline covers every chunk. I16 grouped calls are rejected.
+
+At H=4096 and I=2048 with 4 KiB pages, each Q8 group owns 22,722,560 bytes
+of scratch payload in 26,411,008 mapped bytes (25.1875 MiB), including decode.
+Grouped scratch adds 24 MiB of mappings: 4 MiB input Q8, 2 MiB hidden Q8,
+2 MiB hidden floats, and 16 MiB partials. The I16 mapped ledger remains
+4,849,664 bytes per group. Allocation and first touch happen on each group's
+worker, and all mappings contribute to the placement receipt.
+
+The standalone test additionally checks grouped/decode bit parity, every expert
+row count from 5 through 64 against an independent packed-slice oracle, chunk
+boundaries, and sticky numerical/deadline failures. Its oracle checks intermediate
+finite products, preserving decode's separate multiply/add rounding under
+production compiler flags. The fixture-only chunk cap keeps experts intact even
+when an expert exceeds the requested test cap.
+
+For a synthetic workstation timing comparison, run the standalone binary with
+`--grouped-timing` (defaults: 250 experts, 10 rows each, H4096/I2048, three samples).
+Optional arguments are `--grouped-timing EXPERTS ROWS H I REPS`. A separate
+Q8 virtual-TP2 benchmark factory permits one layer, at most 288 experts, and at
+most 4 GiB of owned packed weights; ordinary fixture and serving admission keep
+their existing limits. Timings compare grouped execution with repeated decode
+calls using identical expert tiles. Repeated decode receives preconverted input
+and excludes assembly of the calls into a full output, so this measures backend
+work rather than a complete prefill pipeline. It is not NUMA or serving evidence.
+
+The 2026-10-22 i9-14900KS workstation run, five workers in virtual groups of two
+and three, measured median 284.700 ms grouped versus 308.384 ms for 750 decode
+calls, using the default 250-expert/10-row benchmark (five grouped chunks,
+2,924,544,000 owned packed bytes). Both production and contraction-disabled
+builds passed 64 grouped/decode bit comparisons, 120 independent oracle cases,
+16 forced-chunk cases, boundary/failure tests, and the existing 664 cases.
+ASan/UBSan and TSan also passed. Run-34 decode gates retained FNV
+`d426d710801c7ec8`, matched 36/36 real-weight cases, and found zero differences
+in 40,000 activation vectors and 512,000 dot outputs. The PyTorch extension suite
+passed 13 of 15 tests, including actual layer-3/11 packed bytes; two remote tests
+were skipped because this sandbox forbids loopback sockets (`EPERM`).
 
 An additional opt-in test builds the default host extension and both LUT compiler
 modes with an installed PyTorch. It blocks CUDA entrypoints, limits builds to two

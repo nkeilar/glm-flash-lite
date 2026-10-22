@@ -89,6 +89,10 @@ struct Tier
     double lut_deadline = 0;
     int64_t lut_generation = 0;
     std::atomic<bool> lut_active{false};
+    std::atomic<bool> lut_sticky{false};
+    // Serializes a whole coordinator job (including remote work) with grouped
+    // prefill; the backend's own try-lock also protects its compute scratch.
+    std::mutex lut_job_mutex;
     std::atomic<unsigned> lut_waiters{0};
     std::atomic<long> lut_failed{0}, lut_completed{0};
     std::mutex lut_error_mutex;
@@ -211,15 +215,20 @@ void tier_add_layer(int64_t li, torch::Tensor ptrs, torch::Tensor suh_g, torch::
 // [7] failed generation, [8] drained generation. [0..4] retain their ABI.
 static bool lut_aborted()
 {
-    return T && T->lut && T->ctrl && (__atomic_load_n(const_cast<int64_t*>(T->ctrl + 5), __ATOMIC_ACQUIRE) ||
-                                    __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE));
+    return T && T->lut && (T->lut_sticky.load(std::memory_order_acquire) ||
+        (T->ctrl && (__atomic_load_n(const_cast<int64_t*>(T->ctrl + 5), __ATOMIC_ACQUIRE) ||
+                     __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE))));
 }
 static void lut_fail(int64_t generation, int code, const std::string& message)
 {
     { std::lock_guard<std::mutex> guard(T->lut_error_mutex); if (T->lut_error.empty()) T->lut_error = message; }
-    __atomic_store_n(const_cast<int64_t*>(T->ctrl + 5), int64_t(1), __ATOMIC_RELEASE);
-    __atomic_store_n(const_cast<int64_t*>(T->ctrl + 7), generation, __ATOMIC_RELEASE);
-    __atomic_store_n(const_cast<int64_t*>(T->ctrl + 6), int64_t(code), __ATOMIC_RELEASE);
+    T->lut_sticky.store(true, std::memory_order_release);
+    if (T->ctrl)
+    {
+        __atomic_store_n(const_cast<int64_t*>(T->ctrl + 5), int64_t(1), __ATOMIC_RELEASE);
+        __atomic_store_n(const_cast<int64_t*>(T->ctrl + 7), generation, __ATOMIC_RELEASE);
+        __atomic_store_n(const_cast<int64_t*>(T->ctrl + 6), int64_t(code), __ATOMIC_RELEASE);
+    }
     T->lut->request_abort();
 }
 static void lut_checkpoint()
@@ -741,6 +750,8 @@ static void lut_worker_main(int cpu0)
     {
         const int64_t generation = __atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE);
         if (generation == last || lut_aborted()) { _mm_pause(); continue; }
+        std::unique_lock<std::mutex> job(T->lut_job_mutex, std::try_to_lock);
+        if (!job.owns_lock() || lut_aborted() || T->quit.load(std::memory_order_acquire)) { _mm_pause(); continue; }
         const double started = now();
         T->lut_active.store(true, std::memory_order_release);
         T->lut_generation = generation; T->lut_deadline = started + T->lut_timeout_ms * 1e-3;
@@ -962,15 +973,129 @@ void tier_init_lut(std::vector<int64_t> cpus, std::string activation, pybind11::
 }
 void tier_lut_check()
 {
-    TORCH_CHECK(T && T->lut && T->ctrl, "LUT coordinator ingress is not initialized");
+    TORCH_CHECK(T && T->lut, "LUT backend is not initialized");
     if (lut_aborted())
     {
         std::lock_guard<std::mutex> guard(T->lut_error_mutex);
-        TORCH_CHECK(false, "LUT request aborted (error ", __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE),
-                    ", generation ", __atomic_load_n(const_cast<int64_t*>(T->ctrl + 7), __ATOMIC_ACQUIRE), "): ",
+        const int64_t code = T->ctrl ? __atomic_load_n(const_cast<int64_t*>(T->ctrl + 6), __ATOMIC_ACQUIRE) : 1;
+        const int64_t generation = T->ctrl ? __atomic_load_n(const_cast<int64_t*>(T->ctrl + 7), __ATOMIC_ACQUIRE) : 0;
+        TORCH_CHECK(false, "LUT request aborted (error ", code, ", generation ", generation, "): ",
                     T->lut_error.empty() ? "device combine timeout or ingress failure; restart required" : T->lut_error);
     }
 }
+
+bool tier_lut_grouped_ready()
+{
+    // Readiness is an observation, not a reservation. Both locks are try-locks:
+    // Python uses this before masking GPU picks and must get an immediate answer.
+    std::unique_lock<std::mutex> lifecycle(lut_lifecycle_mutex, std::try_to_lock);
+    if (!lifecycle.owns_lock() || !T || !T->lut || lut_aborted() || T->quit.load(std::memory_order_acquire)) return false;
+    std::unique_lock<std::mutex> job(T->lut_job_mutex, std::try_to_lock);
+    return job.owns_lock() && T->lut->grouped_ready();
+}
+
+std::tuple<bool, std::string, double, int> tier_lut_forward_grouped(
+    int64_t layer, torch::Tensor x_f16, torch::Tensor experts, torch::Tensor offsets,
+    torch::Tensor row_token, torch::Tensor row_weight, torch::Tensor out, double timeout_ms)
+{
+    const double started = now();
+    auto result = [&](bool ok, const std::string& why, int chunks = 0) {
+        return std::make_tuple(ok, why, (now() - started) * 1000.0, chunks);
+    };
+    // Lifetime ownership must cover the GIL release. A concurrent stop/reset or
+    // grouped call is busy, rather than a reason to wait with the GIL held.
+    std::unique_lock<std::mutex> lifecycle(lut_lifecycle_mutex, std::try_to_lock);
+    if (!lifecycle.owns_lock()) return result(false, "busy");
+    if (!T || !T->lut) return result(false, "LUT backend is not initialized");
+    if (lut_aborted() || T->quit.load(std::memory_order_acquire)) return result(false, "LUT request aborted; restart required");
+    std::unique_lock<std::mutex> job(T->lut_job_mutex, std::try_to_lock);
+    if (!job.owns_lock()) return result(false, "busy");
+    if (layer < 0 || layer > std::numeric_limits<int>::max()) return result(false, "LUT layer index out of range");
+    if (!x_f16.device().is_cpu() || x_f16.scalar_type() != at::kHalf || !x_f16.is_contiguous() ||
+        x_f16.dim() != 2 || x_f16.size(1) != T->H || x_f16.size(0) < 1 || x_f16.size(0) > ft_lut::kGroupedMaxTokens)
+        return result(false, "grouped x must be contiguous CPU fp16 [T,H], T=1..1024");
+    if (!out.device().is_cpu() || out.scalar_type() != at::kFloat || !out.is_contiguous() || out.sizes() != x_f16.sizes())
+        return result(false, "grouped out must be contiguous CPU float32 [T,H] matching x");
+    auto index_vector = [](const torch::Tensor& value) {
+        return value.device().is_cpu() && value.scalar_type() == at::kInt && value.is_contiguous() && value.dim() == 1;
+    };
+    if (!index_vector(experts) || !index_vector(offsets) || !index_vector(row_token) ||
+        !row_weight.device().is_cpu() || row_weight.scalar_type() != at::kFloat || !row_weight.is_contiguous() || row_weight.dim() != 1)
+        return result(false, "grouped rows require contiguous CPU int32 vectors and float32 row_weight");
+    if (experts.numel() >= std::numeric_limits<int>::max() || row_token.numel() > std::numeric_limits<int32_t>::max() ||
+        offsets.numel() != experts.numel() + 1 || row_weight.numel() != row_token.numel() ||
+        offsets.data_ptr<int32_t>()[experts.numel()] != row_token.numel())
+        return result(false, "grouped offsets and row tensor lengths do not match");
+    if (!std::isfinite(timeout_ms) || timeout_ms <= 0 || timeout_ms > 3600000)
+        return result(false, "grouped timeout must be finite and in (0,3600000] milliseconds");
+    bool ok = false; int chunks = 0; std::string why;
+    {
+        pybind11::gil_scoped_release release;
+        ok = T->lut->forward_grouped(int(layer), reinterpret_cast<const uint16_t*>(x_f16.data_ptr()), int(x_f16.size(0)),
+                                    int(experts.numel()), experts.data_ptr<int32_t>(), offsets.data_ptr<int32_t>(),
+                                    row_token.data_ptr<int32_t>(), row_weight.data_ptr<float>(), out.data_ptr<float>(), timeout_ms, &why, &chunks);
+        if (!ok && T->lut->grouped_runtime_failed())
+        {
+            T->lut_failed.fetch_add(1, std::memory_order_relaxed);
+            const int64_t generation = T->ctrl ? __atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE) : 0;
+            lut_fail(generation, 1, why);
+        }
+    }
+    return result(ok, why, chunks);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> tier_lut_build_grouped_rows(
+    torch::Tensor sel, torch::Tensor weights, torch::Tensor take, int64_t E)
+{
+    TORCH_CHECK(E >= 1 && E < std::numeric_limits<int32_t>::max(), "grouped E must fit a positive int32 expert count");
+    TORCH_CHECK(sel.device().is_cpu() && sel.scalar_type() == at::kLong && sel.is_contiguous() && sel.dim() == 2 &&
+                sel.size(0) <= std::numeric_limits<int32_t>::max() && sel.numel() <= std::numeric_limits<int32_t>::max(),
+                "grouped sel must be contiguous CPU int64 [T,K] with int32-sized rows");
+    TORCH_CHECK(weights.device().is_cpu() && (weights.scalar_type() == at::kHalf || weights.scalar_type() == at::kFloat) &&
+                weights.is_contiguous() && weights.sizes() == sel.sizes(), "grouped weights must match sel as contiguous CPU fp16 or float32");
+    TORCH_CHECK(take.device().is_cpu() && take.scalar_type() == at::kByte && take.is_contiguous() && take.dim() == 1 && take.numel() == E,
+                "grouped take must be contiguous CPU uint8 [E]");
+    const auto* selected = sel.data_ptr<int64_t>(); const auto* mask = take.data_ptr<uint8_t>();
+    const bool half = weights.scalar_type() == at::kHalf;
+    const auto* wh = half ? reinterpret_cast<const uint16_t*>(weights.data_ptr()) : nullptr;
+    const auto* wf = half ? nullptr : weights.data_ptr<float>();
+    auto weight_at = [&](int64_t i) { return half ? h2f(wh[i]) : wf[i]; };
+    std::vector<int32_t> count(size_t(E), 0), last_token(size_t(E), -1);
+    for (int64_t e = 0; e < E; ++e) TORCH_CHECK(mask[e] <= 1, "grouped take entries must be zero or one");
+    const int64_t K = sel.size(1);
+    for (int64_t t = 0; t < sel.size(0); ++t) for (int64_t k = 0; k < K; ++k)
+    {
+        const int64_t at = t * K + k, e = selected[at]; const float w = weight_at(at);
+        TORCH_CHECK(std::isfinite(w), "grouped routing weight must be finite");
+        TORCH_CHECK(e >= -1 && e < E, "grouped expert index out of range");
+        if (e == -1) { TORCH_CHECK(w == 0, "grouped masked picks require zero weight"); continue; }
+        if (!mask[e]) continue;
+        TORCH_CHECK(last_token[size_t(e)] != t, "grouped duplicate expert for token");
+        last_token[size_t(e)] = int32_t(t); ++count[size_t(e)];
+    }
+    int32_t nexp = 0, rows = 0;
+    for (int32_t n : count) if (n) { ++nexp; rows += n; }
+    const auto indices = torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt);
+    auto experts = torch::empty({nexp}, indices), offsets = torch::empty({int64_t(nexp) + 1}, indices);
+    auto row_token = torch::empty({rows}, indices), row_weight = torch::empty({rows}, indices.dtype(torch::kFloat));
+    auto* ep = experts.data_ptr<int32_t>(); auto* op = offsets.data_ptr<int32_t>();
+    std::vector<int32_t> cursor(size_t(E), 0); int32_t next = 0; op[0] = 0;
+    for (int64_t e = 0; e < E; ++e) if (count[size_t(e)])
+    {
+        ep[next] = int32_t(e); cursor[size_t(e)] = op[next]; op[next + 1] = op[next] + count[size_t(e)]; ++next;
+    }
+    auto* tp = row_token.data_ptr<int32_t>(); auto* wp = row_weight.data_ptr<float>();
+    // Token-major scatter into expert prefix sums is stable: each expert's
+    // tokens ascend without a sort, in O(T*K + E) time.
+    for (int64_t t = 0; t < sel.size(0); ++t) for (int64_t k = 0; k < K; ++k)
+    {
+        const int64_t at = t * K + k, e = selected[at];
+        if (e < 0 || !mask[e]) continue;
+        const int32_t row = cursor[size_t(e)]++; tp[row] = int32_t(t); wp[row] = weight_at(at);
+    }
+    return std::make_tuple(experts, offsets, row_token, row_weight);
+}
+
 void tier_lut_abort()
 {
     TORCH_CHECK(T && T->lut && T->ctrl, "LUT coordinator ingress is not initialized");
@@ -1177,6 +1302,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           pybind11::arg("ctrl"), pybind11::arg("hx"), pybind11::arg("picks"), pybind11::arg("hout"), pybind11::arg("act_limit"), pybind11::arg("job_timeout_ms") = 30000);
     m.def("tier_lut_stats", &ft::tier_lut_fixture_stats);
     m.def("tier_lut_check", &ft::tier_lut_check);
+    m.def("tier_lut_grouped_ready", &ft::tier_lut_grouped_ready);
+    m.def("tier_lut_forward_grouped", &ft::tier_lut_forward_grouped,
+          pybind11::arg("layer"), pybind11::arg("x_f16"), pybind11::arg("experts"), pybind11::arg("offsets"),
+          pybind11::arg("row_token"), pybind11::arg("row_weight"), pybind11::arg("out"), pybind11::arg("timeout_ms"));
+    m.def("tier_lut_build_grouped_rows", &ft::tier_lut_build_grouped_rows,
+          pybind11::arg("sel"), pybind11::arg("w"), pybind11::arg("take"), pybind11::arg("E"));
     m.def("tier_lut_abort", &ft::tier_lut_abort);
     m.def("tier_lut_fixture_coordinator_start", &ft::tier_lut_fixture_coordinator_start);
     m.def("tier_lut_fixture_fault", &ft::tier_lut_fixture_fault);

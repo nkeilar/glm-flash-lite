@@ -36,6 +36,7 @@ using lutbench::Activation;
 using lutbench::Format;
 using lutbench::Path;
 constexpr uint64_t FIXTURE_LIMIT = 256ULL << 20;
+constexpr uint64_t GROUPED_BENCHMARK_LIMIT = 4ULL << 30;
 constexpr uint64_t STAGING_LIMIT = 64ULL << 20;
 constexpr int MAX_TOKENS = 4, MAX_PICKS = 32;
 constexpr uint64_t HOST_FLOOR = 100ULL << 30, NODE_FLOOR = 8ULL << 30;
@@ -404,11 +405,12 @@ public:
         if (error) std::rethrow_exception(error);
         if (wake_error_.exchange(0, std::memory_order_acq_rel)) throw std::runtime_error("LUT futex wake failed; pools drained");
     }
-    void run(void (*fn)(void*, int, int, int), void* context, uint64_t remaining_ms = 0) {
+    void run(void (*fn)(void*, int, int, int), void* context, uint64_t remaining_ms = 0,
+             const std::chrono::steady_clock::time_point* absolute_deadline = nullptr) {
         require(!cancelled_.load(std::memory_order_acquire), "LUT backend was cancelled");
         abort_.store(false, std::memory_order_release);
         task_ = fn; context_ = context; ++submitted_;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining_ms ? std::min(remaining_ms, timeout_ms_) : timeout_ms_);
+        const auto deadline = absolute_deadline ? *absolute_deadline : std::chrono::steady_clock::now() + std::chrono::milliseconds(remaining_ms ? std::min(remaining_ms, timeout_ms_) : timeout_ms_);
         for (auto& g : groups_) {
 #ifdef FT_LUT_DIAG_TRACE
             const int group = int(&g - groups_.data());
@@ -444,6 +446,11 @@ public:
         require(!aborted(), "LUT job cancelled; both pools drained");
     }
     void set_timeout(uint64_t milliseconds) { require(milliseconds >= 1 && milliseconds <= 3600000, "LUT job timeout must be 1..3600000 milliseconds"); timeout_ms_ = milliseconds; }
+    std::chrono::steady_clock::time_point grouped_deadline(double remaining_ms) const {
+        const double budget = remaining_ms > 0 ? std::min(remaining_ms, double(timeout_ms_)) : double(timeout_ms_);
+        return std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::milli>(budget));
+    }
+    void record_timeout() { timeouts_.fetch_add(1, std::memory_order_relaxed); }
     void request_abort() {
         cancelled_.store(true, std::memory_order_release); abort_.store(true, std::memory_order_release);
         for (auto& group : groups_) notify(group);
@@ -548,6 +555,8 @@ struct Scratch {
     std::array<std::array<Activation, 2>, 6> pairs;
     std::array<std::array<Activation, 4>, MAX_PICKS> hidden_q;
     lutbench::AlignedVector<float> hidden, partial;
+    std::array<Activation, kGroupedChunkRows> grouped_input, grouped_hidden_q;
+    lutbench::AlignedVector<float> grouped_hidden, grouped_partial;
     int h = 0, half = 0;
     std::vector<void*> sample_addresses() const {
         std::set<uintptr_t> pages;
@@ -565,7 +574,9 @@ struct Scratch {
         for (const auto& a : input) activation(a);
         for (const auto& pair : pairs) for (const auto& a : pair) activation(a);
         for (const auto& job : hidden_q) for (const auto& a : job) activation(a);
-        sample(hidden); sample(partial);
+        for (const auto& a : grouped_input) activation(a);
+        for (const auto& a : grouped_hidden_q) activation(a);
+        sample(hidden); sample(partial); sample(grouped_hidden); sample(grouped_partial);
         std::vector<void*> result; for (auto address : pages) result.push_back(reinterpret_cast<void*>(address)); return result;
     }
     size_t bytes() const {
@@ -573,10 +584,12 @@ struct Scratch {
             return a.scales.capacity() * sizeof(float) + (a.i16.capacity() + a.i16_lo_bsums.capacity() + a.i16_hi_bsums.capacity() + a.i16_swizzled.capacity()) * sizeof(int16_t)
                 + a.i16_lo.capacity() + a.i16_hi.capacity() + a.q8.capacity();
         };
-        size_t size = (hidden.capacity() + partial.capacity()) * sizeof(float);
+        size_t size = (hidden.capacity() + partial.capacity() + grouped_hidden.capacity() + grouped_partial.capacity()) * sizeof(float);
         for (const auto& a : input) size += activation_bytes(a);
         for (const auto& pair : pairs) for (const auto& a : pair) size += activation_bytes(a);
         for (const auto& job : hidden_q) for (const auto& a : job) size += activation_bytes(a);
+        for (const auto& a : grouped_input) size += activation_bytes(a);
+        for (const auto& a : grouped_hidden_q) size += activation_bytes(a);
         return size;
     }
     size_t mapped_bytes() const {
@@ -591,7 +604,9 @@ struct Scratch {
         for (const auto& a : input) activation(a);
         for (const auto& pair : pairs) for (const auto& a : pair) activation(a);
         for (const auto& job : hidden_q) for (const auto& a : job) activation(a);
-        count(hidden); count(partial); return total;
+        for (const auto& a : grouped_input) activation(a);
+        for (const auto& a : grouped_hidden_q) activation(a);
+        count(hidden); count(partial); count(grouped_hidden); count(grouped_partial); return total;
     }
     void init(Path path, int width, int ihalf) {
         for (auto& a : input) lutbench::prepare_storage(path, width, a);
@@ -599,9 +614,29 @@ struct Scratch {
         for (auto& job : hidden_q) for (auto& a : job) lutbench::prepare_storage(path, ihalf, a);
         hidden.resize(size_t(MAX_PICKS) * 4 * ihalf);
         partial.resize(size_t(4) * width);
+        if (path == Path::Q8) {
+            for (auto& a : grouped_input) lutbench::prepare_storage(path, width, a);
+            for (auto& a : grouped_hidden_q) lutbench::prepare_storage(path, ihalf, a);
+            grouped_hidden.resize(size_t(kGroupedChunkRows) * ihalf);
+            grouped_partial.resize(size_t(kGroupedMaxTokens) * width);
+        }
         h = width; half = ihalf;
     }
 };
+// The ingress geometry is always a multiple of eight. Conversion uses the
+// decode ingress's F16C operation and finite test, without touching scratch
+// during validation. P0 uses the same helper to fill worker-local storage.
+bool convert_f16_finite(const uint16_t* source, float* destination, size_t n) {
+    const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+    const __m256 inf = _mm256_set1_ps(INFINITY);
+    __m256 bad = _mm256_setzero_ps();
+    for (size_t i = 0; i < n; i += 8) {
+        const __m256 value = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(source + i)));
+        if (destination) _mm256_storeu_ps(destination + i, value);
+        bad = _mm256_or_ps(bad, _mm256_cmp_ps(_mm256_and_ps(value, absmask), inf, _CMP_NLT_UQ));
+    }
+    return _mm256_movemask_ps(bad) == 0;
+}
 bool all_finite(const float* x, size_t n) {
     const __m256 absmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
     const __m256 inf = _mm256_set1_ps(INFINITY);
@@ -664,6 +699,14 @@ struct Backend::Impl {
     int ntok = 0, njobs = 0;
     std::array<Job, MAX_PICKS> jobs;
     std::array<uint64_t, 2> pending_mapped{};
+    bool grouped_benchmark = false;
+    int grouped_chunk_rows = kGroupedChunkRows;
+    std::atomic<bool> grouped_failure{false};
+    const uint16_t* grouped_x = nullptr;
+    const int32_t *grouped_experts = nullptr, *grouped_offsets = nullptr, *grouped_row_token = nullptr;
+    const float* grouped_row_weight = nullptr;
+    int grouped_begin = 0, grouped_end = 0, grouped_row_begin = 0, grouped_rows = 0;
+    bool grouped_first_chunk = false;
     explicit Impl(const Options& o, bool fixture) : options(o), path(o.activation == "i16" ? Path::I16 : Path::Q8), workers(checked_options(o, fixture)) {
         require(o.activation == "i16" || o.activation == "q8", "LUT activation must be i16 or q8");
         require(std::isfinite(o.act_limit) && o.act_limit > 0, "LUT SwiGLU limit must be finite and positive");
@@ -821,6 +864,110 @@ struct Backend::Impl {
             }
         });
     }
+    static void compute_grouped(void* opaque, int group, int local, int nworkers) {
+        auto& self = *static_cast<Impl*>(opaque);
+        Layer& l = *self.active; Scratch& s = self.scratch[group];
+        const int half = l.intermediate / 2;
+        self.phase(0, group, local, [&] {
+            if (self.grouped_first_chunk) {
+                const int begin = l.h * local / nworkers, end = l.h * (local + 1) / nworkers;
+                for (int r = begin; r < end; ++r)
+                    for (int t = 0; t < self.ntok; ++t) s.grouped_partial[size_t(t) * l.h + r] = 0;
+            }
+            // Each worker converts one complete activation into its own small
+            // temporary, then issues the identical block quantizer calls used
+            // by decode. Persistent mappings contain only Q8 activations.
+            alignas(64) float converted[4096];
+            for (int row = local; row < self.grouped_rows; row += nworkers) {
+                if (self.workers.aborted()) break;
+                const int token = self.grouped_row_token[self.grouped_row_begin + row];
+                require(convert_f16_finite(self.grouped_x + size_t(token) * l.h, converted, l.h), "nonfinite LUT grouped input");
+                for (int begin = 0; begin < l.h; begin += 256)
+                    lutbench::prepare_range(Path::Q8, converted, l.h, begin, begin + 256, s.grouped_input[row]);
+            }
+        });
+        self.workers.barrier(group);
+        self.phase(1, group, local, [&] {
+            const int begin = half * local / nworkers, end = half * (local + 1) / nworkers;
+            const int rows = end - begin, experts = self.grouped_end - self.grouped_begin;
+            auto prefetch_gate_up = [&](int position) {
+                if (FT_LUT_PF_GATE_UP <= 0 || rows <= 0 || position >= experts * rows) return;
+                const int expert = self.grouped_experts[self.grouped_begin + position / rows], r = begin + position % rows;
+                const auto& node = l.nodes[group];
+                prefetch_bytes(node.row(0, expert, r), node.strides[0]);
+                prefetch_bytes(node.row(1, expert, r), node.strides[1]);
+            };
+            for (int p = 0; p < FT_LUT_PF_GATE_UP; ++p) prefetch_gate_up(p);
+            for (int e = self.grouped_begin; e < self.grouped_end; ++e) {
+                const int first = self.grouped_offsets[e] - self.grouped_row_begin;
+                const int count = self.grouped_offsets[e + 1] - self.grouped_offsets[e];
+                const int expert = self.grouped_experts[e];
+                if (!count) continue;
+                for (int r = begin; r < end; ++r) {
+                    if (self.workers.aborted()) break;
+                    prefetch_gate_up((e - self.grouped_begin) * rows + (r - begin) + FT_LUT_PF_GATE_UP);
+                    for (int tile = 0; tile < count; tile += 4) {
+                        const int m = std::min(4, count - tile), slot = first + tile;
+                        float g[4], u[4];
+                        dots(l.formats[0], l.nodes[group].row(0, expert, r), s.grouped_input.data() + slot, l.h, m, g);
+                        dots(l.formats[1], l.nodes[group].row(1, expert, r), s.grouped_input.data() + slot, l.h, m, u);
+                        for (int t = 0; t < m; ++t) {
+                            require(std::isfinite(g[t]) && std::isfinite(u[t]), "nonfinite LUT gate/up projection");
+                            float gate = std::min(g[t] / (1.0f + std::exp(-g[t])), self.options.act_limit);
+                            float up = std::max(-self.options.act_limit, std::min(self.options.act_limit, u[t]));
+                            float hidden = gate * up;
+                            require(std::isfinite(hidden), "nonfinite LUT hidden activation");
+                            s.grouped_hidden[size_t(slot + t) * half + r] = hidden;
+                        }
+                    }
+                }
+            }
+        });
+        self.workers.barrier(group);
+        self.phase(2, group, local, [&] {
+            const int blocks = half / 256;
+            for (int task = local; task < self.grouped_rows * blocks; task += nworkers) {
+                if (self.workers.aborted()) break;
+                const int row = task / blocks, begin = task % blocks * 256;
+                lutbench::prepare_range(Path::Q8, s.grouped_hidden.data() + size_t(row) * half, half,
+                                        begin, begin + 256, s.grouped_hidden_q[row]);
+            }
+        });
+        self.workers.barrier(group);
+        self.phase(3, group, local, [&] {
+            const int begin = l.h * local / nworkers, end = l.h * (local + 1) / nworkers;
+            const int rows = end - begin, experts = self.grouped_end - self.grouped_begin;
+            auto prefetch_down = [&](int position) {
+                if (FT_LUT_PF_DOWN <= 0 || rows <= 0 || position >= experts * rows) return;
+                const auto& node = l.nodes[group];
+                prefetch_bytes(node.row(2, self.grouped_experts[self.grouped_begin + position / rows], begin + position % rows), node.strides[2]);
+            };
+            for (int p = 0; p < FT_LUT_PF_DOWN; ++p) prefetch_down(p);
+            for (int e = self.grouped_begin; e < self.grouped_end; ++e) {
+                const int first = self.grouped_offsets[e] - self.grouped_row_begin;
+                const int count = self.grouped_offsets[e + 1] - self.grouped_offsets[e];
+                const int expert = self.grouped_experts[e];
+                if (!count) continue;
+                for (int r = begin; r < end; ++r) {
+                    if (self.workers.aborted()) break;
+                    prefetch_down((e - self.grouped_begin) * rows + (r - begin) + FT_LUT_PF_DOWN);
+                    for (int tile = 0; tile < count; tile += 4) {
+                        const int m = std::min(4, count - tile), slot = first + tile;
+                        float values[4];
+                        dots(l.formats[2], l.nodes[group].row(2, expert, r), s.grouped_hidden_q.data() + slot, half, m, values);
+                        for (int t = 0; t < m; ++t) {
+                            const int row = self.grouped_row_begin + slot + t;
+                            float contribution = self.grouped_row_weight[row] * values[t];
+                            float& partial = s.grouped_partial[size_t(self.grouped_row_token[row]) * l.h + r];
+                            float updated = partial + contribution;
+                            require(std::isfinite(values[t]) && std::isfinite(contribution) && std::isfinite(updated), "nonfinite LUT weighted down output");
+                            partial = updated;
+                        }
+                    }
+                }
+            }
+        });
+    }
 };
 
 BankPlan bank_plan(const std::vector<LayerInput>& inputs) {
@@ -868,6 +1015,12 @@ void check_memory_limit(uint64_t limit, uint64_t current, uint64_t additional) {
 }
 Backend::Backend(const Options& options, bool fixture) : impl_(std::make_unique<Impl>(options, fixture)) {}
 std::unique_ptr<Backend> Backend::offline_fixture(const Options& options) { return std::unique_ptr<Backend>(new Backend(options)); }
+std::unique_ptr<Backend> Backend::grouped_benchmark_fixture(const Options& options) {
+    require(options.virtual_tp2 && options.activation == "q8", "grouped benchmark requires an offline Q8 virtual TP2 fixture");
+    auto backend = std::unique_ptr<Backend>(new Backend(options));
+    backend->impl_->grouped_benchmark = true;
+    return backend;
+}
 std::unique_ptr<Backend> Backend::staged_bank(const Options& options, const std::vector<LayerInput>& inputs) {
     checked_options(options, false);
     const auto plan = bank_plan(inputs);
@@ -896,7 +1049,10 @@ void Backend::add_layer(const LayerInput& in) {
     require(in.model_layer >= 3 && in.model_layer <= 44 && in.internal_li == in.model_layer - 3, "LUT model/internal layer mapping mismatch");
     require(!impl_->layers.count(in.internal_li), "LUT layer already loaded");
     int h = in.tensors[0].width, i = in.tensors[0].rows, e = in.tensors[0].experts;
-    if (impl_->report.offline_fixture)
+    if (impl_->grouped_benchmark)
+        require(impl_->layers.empty() && h >= 256 && h <= 4096 && h % 256 == 0 && i >= 512 && i <= 2048 && i % 512 == 0 && e >= 1 && e <= 288,
+                "grouped benchmark requires one layer with bounded geometry and at most 288 experts");
+    else if (impl_->report.offline_fixture)
         require(h >= 256 && h <= 4096 && h % 256 == 0 && i >= 512 && i <= 2048 && i % 512 == 0 && e >= 1 && e <= 8,
                 "offline LUT fixture dimensions exceed bounded geometry");
     else {
@@ -927,9 +1083,11 @@ void Backend::add_layer(const LayerInput& in) {
     }
     std::sort(ranges.begin(), ranges.end());
     for (size_t n = 1; n < ranges.size(); ++n) require(ranges[n - 1].second <= ranges[n].first, "overlapping LUT tensor ranges");
-    if (impl_->report.offline_fixture)
-        require(additional <= FIXTURE_LIMIT && impl_->report.payload_bytes[0] + impl_->report.payload_bytes[1] <= FIXTURE_LIMIT - additional,
+    if (impl_->report.offline_fixture) {
+        const uint64_t limit = impl_->grouped_benchmark ? GROUPED_BENCHMARK_LIMIT : FIXTURE_LIMIT;
+        require(additional <= limit && impl_->report.payload_bytes[0] + impl_->report.payload_bytes[1] <= limit - additional,
                 "offline LUT fixture exceeds aggregate allocation bound");
+    }
     File file(in.path); require(identity(file.fd) == in.identity, "LUT source fingerprint changed before load");
     auto layer = std::make_unique<Layer>();
     layer->model_layer = in.model_layer; layer->li = in.internal_li; layer->h = h; layer->intermediate = i; layer->experts = e;
@@ -1006,7 +1164,14 @@ void Backend::add_layer(const LayerInput& in) {
     for (int group = 0; group < 2; ++group) {
         impl_->report.scratch_bytes[group] = impl_->scratch[group].bytes();
         impl_->report.scratch_mapped_bytes[group] = impl_->scratch[group].mapped_bytes();
-        require(impl_->report.scratch_mapped_bytes[group] <= 32ULL * 1024 * 1024, "LUT per-node mapped scratch exceeds declared bound");
+        // 4 KiB pages, maximum geometry: decode Q8 1,245,184 bytes plus
+        // grouped input 512*8192 + hidden-Q8 512*4096 + hidden 512*1024*4
+        // + partial 1024*4096*4 = 26,411,008 bytes/group. I16 is unchanged
+        // at 4,849,664 bytes. Count each mapping, including tiny Q8 buffers.
+        // Q8 allows 48 MiB for grouped scratch and other host page sizes;
+        // I16 retains its existing 32 MiB admission bound.
+        const uint64_t scratch_bound = (impl_->path == Path::Q8 ? 48ULL : 32ULL) << 20;
+        require(impl_->report.scratch_mapped_bytes[group] <= scratch_bound, "LUT per-node mapped scratch exceeds declared bound");
     }
     bool verified = impl_->workers.controls_verified();
     for (const auto& receipt : receipts) verified = verified && receipt.preferred_policy && !receipt.query_errno && !receipt.page_errors && !receipt.off_node_pages;
@@ -1089,6 +1254,111 @@ void Backend::forward_impl(int li, const float* x, int ntok, const Routes& route
     std::memcpy(output, merged, count * sizeof(float));
 }
 
+bool Backend::forward_grouped(int li, const uint16_t* x_f16, int ntok,
+                              int nexp, const int32_t* experts, const int32_t* offsets,
+                              const int32_t* row_token, const float* row_weight,
+                              float* output, double remaining_ms, std::string* why) {
+    return forward_grouped(li, x_f16, ntok, nexp, experts, offsets, row_token, row_weight, output, remaining_ms, why, nullptr);
+}
+bool Backend::forward_grouped(int li, const uint16_t* x_f16, int ntok,
+                              int nexp, const int32_t* experts, const int32_t* offsets,
+                              const int32_t* row_token, const float* row_weight,
+                              float* output, double remaining_ms, std::string* why, int* chunks) {
+    if (chunks) *chunks = 0;
+    auto reject = [&](const char* message) { if (why) *why = message; return false; };
+    std::unique_lock<std::mutex> lock(impl_->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return reject("busy");
+    Layer* layer = nullptr;
+    std::chrono::steady_clock::time_point deadline;
+    // Complete admission before publishing a generation, changing scratch, or
+    // setting any active-call fields. Rejection therefore leaves decode usable.
+    try {
+        require(std::isfinite(remaining_ms) && remaining_ms >= 0 && remaining_ms <= 3600000,
+                "LUT grouped remaining deadline budget must be finite and 0..3600000 ms");
+        deadline = impl_->workers.grouped_deadline(remaining_ms);
+        require(impl_->path == Path::Q8, "LUT grouped forward supports Q8 activations only; I16 is unsupported");
+        require(x_f16 && output && ntok > 0 && ntok <= kGroupedMaxTokens, "LUT grouped token count must be 1..1024 with nonnull input/output");
+        auto found = impl_->layers.find(li); require(found != impl_->layers.end(), "LUT layer is not loaded");
+        layer = found->second.get();
+        require(impl_->report.offline_fixture || impl_->report.bank_complete, "full LUT bank is not ready");
+        require(nexp >= 0 && nexp <= layer->experts && offsets && (!nexp || experts), "invalid LUT grouped expert arrays");
+        require(offsets[0] == 0, "LUT grouped offsets must start at zero");
+        for (int e = 0; e < nexp; ++e) {
+            require(experts[e] >= 0 && experts[e] < layer->experts && (!e || experts[e - 1] < experts[e]),
+                    "LUT grouped experts must be strictly ascending and in range");
+            require(offsets[e + 1] >= offsets[e] && offsets[e + 1] - offsets[e] <= kGroupedMaxRowsPerExpert,
+                    "LUT grouped offsets must be ascending with at most 64 rows per expert");
+        }
+        require(offsets[nexp] == 0 || (row_token && row_weight), "LUT grouped row arrays are null");
+        for (int e = 0; e < nexp; ++e) for (int r = offsets[e]; r < offsets[e + 1]; ++r) {
+            require(row_token[r] >= 0 && row_token[r] < ntok && (r == offsets[e] || row_token[r - 1] < row_token[r]),
+                    "LUT grouped tokens must be strictly ascending within each expert and in range");
+            require(std::isfinite(row_weight[r]), "nonfinite LUT grouped routing weight");
+        }
+        require(convert_f16_finite(x_f16, nullptr, size_t(ntok) * layer->h), "nonfinite LUT grouped input");
+    } catch (const std::exception& error) { return reject(error.what()); }
+      catch (...) { return reject("unknown LUT grouped validation failure"); }
+    try {
+        require(!impl_->grouped_failure.load(std::memory_order_acquire) && !impl_->workers.aborted(), "LUT backend was cancelled");
+        auto checkpoint = [&] {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                impl_->workers.record_timeout();
+                throw std::runtime_error("LUT grouped deadline expired; both pools drained");
+            }
+            require(!impl_->workers.aborted(), "LUT grouped job cancelled; both pools drained");
+        };
+        checkpoint();
+        impl_->active = layer; impl_->ntok = ntok;
+        impl_->grouped_x = x_f16; impl_->grouped_experts = experts; impl_->grouped_offsets = offsets;
+        impl_->grouped_row_token = row_token; impl_->grouped_row_weight = row_weight;
+        impl_->failed.store(false, std::memory_order_release); impl_->failure = nullptr;
+        int attempted = 0;
+        for (int begin = 0; begin < nexp;) {
+            int end = begin, rows = 0;
+            while (end < nexp) {
+                const int count = offsets[end + 1] - offsets[end];
+                if (rows && rows + count > impl_->grouped_chunk_rows) break;
+                rows += count; ++end;
+            }
+            if (rows) {
+                checkpoint();
+                impl_->grouped_begin = begin; impl_->grouped_end = end;
+                impl_->grouped_row_begin = offsets[begin]; impl_->grouped_rows = rows;
+                impl_->grouped_first_chunk = attempted == 0;
+                ++attempted; if (chunks) *chunks = attempted;
+                impl_->workers.run(&Impl::compute_grouped, impl_.get(), 0, &deadline);
+                if (impl_->failed.load(std::memory_order_acquire)) std::rethrow_exception(impl_->failure);
+                checkpoint();
+            }
+            begin = end;
+        }
+        const size_t count = size_t(ntok) * layer->h;
+        if (!attempted) for (auto& scratch : impl_->scratch)
+            std::fill_n(scratch.grouped_partial.data(), count, 0.0f);
+        float* merged = impl_->scratch[0].grouped_partial.data();
+        require(merge_finite(merged, impl_->scratch[1].grouped_partial.data(), count), "nonfinite merged LUT result");
+        checkpoint();
+        std::memcpy(output, merged, count * sizeof(float));
+        if (why) why->clear();
+        return true;
+    } catch (const std::exception& error) {
+        impl_->grouped_failure.store(true, std::memory_order_release);
+        impl_->workers.request_abort();
+        return reject(error.what());
+    } catch (...) {
+        impl_->grouped_failure.store(true, std::memory_order_release);
+        impl_->workers.request_abort();
+        return reject("unknown LUT grouped runtime failure; both pools drained");
+    }
+}
+bool Backend::grouped_ready() const {
+    std::unique_lock<std::mutex> lock(impl_->mutex, std::try_to_lock);
+    return lock.owns_lock() && impl_->path == Path::Q8 && !impl_->layers.empty() &&
+           (impl_->report.offline_fixture || impl_->report.bank_complete) &&
+           !impl_->grouped_failure.load(std::memory_order_acquire) && !impl_->workers.aborted();
+}
+bool Backend::grouped_runtime_failed() const { return impl_->grouped_failure.load(std::memory_order_acquire); }
+
 void Backend::request_abort() { impl_->workers.request_abort(); }
 void Backend::shutdown() {
     impl_->workers.request_abort();
@@ -1116,6 +1386,11 @@ void Backend::fixture_set_timeout(uint64_t milliseconds) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     require(impl_->report.offline_fixture, "timeout override is an offline fixture API only");
     impl_->workers.set_timeout(milliseconds);
+}
+void Backend::fixture_set_grouped_chunk_rows(int rows) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    require(impl_->report.offline_fixture && rows >= 1 && rows <= kGroupedChunkRows, "invalid offline LUT grouped chunk cap");
+    impl_->grouped_chunk_rows = rows;
 }
 uint64_t Backend::fixture_flush_weights() {
     std::lock_guard<std::mutex> lock(impl_->mutex);

@@ -46,6 +46,20 @@ std::vector<int> cpus() {
     }
     check(result.size() >= 5, "tests need five distinct allowed physical cores for asymmetric 2/3 groups"); return result;
 }
+// Timing only (LUT_TIMING_ALL_CORES=1): every allowed distinct physical core, e.g. production's 42 under taskset.
+std::vector<int> timing_cpus() {
+    const char* all = std::getenv("LUT_TIMING_ALL_CORES");
+    if (!all || std::string(all) != "1") return cpus();
+    cpu_set_t allowed; CPU_ZERO(&allowed); check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "affinity unavailable");
+    std::set<std::pair<int, int>> cores; std::vector<int> result;
+    for (int c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &allowed)) {
+        int pkg = -1, core = -1;
+        std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/";
+        std::ifstream(base + "physical_package_id") >> pkg; std::ifstream(base + "core_id") >> core;
+        if (pkg >= 0 && core >= 0 && cores.insert({pkg, core}).second) result.push_back(c);
+    }
+    check(result.size() >= 2, "timing needs two allowed physical cores"); return result;
+}
 std::vector<int> allowed_siblings() {
     cpu_set_t allowed; CPU_ZERO(&allowed); check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0, "affinity unavailable");
     std::map<std::pair<int, int>, int> cores;
@@ -221,6 +235,403 @@ void numeric(ft_lut::Backend& backend, const Fixture& f, lutbench::Path path, in
         check(error <= 1e-5, "TP2 output differs from canonical packed-weight reference"); ++cases;
     }
 }
+struct GroupedRows {
+    std::vector<int32_t> experts, offsets{0}, token;
+    std::vector<float> weight;
+    void append(int expert, const std::vector<int>& tokens) {
+        experts.push_back(expert);
+        for (int t : tokens) { token.push_back(t); weight.push_back(fp16(.035f + .003f * float((expert + 3 * t) % 23))); }
+        offsets.push_back(int32_t(token.size()));
+    }
+};
+uint32_t random_word(uint32_t& state) { state = state * 1664525U + 1013904223U; return state; }
+std::vector<uint16_t> grouped_input(int ntok, int h, uint32_t seed) {
+    std::vector<uint16_t> result(size_t(ntok) * h);
+    for (auto& value : result) value = _cvtss_sh(float(int(random_word(seed) >> 8) - 8388608) / 8388608.f, _MM_FROUND_TO_NEAREST_INT);
+    return result;
+}
+std::vector<float> expanded(const std::vector<uint16_t>& input) {
+    std::vector<float> result(input.size());
+    for (size_t n = 0; n < result.size(); ++n) result[n] = _cvtsh_ss(input[n]);
+    return result;
+}
+bool grouped(ft_lut::Backend& backend, int li, const std::vector<uint16_t>& x, int ntok,
+             const GroupedRows& rows, std::vector<float>& output, std::string& why,
+             double budget = 30000, int* chunks = nullptr) {
+    return backend.forward_grouped(li, x.data(), ntok, int(rows.experts.size()), rows.experts.data(),
+                                   rows.offsets.data(), rows.token.data(), rows.weight.data(), output.data(), budget, &why, chunks);
+}
+void same_bits(const std::vector<float>& a, const std::vector<float>& b, const char* message) {
+    check(a.size() == b.size(), message);
+    if (std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) != 0) {
+        for (size_t n = 0; n < a.size(); ++n) if (std::memcmp(&a[n], &b[n], sizeof(float)) != 0) {
+            uint32_t got, expected; std::memcpy(&got, &a[n], sizeof(got)); std::memcpy(&expected, &b[n], sizeof(expected));
+            std::cerr << message << " index=" << n << " got_bits=0x" << std::hex << got << " expected_bits=0x" << expected << std::dec << '\n';
+            break;
+        }
+        check(false, message);
+    }
+}
+// Independent TP2 oracle: packed slices come from the loader, but no grouped
+// worklist, scratch, projection routine or coordinator is used here.
+std::vector<float> grouped_reference(ft_lut::Backend& backend, const Fixture& f,
+                                     const std::vector<uint16_t>& x, int ntok, const GroupedRows& rows) {
+    const auto input = expanded(x);
+    const int half = f.i / 2;
+    std::array<std::vector<float>, 2> partial;
+    for (int group = 0; group < 2; ++group) {
+        partial[group].resize(size_t(ntok) * f.h, 0.f);
+        for (size_t j = 0; j < rows.experts.size(); ++j) {
+            const int start = rows.offsets[j], count = rows.offsets[j + 1] - start;
+            std::array<std::vector<uint8_t>, 3> packed;
+            std::array<size_t, 3> stride;
+            for (int matrix = 0; matrix < 3; ++matrix) {
+                packed[matrix] = backend.fixture_slice(f.input.internal_li, group, rows.experts[j], matrix);
+                stride[matrix] = lutbench::row_bytes(fmt(f.input.tensors[matrix].type_id), matrix == 2 ? half : f.h);
+            }
+            std::vector<lutbench::Activation> activation(count), hidden_q(count);
+            std::vector<float> hidden(size_t(count) * half);
+            for (int t = 0; t < count; ++t)
+                lutbench::prepare(lutbench::Path::Q8, input.data() + size_t(rows.token[start + t]) * f.h, f.h, activation[t]);
+            for (int r = 0; r < half; ++r) for (int tile = 0; tile < count; tile += 4) {
+                const int m = std::min(4, count - tile); float g[4], u[4];
+                dot_m(fmt(f.input.tensors[0].type_id), packed[0].data() + size_t(r) * stride[0], activation.data() + tile, f.h, m, g);
+                dot_m(fmt(f.input.tensors[1].type_id), packed[1].data() + size_t(r) * stride[1], activation.data() + tile, f.h, m, u);
+                for (int t = 0; t < m; ++t) {
+                    check(std::isfinite(g[t]) && std::isfinite(u[t]), "oracle nonfinite gate/up projection");
+                    float gate = std::min(g[t] / (1.0f + std::exp(-g[t])), 10.f);
+                    float up = std::max(-10.f, std::min(10.f, u[t]));
+                    float value = gate * up;
+                    check(std::isfinite(value), "oracle nonfinite hidden activation");
+                    hidden[size_t(tile + t) * half + r] = value;
+                }
+            }
+            for (int t = 0; t < count; ++t)
+                lutbench::prepare(lutbench::Path::Q8, hidden.data() + size_t(t) * half, half, hidden_q[t]);
+            for (int r = 0; r < f.h; ++r) for (int tile = 0; tile < count; tile += 4) {
+                const int m = std::min(4, count - tile); float y[4];
+                dot_m(fmt(f.input.tensors[2].type_id), packed[2].data() + size_t(r) * stride[2], hidden_q.data() + tile, half, m, y);
+                for (int t = 0; t < m; ++t) {
+                    float contribution = rows.weight[start + tile + t] * y[t];
+                    float& value = partial[group][size_t(rows.token[start + tile + t]) * f.h + r];
+                    float updated = value + contribution;
+                    // Decode validates the separately rounded product. Omitting
+                    // this contract lets production GCC fuse the multiply/add.
+                    check(std::isfinite(y[t]) && std::isfinite(contribution) && std::isfinite(updated), "oracle nonfinite weighted down output");
+                    value = updated;
+                }
+            }
+        }
+    }
+    for (size_t n = 0; n < partial[0].size(); ++n) {
+        partial[0][n] = partial[0][n] + partial[1][n];
+        check(std::isfinite(partial[0][n]), "oracle nonfinite merged result");
+    }
+    return partial[0];
+}
+void grouped_checks(const std::vector<int>& workers, const Fixture& ordinary, const Fixture& upgrade) {
+    ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true; options.activation = "q8";
+    auto backend = ft_lut::Backend::offline_fixture(options);
+    backend->add_layer(ordinary.input); backend->add_layer(upgrade.input);
+    check(backend->grouped_ready() && !backend->grouped_runtime_failed(), "loaded grouped backend is not ready");
+    int parity_cases = 0, oracle_cases = 0, chunk_cases = 0;
+    for (const Fixture* f : {&ordinary, &upgrade}) {
+        for (int ntok = 1; ntok <= 4; ++ntok) for (uint32_t seed = 1; seed <= 8; ++seed) {
+            const auto x = grouped_input(ntok, f->h, seed + uint32_t(f->input.model_layer * 31));
+            const auto xf = expanded(x); GroupedRows rows; ft_lut::Routes routes(ntok);
+            for (int e = 0; e < 8; ++e) {
+                std::vector<int> tokens;
+                const unsigned mask = e == 0 ? (1U << ntok) - 1 : unsigned(e + seed) % (1U << ntok);
+                for (int t = 0; t < ntok; ++t) if (mask & (1U << t)) tokens.push_back(t);
+                if (tokens.empty()) continue;
+                rows.append(e, tokens);
+                for (int r = rows.offsets[rows.offsets.size() - 2]; r < rows.offsets.back(); ++r)
+                    routes[rows.token[r]].push_back({e, rows.weight[r]});
+            }
+            std::vector<float> decode(x.size(), 123.f), actual(x.size(), 123.f); std::string why;
+            backend->forward(f->input.internal_li, xf.data(), ntok, routes, decode.data());
+            check(grouped(*backend, f->input.internal_li, x, ntok, rows, actual, why), "valid small grouped call failed");
+            same_bits(actual, decode, "grouped/decode bit parity failed for random M=1..4 or gapped pair");
+            ++parity_cases;
+        }
+        // Every count5..64 occurs for multiple overlapping experts. Gapped
+        // tokens leave unused outputs and exercise every final tile shape.
+        for (int count = 5; count <= 64; ++count) {
+            const int ntok = 132; const auto x = grouped_input(ntok, f->h, uint32_t(count + f->input.model_layer));
+            GroupedRows rows;
+            for (int e : {0, 2, 7}) {
+                std::vector<int> tokens;
+                for (int t = 0; t < count - (e == 2 && count > 5 ? 1 : 0); ++t) tokens.push_back(2 * t + e % 2);
+                rows.append(e, tokens);
+            }
+            if (count == 17) rows.weight[0] = -.25f; // grouped admits any finite routing weight.
+            auto expected = grouped_reference(*backend, *f, x, ntok, rows);
+            std::vector<float> actual(x.size(), 123.f); std::string why; int chunks = -1;
+            backend->fixture_set_grouped_chunk_rows(512);
+            check(grouped(*backend, f->input.internal_li, x, ntok, rows, actual, why, 30000, &chunks) && chunks == 1,
+                  "valid large grouped single chunk failed");
+            const std::string context = "grouped output differs from independent TP2 dot_multi oracle layer=" + std::to_string(f->input.model_layer) + " rows=" + std::to_string(count);
+            same_bits(actual, expected, context.c_str()); ++oracle_cases;
+            if (count == 5 || count == 17 || count == 63 || count == 64) for (int cap : {1, count}) {
+                backend->fixture_set_grouped_chunk_rows(cap);
+                std::vector<float> chunked(actual.size(), 123.f);
+                check(grouped(*backend, f->input.internal_li, x, ntok, rows, chunked, why, 30000, &chunks) && chunks > 1,
+                      "forced grouped chunks were not published");
+                same_bits(actual, chunked, "chunk boundary changed grouped output bits"); ++chunk_cases;
+            }
+        }
+    }
+    backend->fixture_set_grouped_chunk_rows(512);
+    auto x = grouped_input(4, ordinary.h, 81); GroupedRows valid;
+    valid.append(0, {0, 2}); valid.append(2, {1, 3}); valid.append(7, {0, 1, 2, 3});
+    auto reject = [&](const GroupedRows& rows, const std::vector<uint16_t>& input, int ntok) {
+        const auto generation = backend->fixture_generations(); const auto saved = input;
+        std::vector<float> output(size_t(std::max(1, ntok)) * ordinary.h, 123.f); std::string why; int chunks = -1;
+        check(!grouped(*backend, 0, input, ntok, rows, output, why, 30000, &chunks) && !why.empty(), "invalid grouped request accepted");
+        check(std::all_of(output.begin(), output.end(), [](float v) { return v == 123.f; }), "grouped rejection published caller output");
+        const auto after = backend->fixture_generations();
+        for (int g = 0; g < 2; ++g) check(generation[g].epoch == after[g].epoch, "grouped validation published worker generation");
+        check(input == saved && backend->grouped_ready() && !backend->grouped_runtime_failed(), "grouped admission rejection changed backend/input state");
+    };
+    auto bad = valid; std::swap(bad.experts[0], bad.experts[1]); reject(bad, x, 4);
+    bad = valid; bad.experts[1] = bad.experts[0]; reject(bad, x, 4);
+    bad = valid; bad.experts[0] = -1; reject(bad, x, 4);
+    bad = valid; bad.experts.back() = ordinary.experts; reject(bad, x, 4);
+    bad = valid; bad.token[1] = bad.token[0]; reject(bad, x, 4);
+    bad = valid; std::swap(bad.token[0], bad.token[1]); reject(bad, x, 4);
+    bad = valid; bad.token[0] = -1; reject(bad, x, 4);
+    bad = valid; bad.token[0] = 4; reject(bad, x, 4);
+    bad = valid; bad.offsets[0] = 1; reject(bad, x, 4);
+    bad = valid; bad.offsets[1] = -1; reject(bad, x, 4);
+    bad = valid; bad.offsets[2] = bad.offsets[1] - 1; reject(bad, x, 4);
+    for (float value : {INFINITY, -INFINITY, std::numeric_limits<float>::quiet_NaN()}) {
+        bad = valid; bad.weight[0] = value; reject(bad, x, 4);
+    }
+    for (uint16_t value : {uint16_t(0x7c00), uint16_t(0xfc00), uint16_t(0x7e00)})
+        for (size_t position : {size_t(0), size_t(7), size_t(8), x.size() - 1}) {
+            auto invalid_x = x; invalid_x[position] = value; reject(valid, invalid_x, 4);
+        }
+    GroupedRows too_many; std::vector<int> tokens(65); for (int t = 0; t < 65; ++t) tokens[t] = t;
+    too_many.append(0, tokens); reject(too_many, grouped_input(65, ordinary.h, 3), 65);
+    reject(valid, x, 0); reject(GroupedRows{}, grouped_input(1025, ordinary.h, 3), 1025);
+    // At the exact token bound, an empty route set writes all zero outputs.
+    auto boundary_x = grouped_input(1024, ordinary.h, 9); std::vector<float> boundary(boundary_x.size(), 123.f); std::string why;
+    check(grouped(*backend, 0, boundary_x, 1024, GroupedRows{}, boundary, why), "1024-token empty grouped request rejected");
+    check(std::all_of(boundary.begin(), boundary.end(), [](float v) { return v == 0.f; }), "unrouted grouped tokens were not zeroed");
+    // A decode generation owns the same lock used for grouped admission.
+    backend->inject_delay(0, 1, 100); const auto before = backend->fixture_generations();
+    auto xf = expanded(x); std::vector<float> decode(x.size()); ft_lut::Routes route(4); route[0] = {{0, 1.f}};
+    std::atomic<bool> done{false}; std::exception_ptr error;
+    std::thread in_flight([&] { try { backend->forward(0, xf.data(), 4, route, decode.data()); } catch (...) { error = std::current_exception(); } done.store(true, std::memory_order_release); });
+    const auto witness_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2); bool active = false;
+    while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < witness_deadline) {
+        const auto generation = backend->fixture_generations();
+        if (generation[0].epoch != before[0].epoch) { active = true; break; }
+        std::this_thread::yield();
+    }
+    std::vector<float> busy_output(x.size(), 123.f);
+    const bool ready_while_busy = backend->grouped_ready();
+    const bool busy_ok = grouped(*backend, 0, x, 4, valid, busy_output, why);
+    in_flight.join(); if (error) std::rethrow_exception(error);
+    check(active && !ready_while_busy && !busy_ok && why == "busy", "grouped call did not reject concurrent decode as busy");
+    check(std::all_of(busy_output.begin(), busy_output.end(), [](float v) { return v == 123.f; }), "busy grouped request published output");
+    backend->inject_delay(-1, 1, 0); check(backend->grouped_ready(), "busy rejection became sticky");
+    options.activation = "i16"; auto i16 = ft_lut::Backend::offline_fixture(options); i16->add_layer(ordinary.input);
+    std::fill(busy_output.begin(), busy_output.end(), 123.f);
+    check(!grouped(*i16, 0, x, 4, valid, busy_output, why) && (why.find("Q8") != std::string::npos || why.find("q8") != std::string::npos), "I16 grouped mode lacks clear Q8 rejection");
+    check(std::all_of(busy_output.begin(), busy_output.end(), [](float v) { return v == 123.f; }), "I16 rejection published output");
+    options.activation = "q8";
+    // Each individual chunk is below the budget; the whole eight-chunk call
+    // exceeds it. Resetting a relative timeout at each chunk would pass wrongly.
+    auto timed = ft_lut::Backend::offline_fixture(options); timed->add_layer(ordinary.input);
+    timed->fixture_set_grouped_chunk_rows(1); timed->inject_delay(0, 1, 30);
+    GroupedRows many; for (int e = 0; e < 8; ++e) many.append(e, {0});
+    int chunks = -1; std::fill(busy_output.begin(), busy_output.end(), 123.f);
+    check(!grouped(*timed, 0, x, 4, many, busy_output, why, 120, &chunks), "grouped chunks reset their deadline");
+    check(chunks >= 2 && chunks < 8 && timed->receipt().timed_out_jobs == 1, "grouped absolute deadline was not exercised across chunks");
+    check(std::all_of(busy_output.begin(), busy_output.end(), [](float v) { return v == 123.f; }), "grouped timeout published partial output");
+    timed->inject_delay(-1, 1, 0);
+    check(timed->grouped_runtime_failed() && !timed->grouped_ready(), "grouped timeout is not sticky");
+    check(!grouped(*timed, 0, x, 4, valid, busy_output, why), "sticky grouped timeout accepted a later call");
+    for (int phase = 0; phase < 4; ++phase) {
+        auto failed = ft_lut::Backend::offline_fixture(options); failed->add_layer(ordinary.input); failed->inject_failure(phase, 1);
+        std::fill(busy_output.begin(), busy_output.end(), 123.f);
+        check(!grouped(*failed, 0, x, 4, valid, busy_output, why) && failed->grouped_runtime_failed() && !failed->grouped_ready(), "grouped worker failure is not sticky");
+        check(std::all_of(busy_output.begin(), busy_output.end(), [](float v) { return v == 123.f; }), "grouped worker failure published output");
+    }
+    std::cout << "GROUPED_PASS decode_bit_cases=" << parity_cases << " independent_oracle_cases=" << oracle_cases
+              << " rows_per_expert=5..64 forced_chunk_cases=" << chunk_cases
+              << " gapped_pairs=0,2;1,3 rejection_no_worker_publication=covered token_bound=1024 busy=covered sticky_failures=covered absolute_chunk_deadline=covered\n";
+}
+void grouped_boundary_checks(const std::vector<int>& workers) {
+    Temporary temp; Fixture f(temp, 3, 9);
+    ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true; options.activation = "q8";
+    auto ordinary = ft_lut::Backend::offline_fixture(options);
+    rejects([&] { ordinary->add_layer(f.input); }); // The original eight-expert admission remains strict.
+    auto backend = ft_lut::Backend::grouped_benchmark_fixture(options); backend->add_layer(f.input);
+    const auto x = grouped_input(1024, f.h, 911); GroupedRows rows;
+    std::vector<int> tokens(64); for (int t = 0; t < 64; ++t) tokens[t] = 2 * t;
+    for (int e = 0; e < 8; ++e) rows.append(e, tokens);
+    std::vector<float> output(x.size(), 123.f); std::string why; int chunks = -1;
+    check(grouped(*backend, 0, x, 1024, rows, output, why, 30000, &chunks) && chunks == 1, "512 grouped rows did not fit exactly one chunk");
+    rows.append(8, {1023});
+    auto expected = grouped_reference(*backend, f, x, 1024, rows);
+    check(grouped(*backend, 0, x, 1024, rows, output, why, 30000, &chunks) && chunks == 2, "513 grouped rows did not use two default chunks");
+    same_bits(output, expected, "default 512-row chunk boundary or token1023 changed output bits");
+    check(std::any_of(output.begin() + size_t(1023) * f.h, output.end(), [](float value) { return value != 0.f; }), "last admitted token did not receive its expert row");
+    backend->fixture_set_grouped_chunk_rows(64);
+    check(grouped(*backend, 0, x, 1024, rows, output, why, 30000, &chunks) && chunks == 9, "64-row forced chunks did not preserve whole experts");
+    same_bits(output, expected, "nine forced chunks changed grouped output bits");
+    const auto receipt = backend->receipt();
+    check(receipt.payload_bytes[0] + receipt.payload_bytes[1] <= (4ULL << 30) && receipt.offline_fixture && !receipt.bank_complete && !receipt.placement_verified,
+          "benchmark fixture exceeded its bound or claimed serving/NUMA admission");
+    std::cout << "GROUPED_BOUNDARY_PASS rows=512,513 chunks=1,2,9 token1023=covered ordinary_fixture_bound=8\n";
+}
+void grouped_numeric_failure_checks(const std::vector<int>& workers) {
+    Temporary temp; Fixture f(temp, 3, 1);
+    {
+        std::fstream file(f.input.path, std::ios::in | std::ios::out | std::ios::binary);
+        for (int matrix = 0; matrix < 3; ++matrix) {
+            const auto& tensor = f.input.tensors[matrix]; std::vector<float> row(tensor.width, .01f);
+            for (int r = 0; r < tensor.rows; ++r)
+                lutbench::quantize(fmt(tensor.type_id), row.data(), f.packed[matrix].data() + size_t(r) * f.stride[matrix], tensor.width);
+            file.seekp(std::streamoff(tensor.offset));
+            file.write(reinterpret_cast<const char*>(f.packed[matrix].data()), std::streamsize(tensor.nbytes));
+        }
+        check(bool(file), "cannot write grouped numerical-failure fixture");
+    }
+    f.input.identity = ft_lut::file_identity(f.input.path);
+    ft_lut::Options options; options.cpus = workers; options.virtual_tp2 = true; options.activation = "q8";
+    GroupedRows rows; rows.append(0, {0}); rows.weight[0] = std::numeric_limits<float>::max();
+    for (float value : {.25f, 25.f}) {
+        auto backend = ft_lut::Backend::offline_fixture(options); backend->add_layer(f.input);
+        std::vector<uint16_t> x(f.h, _cvtss_sh(value, _MM_FROUND_TO_NEAREST_INT)); std::vector<float> output(f.h, 123.f); std::string why;
+        check(!grouped(*backend, 0, x, 1, rows, output, why), "grouped finite weighted/merge overflow accepted");
+        check(why.find(value == .25f ? "merged" : "weighted") != std::string::npos, "grouped overflow failed in the wrong numerical phase");
+        check(backend->grouped_runtime_failed() && !backend->grouped_ready(), "grouped numerical overflow is not sticky");
+        check(std::all_of(output.begin(), output.end(), [](float v) { return v == 123.f; }), "grouped numerical overflow published output");
+    }
+    // IQ3_K begins each256-weight block with an fp16 scale. Corrupt only that
+    // scale, retaining a structurally admitted file and otherwise finite rows.
+    {
+        std::fstream file(f.input.path, std::ios::in | std::ios::out | std::ios::binary);
+        const uint16_t inf = 0x7c00; file.seekp(std::streamoff(f.input.tensors[0].offset)); file.write(reinterpret_cast<const char*>(&inf), sizeof(inf));
+        check(bool(file), "cannot corrupt grouped projection scale");
+    }
+    f.input.identity = ft_lut::file_identity(f.input.path);
+    auto backend = ft_lut::Backend::offline_fixture(options); backend->add_layer(f.input);
+    rows.weight[0] = 1.f; std::vector<uint16_t> x(f.h, _cvtss_sh(.25f, _MM_FROUND_TO_NEAREST_INT));
+    std::vector<float> output(f.h, 123.f); std::string why;
+    check(!grouped(*backend, 0, x, 1, rows, output, why) && why.find("projection") != std::string::npos, "corrupted grouped scale did not fail its projection");
+    check(backend->grouped_runtime_failed() && !backend->grouped_ready(), "grouped nonfinite projection is not sticky");
+    check(std::all_of(output.begin(), output.end(), [](float v) { return v == 123.f; }), "grouped nonfinite projection published output");
+    std::cout << "GROUPED_NUMERIC_FAILURE_PASS nonfinite_projection=covered finite_weight_overflow=covered merge_overflow=covered sticky=covered\n";
+}
+int grouped_timing(int argc, char** argv) {
+    using Clock = std::chrono::steady_clock;
+    check(argc == 2 || argc == 7, "usage: --grouped-timing [EXPERTS ROWS H I REPETITIONS]");
+    const int nexp = argc == 7 ? std::stoi(argv[2]) : 250, nrow = argc == 7 ? std::stoi(argv[3]) : 10;
+    const int h = argc == 7 ? std::stoi(argv[4]) : 4096, intermediate = argc == 7 ? std::stoi(argv[5]) : 2048;
+    const int repetitions = argc == 7 ? std::stoi(argv[6]) : 3;
+    check(nexp > 0 && nexp <= 288 && nrow > 0 && nrow <= 64 && h >= 256 && h <= 4096 && h % 256 == 0 &&
+          intermediate >= 512 && intermediate <= 2048 && intermediate % 512 == 0 && repetitions > 0 && repetitions <= 20,
+          "grouped timing dimensions exceed test-only bounds");
+    Temporary temp; ft_lut::LayerInput layer; layer.model_layer = 3; layer.internal_li = 0; layer.path = temp.name("random-iq3-iq4");
+    uint64_t extent = 64, payload = 0;
+    for (int matrix = 0; matrix < 3; ++matrix) {
+        const int width = matrix == 2 ? intermediate : h, rows = matrix == 2 ? h : intermediate, type = matrix == 2 ? 144 : 138;
+        const uint64_t bytes = uint64_t(lutbench::row_bytes(fmt(type), width)) * rows * nexp;
+        layer.tensors[matrix] = {extent, bytes, type, width, rows, nexp}; payload += bytes; extent = (extent + bytes + 31) / 32 * 32;
+    }
+    check(payload <= (4ULL << 30), "synthetic packed weights exceed4GiB");
+    {
+        std::ofstream file(layer.path, std::ios::binary); uint32_t seed = 0xc001cafeU;
+        // All bit patterns are valid IQ3_K/IQ4_KS codes and integer scales.
+        // Randomize them directly, then give every floating scale a small,
+        // finite value. One expert buffer bounds generation memory and avoids
+        // retaining a second multi-GiB float or packed copy beside the backend.
+        for (int matrix = 0; matrix < 3; ++matrix) {
+            const auto& tensor = layer.tensors[matrix]; const size_t stride = lutbench::row_bytes(fmt(tensor.type_id), tensor.width);
+            check(stride == (matrix == 2 ? 4 + size_t(tensor.width / 256) * 136 : size_t(tensor.width / 256) * 110), "random packed generator layout mismatch");
+            std::vector<uint8_t> expert(stride * tensor.rows); file.seekp(std::streamoff(tensor.offset));
+            for (int e = 0; e < nexp; ++e) {
+                for (size_t p = 0; p < expert.size(); p += sizeof(uint32_t)) {
+                    uint32_t word = random_word(seed); std::memcpy(expert.data() + p, &word, std::min(sizeof(word), expert.size() - p));
+                }
+                for (int r = 0; r < tensor.rows; ++r) {
+                    auto* row = expert.data() + size_t(r) * stride;
+                    if (matrix == 2) {
+                        const float scale = .000005f + float(random_word(seed) >> 28) * .0000002f; std::memcpy(row, &scale, sizeof(scale));
+                    } else for (int b = 0; b < tensor.width / 256; ++b) {
+                        const uint16_t scale = _cvtss_sh(.00005f + float(random_word(seed) >> 28) * .000002f, _MM_FROUND_TO_NEAREST_INT);
+                        std::memcpy(row + size_t(b) * 110, &scale, sizeof(scale));
+                    }
+                }
+                file.write(reinterpret_cast<const char*>(expert.data()), std::streamsize(expert.size()));
+            }
+        }
+        check(bool(file), "cannot write random packed timing fixture");
+    }
+    layer.identity = ft_lut::file_identity(layer.path);
+    ft_lut::Options options; options.cpus = timing_cpus(); options.virtual_tp2 = true; options.activation = "q8"; options.job_timeout_ms = 3600000;
+    std::printf("GROUPED_TIMING_WORKERS %zu\n", options.cpus.size());
+    auto backend = ft_lut::Backend::grouped_benchmark_fixture(options); backend->add_layer(layer);
+    const auto receipt = backend->receipt();
+    check(receipt.payload_bytes[0] + receipt.payload_bytes[1] <= (4ULL << 30), "owned synthetic weights exceed4GiB");
+    const int ntok = 128; const auto x = grouped_input(ntok, h, 0x12345678U); const auto xf = expanded(x);
+    GroupedRows rows;
+    for (int e = 0; e < nexp; ++e) {
+        std::vector<int> tokens; const int first = (e * 17) % (ntok - nrow + 1);
+        for (int t = 0; t < nrow; ++t) tokens.push_back(first + t);
+        rows.append(e, tokens);
+    }
+    struct DecodeCall { int m; std::vector<float> x, out; ft_lut::Routes routes; };
+    std::vector<DecodeCall> calls;
+    for (int e = 0; e < nexp; ++e) for (int tile = 0; tile < nrow; tile += 4) {
+        const int m = std::min(4, nrow - tile); DecodeCall call; call.m = m; call.routes.resize(m); call.x.resize(size_t(m) * h); call.out.resize(call.x.size());
+        for (int t = 0; t < m; ++t) {
+            const int row = rows.offsets[e] + tile + t;
+            std::copy_n(xf.data() + size_t(rows.token[row]) * h, h, call.x.data() + size_t(t) * h);
+            call.routes[t].push_back({e, rows.weight[row]});
+        }
+        calls.push_back(std::move(call));
+    }
+    std::vector<float> output(x.size()); std::string why; int chunks = -1;
+    auto run_grouped = [&] {
+        check(grouped(*backend, 0, x, ntok, rows, output, why, 3600000, &chunks), "grouped timing run failed");
+    };
+    auto run_decode = [&] { for (auto& call : calls) backend->forward(0, call.x.data(), call.m, call.routes, call.out.data()); };
+    run_grouped(); run_decode();
+    // Compare one expert at a time: its4/4/remainder decode tiles have exactly
+    // the grouped tile arithmetic. Summing already-merged outputs of different
+    // experts would introduce a different TP2 rounding order.
+    for (int e : {0, nexp - 1}) {
+        GroupedRows probe; probe.experts = {e}; probe.offsets = {0, nrow};
+        probe.token.assign(rows.token.begin() + rows.offsets[e], rows.token.begin() + rows.offsets[e + 1]);
+        probe.weight.assign(rows.weight.begin() + rows.offsets[e], rows.weight.begin() + rows.offsets[e + 1]);
+        check(grouped(*backend, 0, x, ntok, probe, output, why, 3600000), "timing fixture single-expert check failed");
+        for (int tile = 0; tile < nrow; tile += 4) {
+            const auto& call = calls[size_t(e) * ((nrow + 3) / 4) + tile / 4];
+            for (int t = 0; t < call.m; ++t)
+                check(std::memcmp(output.data() + size_t(probe.token[tile + t]) * h, call.out.data() + size_t(t) * h, size_t(h) * sizeof(float)) == 0,
+                      "random packed timing weights changed grouped/decode tile bits");
+        }
+    }
+    std::vector<double> grouped_ms, decode_ms;
+    for (int repeat = 0; repeat < repetitions; ++repeat) {
+        auto begin = Clock::now(); run_grouped(); grouped_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
+        begin = Clock::now(); run_decode(); decode_ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - begin).count());
+    }
+    std::sort(grouped_ms.begin(), grouped_ms.end()); std::sort(decode_ms.begin(), decode_ms.end());
+    double checksum = 0; for (float value : output) { check(std::isfinite(value), "nonfinite timing output"); checksum += value; }
+    std::cout << "GROUPED_TIMING scope=workstation_synthetic placement_claim=none experts=" << nexp << " rows_per_expert=" << nrow
+              << " H=" << h << " I=" << intermediate << " tokens=" << ntok << " repetitions=" << repetitions
+              << " grouped_p50_ms=" << grouped_ms[grouped_ms.size() / 2] << " repeated_decode_p50_ms=" << decode_ms[decode_ms.size() / 2]
+              << " decode_calls=" << calls.size() << " grouped_chunks=" << chunks << " packed_bytes=" << payload
+              << " owned_payload_bytes=" << receipt.payload_bytes[0] + receipt.payload_bytes[1]
+              << " scratch_mapped_bytes_per_group=" << receipt.scratch_mapped_bytes[0] << " tile_bits=verified_first_last_expert checksum=" << checksum << '\n';
+    return 0;
+}
 void merged_overflow_checks(const std::vector<int>& workers) {
     Temporary temp;
     Fixture fixture(temp, 3, 1);
@@ -281,7 +692,7 @@ void mapping_allocator_checks() {
 void verify_policy_receipts(const ft_lut::Receipt& receipt) {
     for (const auto& row : receipt.scratch) {
         check(row.payload_bytes == receipt.scratch_bytes[row.group] && row.mapped_bytes == receipt.scratch_mapped_bytes[row.group], "scratch receipt byte ledger mismatch");
-        check(row.mapped_bytes >= row.payload_bytes && row.mapped_bytes <= (32ULL << 20), "scratch mapped allocation bound incorrect");
+        check(row.mapped_bytes >= row.payload_bytes && row.mapped_bytes <= ((receipt.activation == "q8" ? 48ULL : 32ULL) << 20), "scratch mapped allocation bound incorrect");
         if (row.preferred_policy)
             check(row.policy_mode == MPOL_PREFERRED && row.policy_nodes == std::vector<int>{row.node} && !row.policy_failures && !row.policy_errno, "scratch policy was not read back exactly");
     }
@@ -352,6 +763,7 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string(argv[1]) == "--numa-probe") {
             check(argc == 5, "usage: --numa-probe CPU_CSV FIXTURE_DIRECTORY i16|q8"); return numa_probe(argv[2], argv[3], argv[4]);
         }
+        if (argc > 1 && std::string(argv[1]) == "--grouped-timing") return grouped_timing(argc, argv);
         mapping_allocator_checks();
         std::string real_directory;
         if (argc > 1) { check(argc == 3 && std::string(argv[1]) == "--fixtures", "usage: [--fixtures FIXTURE_DIRECTORY]"); real_directory = argv[2]; }
@@ -406,6 +818,9 @@ int main(int argc, char** argv) {
         rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, bank); });
         rejects([&] { ft_lut::Backend::staged_bank(rejected_bank, broken); });
         Fixture ordinary(temp, 3, 8), upgrade(temp, 11, 8), down6(temp, 12, 8);
+        grouped_checks(workers, ordinary, upgrade);
+        grouped_boundary_checks(workers);
+        grouped_numeric_failure_checks(workers);
         int cases = 0; double worst = 0;
         // The diagnostics cannot enter production, even before a bank exists.
         // Verify the specific early rejection instead of relying on empty-bank
@@ -717,8 +1132,10 @@ int main(int argc, char** argv) {
             const auto full_receipt = full_width->receipt(); verify_policy_receipts(full_receipt);
             check(full_receipt.act_limit == 1.5f, "model activation limit not recorded");
             if (sysconf(_SC_PAGESIZE) == 4096) {
-                const uint64_t expected = activation == "i16" ? 4849664 : 1245184;
+                const uint64_t expected = activation == "i16" ? 4849664 : 26411008;
                 check(full_receipt.scratch_mapped_bytes == std::array<uint64_t, 2>{expected, expected}, "production scratch mapped ledger differs from page-rounded recipe");
+                if (activation == "q8")
+                    check(full_receipt.scratch_bytes == std::array<uint64_t, 2>{22722560, 22722560}, "production Q8 scratch payload ledger differs from recipe");
             }
             if (real_upgrade) { full_width->add_layer(real_upgrade->input); layout(*full_width, *real_upgrade); numeric(*full_width, *real_upgrade, activation == "i16" ? lutbench::Path::I16 : lutbench::Path::Q8, cases, worst, 1.5f); }
             if (activation == "i16") idle_measure(*full_width, *production);
