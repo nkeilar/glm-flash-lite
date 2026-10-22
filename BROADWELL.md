@@ -28,6 +28,7 @@ Every switch added here defaults to off (upstream behaviour). In the table, the 
 | `GLM53_CT_BUILD` | path | separate JIT build dir per flag set, so variants don't overwrite each other | |
 | `GLM53_ZC_THP` | 0 · **1** | pinned expert arena backed by 2 MB pages (mmap + `MADV_HUGEPAGE` before first touch) | prefill +4-5%, decode tie; needs THP `madvise` or `always` |
 | `GLM53_LA` | 0 · **1** | decode lookahead (ported from upstream `1f6d74e`); runtime `GET /la?on=0\|1` | +3.3%; greedy-identical in `exact` mode |
+| `GLM53_CT_PREFILL` | 0 · **1** | small prefills (9-1,023 tokens) give their least-routed cold experts to the LUT CPU tier while the GPU streams the rest; runtime `GET /ct_policy?prefill=0\|1`; `/stats` `cpu_tier.prefill_cpu` (tuning: `GLM53_CT_PREFILL_MAX`, `GLM53_CT_PF_ROWCAP`, `GLM53_CT_PF_TZC`, `GLM53_CT_PF_D`, `GLM53_CT_PF_R`, `GLM53_CT_PF_TIMEOUT_S`) | follow-up turn after a 32k context, +256 tokens: 8.5 → 2.5 s to the first token (see "Agent turns, part 2") |
 | `GLM53_RC_PAGE` | 0 · **1** | one prefill forward per agent turn: snapshot the KDA state at every page during decode and drop exllamav3's separate last-page prefill forward; runtime `GET /rc?mode=page\|stock`; serve with `-rcs 24` | time to first token after a tool result 18.9 → 9.3 s (see "Agent turns") |
 | `GLM53_CT_SWIGLU_CLAMP` | 0 · **1** | apply the model's `swiglu_limit` (10) in the CPU path, as the GPU path does | correctness: CPU-path panel top-1 0.9842 → 0.9865 |
 | `GLM53_EC_BG` | 0 · **1** | background admission into the VRAM expert cache on a copy stream (`GLM53_EC_BG_*` tune it) | flat on one GPU; +10% with the remote tier |
@@ -134,6 +135,7 @@ export GLM53_CT_FORMAT=lut GLM53_CT_LUT_ACT=q8 \
   GLM53_CT_CPUS=2-43 GLM53_CT_THREADS=0 GLM53_CT_COORD_CPU=0 GLM53_CT_MAXBSZ=4 GLM53_CT_SWIGLU_CLAMP=1 \
   GLM53_CT_B=0.31 GLM53_CT_TZC=3.0 GLM53_CT_FORCE_N=-1   # TZC 3.0, not 1.3, with the bounded policy: see "Two configuration fixes"
 export GLM53_RC_PAGE=1      # agent turns: one prefill forward instead of two; add -rcs 24 to the serve.py arguments
+export GLM53_CT_PREFILL=1   # agent turns: small prefills put their least-routed cold experts on the CPU
 # not used with E1: GLM53_CT_SWZ, GLM53_CT_SPLIT1, GLM53_CT_SOCKQ, GLM53_CT_P0BLK, GLM53_CT_CFLAGS (trellis-only)
 ```
 
@@ -343,6 +345,50 @@ RAM, as the decode path already does, is the next lever.
 - **Why:** verifying k drafted tokens costs ~0.5 token each here. The CPU lane is bandwidth-bound, and the distinct cold
   experts grow almost linearly with the window, so even a perfect 8-token copy gains only 1.7× per step. Most output is
   reasoning, which rarely repeats the context.
+
+### Agent turns, part 2: small prefills on the CPU (2026-10-22)
+After the one-pass fix, an agent turn still pays one prefill pass, and on this box that pass reads almost the whole
+non-cached expert bank over PCIe 3.0 (~8 s), however few tokens it carries. Decode already computes cold experts on the
+CPU from RAM. Prefill didn't, because the LUT kernels take at most 4 tokens per call.
+
+**First, the obvious idea didn't work.** I expected that grouping all of an expert's tokens would be nearly free once
+its weights were cached. A cost split of the production kernels said otherwise:
+- each 4-row call spends ~23% unpacking weights and the rest on per-row integer work;
+- the assembly M4 kernel already sits at ~72% of Broadwell's port-0 floor for that work;
+- DRAM was a rounding error (4 µs per call).
+
+So a bigger "unpack once, many rows" kernel would buy at most ~20%. An 8-row instantiation of the generic kernel was
+actually slower (register spills).
+
+**What works is splitting each layer between the two sides:**
+- **The CPU** takes the experts few tokens need: one weight read serves 1-10 rows cheaply.
+- **The GPU** streams the busy ones over PCIe: one transfer serves many rows.
+- **The planner** sorts a layer's cold experts by row count and picks the prefix that minimises max(CPU time, PCIe time).
+  That's the split rule from mw00/project-maya's GLM prefill. The CPU's cost per row is learned live.
+- **The CPU call** is a new expert-major entry point: an expert's rows are tiled exactly as decode tiles them, one pool
+  run per ≤ 512-row chunk.
+- **Masking:** the CPU's experts are masked out of the GPU's selection with exl3_moe's ignored sentinel id
+  (num_experts, weight 0), only once the CPU has said it is ready. Otherwise the GPU path stays untouched.
+- **Timing:** the CPU call runs while the GPU computes the rest of the layer, and its fp32 partial is added before the
+  shared expert.
+- **Decode is unchanged** and bit-identical to the previous build.
+
+**Measured on the test box** (one user; `GET /ct_policy?prefill=0|1` on the same server):
+
+| Follow-up turn after a cached 32k context | Off | On |
+|---|---|---|
+| +64 new tokens | 5.6-5.7 s | **1.2-1.3 s** |
+| +256 new tokens | 8.4-8.5 s | **2.4-2.5 s** |
+| +1,000 new tokens | 11.4 s | **5.8 s** |
+| Decode, 1 / 2 / 4 users (prefill path idle) | 29.6 / 26.8 / 29.3 tok/s (previous build) | 30.1 / 27.6 / 29.7 tok/s |
+
+- **Quality:** greedy tokens after a ~900-token prompt matched a cache-free reference forward 94.8% of the time with
+  the CPU path, against 86.2% without it, on different texts. Follow-up turns: 89.5% vs 90.6%. No collapse.
+- **A live coding agent** (pi, writing and editing files): the median wait before a reply fell from 10.5 s to 5.6 s.
+- **What's left:**
+  - The host-side planning (one sync, a numpy plan, the row build) costs ~16 ms per layer, about half of a 64-token
+    turn.
+  - Prefills of 1,024+ tokens still use the staged GPU path.
 
 ## The measured profile
 
