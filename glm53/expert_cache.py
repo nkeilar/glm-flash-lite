@@ -874,7 +874,8 @@ class Pool:
         if self.bg is not None:                         # [E3] the router's picks before ft_split masked the CPU lane
             m = self.mods[li]
             o = getattr(m, "_ct_orig", None)
-            if o is not None and getattr(m, "_ct_pending", False) and o.numel() == sel.numel():
+            pending = getattr(m, "_ct_pending", False) or getattr(m, "_pf", None) is not None   # [bdw-prefill] grouped prefill too
+            if o is not None and pending and o.numel() == sel.numel():
                 osel = o.reshape(-1)
                 if osel.dtype != torch.long or not osel.is_contiguous():
                     osel = osel.long().contiguous()

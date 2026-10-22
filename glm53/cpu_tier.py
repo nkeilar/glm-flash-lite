@@ -30,10 +30,23 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _KDIR = os.path.join(os.path.dirname(_HERE), "kernels", "cpu_avx2")
 _H = None
 _CU = None
-S = {"mods": [], "dev": None, "seq": 0, "started": False, "selftest": None, "lut_error": None}
+S = {"mods": [], "dev": None, "seq": 0, "started": False, "selftest": None, "lut_error": None, "in_prefill": False}
 # [bdw-opt trace] GLM53_TRACE_ROUTES=<path>: append one JSON line per decode MoE step: [layer, orig picks..., post-split
 # picks...] (post-split: picks sent to the CPU tier are -1). Forces two device syncs per layer: TRACE RUNS ONLY.
 TR = {"path": os.environ.get("GLM53_TRACE_ROUTES"), "buf": []}
+# [bdw-prefill] CPU-side small prefills (LUT only). A prefill forward of 9..PF["max"] tokens otherwise reads every non-VRAM expert
+# zero-copy over PCIe (~8.5 s per forward on PCIe 3.0, measured). Per MoE layer of such a forward: one sync fetches the
+# picks, weights, cache residency and expert input; a planner gives the CPU the least-routed cold experts (ascending rows
+# while the estimated CPU time stays under the PCIe time still left; experts over the per-expert row cap stay on the GPU);
+# only after the LUT backend reports ready are those picks masked out of the GPU's selection (id = num_experts, weight 0:
+# exl3_moe's ignored sentinel bin); comb() then runs the grouped CPU call while the GPU experts run (GIL released) and adds
+# its fp32 partial before the shared expert. A failure after masking is sticky and raises (never a silent drop).
+# Env: GLM53_CT_PREFILL (0; runtime /ct_policy?prefill=0|1), GLM53_CT_PREFILL_MAX (1023), GLM53_CT_PF_ROWCAP (64),
+#      GLM53_CT_PF_TZC (0.86 ms per cold expert over PCIe), GLM53_CT_PF_D / GLM53_CT_PF_R (CPU ms per expert / per row; the
+#      planner rescales them by the measured/predicted ratio, kappa), GLM53_CT_PF_TIMEOUT_S (10).
+PF = {"on": False, "max": 1023, "cap": 0, "rowcap": 64, "tzc_ms": 0.86, "d_ms": 0.055, "r_ms": 0.047, "kappa": 1.0,
+      "timeout_ms": 10000.0, "stats": {"forwards": 0, "layers": 0, "rows": 0, "cpu_experts": 0, "gpu_cold_experts": 0,
+      "cpu_ms": 0.0, "predicted_ms": 0.0, "plan_ms": 0.0, "not_ready": 0, "nothing_taken": 0}}
 
 
 def set_trace(path=None):
@@ -267,6 +280,8 @@ def wrap(model):
     S["picks"] = torch.zeros(S["maxpicks"] * 3, dtype=torch.int32).pin_memory()
     S["hout"] = torch.zeros(max(8, maxbsz) * H, dtype=torch.float32).pin_memory()
     S["dflag"] = torch.zeros(1, dtype=torch.int64, device=dev)
+    if settings.format == "lut":
+        _pf_alloc(model, mods, dev, H)
     S["stats"] = torch.zeros(8, dtype=torch.int64, device=dev)
     sp = os.environ.get("GLM53_CT_STATS") or os.environ.get("GLM53_EC_WARM") or os.environ.get("GLM53_ZC_STATS")
     scores = json.load(open(sp)) if sp else {}
@@ -292,6 +307,11 @@ def wrap(model):
                 raise RuntimeError("LUT tier failed; restart required: " + S["lut_error"])
             sel, w = _orig(bsz, cfg, z, params)
             _m._ct_pending = False
+            _m._pf = None
+            if (PF["on"] and S["in_prefill"] and S["started"] and 8 < bsz <= PF["max"] and not params.get("autosplit_measure")
+                    and not params.get("tp_warmup") and getattr(_m, "_ec", None) is not None):
+                routed_pf = _pf_route(_m, bsz, z, sel, w)
+                return routed_pf if routed_pf is not None else (sel, w)
             if (not S["started"] or bsz > S["maxbsz"] or params.get("autosplit_measure") or params.get("tp_warmup")
                     or getattr(_m, "_ec", None) is None or sel.numel() > S["maxpicks"]):
                 return sel, w
@@ -318,6 +338,8 @@ def wrap(model):
         orig_comb = m.cpu_split_combine
 
         def comb(fhs, cpu_partial, cpu_pending, shape, _orig=orig_comb, _m=m):
+            if getattr(_m, "_pf", None) is not None:
+                fhs = _pf_combine(_m, fhs)
             if _m._ct_pending:
                 _m._ct_pending = False
                 f = fhs if fhs.is_contiguous() else fhs.contiguous()
@@ -330,6 +352,144 @@ def wrap(model):
     S["mods"] = mods
     _prelaunch(dev, H, mods[0])
     print(f" -- cpu_tier: wrapped {len(mods)} MoE layers on {dev} (max bsz {maxbsz}, scores {sp})", flush=True)
+
+
+def _pf_alloc(model, mods, dev, H):
+    """[bdw-prefill] Buffers for the grouped prefill path, allocated before expert_cache sizes its arena (the device output buffer
+    takes VRAM), whether or not the path starts enabled, so /ct_policy?prefill=1 can turn it on without a restart."""
+    from lut_manifest import require
+    PF.update(on=os.environ.get("GLM53_CT_PREFILL", "0") == "1", max=int(os.environ.get("GLM53_CT_PREFILL_MAX", "1023")),
+              rowcap=int(os.environ.get("GLM53_CT_PF_ROWCAP", "64")), tzc_ms=float(os.environ.get("GLM53_CT_PF_TZC", "0.86")),
+              d_ms=float(os.environ.get("GLM53_CT_PF_D", "0.055")), r_ms=float(os.environ.get("GLM53_CT_PF_R", "0.047")),
+              timeout_ms=1000.0 * float(os.environ.get("GLM53_CT_PF_TIMEOUT_S", "10")))
+    require(9 <= PF["max"] <= 1023, "GLM53_CT_PREFILL_MAX must be 9..1023 (staging takes 1024+ token chunks)")
+    import math
+    for key in ("tzc_ms", "d_ms", "r_ms"):
+        require(math.isfinite(PF[key]) and 0 < PF[key] <= 1000, f"grouped prefill cost {key} must be finite, in (0, 1000] ms")
+    require(math.isfinite(PF["timeout_ms"]) and 0 < PF["timeout_ms"] <= 3600000,
+            "GLM53_CT_PF_TIMEOUT_S must be finite, in (0, 3600] s (the native grouped timeout range)")
+    require(1 <= PF["rowcap"] <= 64, "GLM53_CT_PF_ROWCAP must be 1..64 (the native per-expert row limit)")
+    E = mods[0].num_local_experts or mods[0].num_experts
+    require(all((x.num_local_experts or x.num_experts) == E and int(x.routing_first or 0) == 0 for x in mods),
+            "grouped prefill needs the same expert count on every layer, first expert 0")
+    T = PF["max"]
+    PF.update(cap=T, E=E, H=H, hsel=torch.empty(T * 8, dtype=torch.int64).pin_memory(),
+              hw=torch.empty(T * 8, dtype=torch.half).pin_memory(), hslot=torch.empty(E, dtype=torch.int32).pin_memory(),
+              hz=torch.empty(T * H, dtype=torch.half).pin_memory(), hout=torch.empty(T * H, dtype=torch.float32).pin_memory(),
+              dout=torch.empty(T, H, dtype=torch.float32, device=dev), ev=torch.cuda.Event())
+    cls = type(model)
+    if not getattr(cls, "_bdw_prefill_hooked", False):   # exllamav3 Job.prefill calls model.prefill; decode calls forward
+        orig = cls.prefill
+
+        def prefill(self, *args, _orig=orig, **kwargs):
+            S["in_prefill"] = True
+            try:
+                return _orig(self, *args, **kwargs)
+            finally:
+                S["in_prefill"] = False
+        cls.prefill = prefill
+        cls._bdw_prefill_hooked = True
+
+
+def pf_plan(counts, d_ms, r_ms, tzc_ms, rowcap):
+    """[bdw-prefill] Split one layer's cold experts (counts[e] = cold rows of expert e) between the CPU and PCIe: the CPU takes a
+    least-routed-first prefix (d_ms + r_ms * rows each), the GPU streams the rest (tzc_ms each); the prefix minimising
+    max(CPU time, PCIe time) wins (the split rule of mw00/project-maya's GLM prefill, without leaving the last expert on
+    the GPU when the CPU is faster).
+    Experts over rowcap stay on the GPU. Returns (take uint8[E], estimated CPU ms)."""
+    import numpy as np
+    counts = np.asarray(counts)
+    cand = np.nonzero((counts > 0) & (counts <= rowcap))[0]
+    cand = cand[np.argsort(counts[cand], kind="stable")]
+    n_cold = int(np.count_nonzero(counts))
+    cpu = np.concatenate(([0.0], np.cumsum(d_ms + r_ms * counts[cand].astype(np.float64))))   # CPU ms for the first k
+    pcie = (n_cold - np.arange(cand.size + 1)) * tzc_ms                                    # PCIe ms for the rest
+    k = int(np.argmin(np.maximum(cpu, pcie)))       # the sorted prefix with the earliest finish of the slower side
+    take = np.zeros(counts.shape[0], dtype=np.uint8)
+    take[cand[:k]] = 1
+    return take, float(cpu[k])
+
+
+def _pf_route(m, T, z, sel, w):
+    """[bdw-prefill] Plan one prefill MoE layer: returns the GPU's masked (sel, w), or None for the unchanged GPU path."""
+    import numpy as np
+    pool, li = m._ec
+    E, H = PF["E"], PF["H"]
+    if not _H.tier_lut_grouped_ready():          # acceptance before any masking: otherwise the GPU path stays whole
+        PF["stats"]["not_ready"] += 1
+        return None
+    t0 = time.perf_counter()
+    n = T * 8
+    assert sel.numel() == n, "grouped prefill expects 8 picks per token"
+    hsel, hw, hz = PF["hsel"][:n], PF["hw"][:n], PF["hz"][:T * H]
+    hsel.copy_(sel.reshape(-1), non_blocking=True)
+    hw.copy_(w.reshape(-1).to(torch.half), non_blocking=True)
+    PF["hslot"].copy_(pool.slotof[li], non_blocking=True)
+    zz = z.reshape(T, H)
+    hz.view(T, H).copy_(zz if zz.dtype == torch.half else zz.half(), non_blocking=True)
+    PF["ev"].record()
+    PF["ev"].synchronize()
+    s = hsel.numpy()
+    slot = PF["hslot"].numpy()
+    valid = (s >= 0) & (s < E)
+    cold = valid & (slot[np.clip(s, 0, E - 1)] < 0)
+    counts = np.bincount(s[cold], minlength=E)
+    take, t_cpu = pf_plan(counts, PF["kappa"] * PF["d_ms"], PF["kappa"] * PF["r_ms"], PF["tzc_ms"], PF["rowcap"])
+    n_cold = int(np.count_nonzero(counts))
+    st = PF["stats"]
+    if not take.any():
+        st["nothing_taken"] += 1
+        return None
+    take_t = torch.from_numpy(take)
+    experts, offsets, row_token, row_weight = _H.tier_lut_build_grouped_rows(hsel.view(T, 8), hw.view(T, 8), take_t, E)
+    take_d = take_t.to(sel.device, non_blocking=True).bool()
+    cpu_mask = take_d[sel.clamp(0, E - 1)] & (sel >= 0) & (sel < E)
+    sel_m = torch.where(cpu_mask, torch.full_like(sel, E), sel)       # E = num_experts: exl3_moe's ignored sentinel bin
+    w_m = torch.where(cpu_mask, torch.zeros_like(w), w)
+    ntake, R = int(take.sum()), int(offsets[-1])
+    m._ct_orig = sel                              # expert_cache counts the CPU-lane experts' use (as for decode)
+    m._pf = (li, T, experts, offsets, row_token, row_weight, t_cpu)
+    st["layers"] += 1
+    st["rows"] += R
+    st["cpu_experts"] += ntake
+    st["gpu_cold_experts"] += n_cold - ntake
+    st["predicted_ms"] += t_cpu
+    st["plan_ms"] += 1000.0 * (time.perf_counter() - t0)
+    if li == 0:
+        st["forwards"] += 1
+    return sel_m, w_m
+
+
+def _pf_combine(m, fhs):
+    """[bdw-prefill] Run the planned grouped CPU call (the GPU experts are already queued) and add its partial into fhs."""
+    li, T, experts, offsets, row_token, row_weight, predicted = m._pf
+    m._pf = None
+    H = PF["H"]
+    hout = PF["hout"][:T * H].view(T, H)
+    ok, why, ms, chunks = _H.tier_lut_forward_grouped(li, PF["hz"][:T * H].view(T, H), experts, offsets, row_token,
+                                                       row_weight, hout, PF["timeout_ms"])
+    if not ok:
+        S["lut_error"] = f"grouped prefill, layer {li}: {why}"
+        raise RuntimeError("LUT tier failed; restart required: " + S["lut_error"])
+    st = PF["stats"]
+    st["cpu_ms"] += ms
+    if predicted > 0:                              # the planner's CPU cost scale follows what the CPU actually took
+        PF["kappa"] = min(4.0, max(0.25, 0.9 * PF["kappa"] + 0.1 * PF["kappa"] * ms / predicted))
+    f = fhs if fhs.is_contiguous() else fhs.contiguous()
+    assert f.dtype == torch.float32 and f.numel() == T * H, "grouped prefill expects the fp32 [T,H] expert sum"
+    dout = PF["dout"][:T]
+    dout.copy_(hout, non_blocking=True)
+    f.view(T, H).add_(dout)
+    return f
+
+
+def _pf_summary():
+    st = dict(PF["stats"])
+    return dict(on=PF["on"], max=PF["max"], rowcap=PF["rowcap"], tzc_ms=PF["tzc_ms"], d_ms=PF["d_ms"], r_ms=PF["r_ms"],
+                kappa=round(PF["kappa"], 3), **st,
+                cpu_ms_per_layer=round(st["cpu_ms"] / max(1, st["layers"]), 3),
+                plan_ms_per_layer=round(st["plan_ms"] / max(1, st["layers"]), 3),
+                rows_per_layer=round(st["rows"] / max(1, st["layers"]), 1))
 
 
 def _prelaunch(dev, H, m):
@@ -640,6 +800,7 @@ def summary():
             "gpu_late": st[7], "gpu_late_frac": round(st[7] / max(1, st[5]), 4),
             "job_hist": _job_hist()}
     if S.get("settings") and S["settings"].format == "lut":
+        result.update(prefill_cpu=_pf_summary())
         result.update(format="lut", activation=S["settings"].activation, act_limit=S["act_limit"],
                       admission=S["settings"].admission, lut=_H.tier_lut_stats(),
                       measured_cost_policy="profile/M shared grid K<=8; see lut_batch_policy for caps and EST tails",
@@ -680,7 +841,7 @@ def _write_policy(index, value):
 
 
 def set_policy(rt=None, check=None, b_rt=None, auto_b=None, e4=None, fuse=None, fuse_maxn=None, pf_lean=None, lut=None,
-               ovl_after=None, **kw):
+               ovl_after=None, prefill=None, pf_max=None, pf_tzc=None, **kw):
     """[rt] runtime knobs (T-18 verification, no restart): ft_split cost model values in S["pol"] (read by the GPU split
     kernel every call) and the remote tier on/off + numerics-check period. Returns the current values."""
     is_lut = bool(S.get("settings") and S["settings"].format == "lut")
@@ -697,6 +858,18 @@ def set_policy(rt=None, check=None, b_rt=None, auto_b=None, e4=None, fuse=None, 
         if kw.get("force_n") is not None:
             lut_policy_count(kw["force_n"], "force_n", -1, 8)
         require(kw.get("tok") is None or float(kw["tok"]) == 0, "LUT M costs already include token multiplicity")
+    if prefill is not None or pf_max is not None or pf_tzc is not None:   # [bdw-prefill] grouped CPU prefill switches
+        from lut_manifest import require
+        require(is_lut and PF["cap"] > 0, "grouped CPU prefill needs the LUT tier")
+        if pf_max is not None:
+            require(9 <= int(pf_max) <= PF["cap"], f"pf_max must be 9..{PF['cap']} (the allocated buffers)")
+            PF["max"] = int(pf_max)
+        if pf_tzc is not None:
+            import math
+            require(math.isfinite(float(pf_tzc)) and 0 < float(pf_tzc) <= 100, "pf_tzc must be a finite positive ms cost")
+            PF["tzc_ms"] = float(pf_tzc)
+        if prefill is not None:
+            PF["on"] = bool(int(prefill))
     if b_rt is not None:
         S["b_rt"] = float(b_rt)                              # B used while the 3090s are attached (auto mode)
     if auto_b is not None:
@@ -727,7 +900,7 @@ def set_policy(rt=None, check=None, b_rt=None, auto_b=None, e4=None, fuse=None, 
             "ovl_after": after,
             "remote_on": S.get("rt_on"), "auto_b": S.get("b_auto"),
             "b_rt": S.get("b_rt"), "b_base": S.get("b_base"), "remote": _rt_summary(),
-            **({"lut_batch_policy": _lut_policy_summary(p[5])} if is_lut else {})}
+            **({"lut_batch_policy": _lut_policy_summary(p[5]), "prefill_cpu": _pf_summary()} if is_lut else {})}
 
 
 def _rt_sync_masks():

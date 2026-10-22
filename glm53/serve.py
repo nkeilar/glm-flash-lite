@@ -597,13 +597,16 @@ async def ct_policy(b: float | None = None, tzc: float | None = None, a: float |
                     rt: int | None = None, check: int | None = None, b_rt: float | None = None, auto_b: int | None = None,
                     e4: int | None = None, ra: float | None = None, rb: float | None = None, fuse: int | None = None,
                     fuse_maxn: int | None = None, pf_lean: int | None = None, lut: str | None = None,
-                    ovl_after: int | None = None):
-    """[rt] T-18: runtime CPU-tier split knobs + remote tier on/off + numerics-check period (cpu_tier.set_policy)."""
+                    ovl_after: int | None = None, prefill: int | None = None, pf_max: int | None = None,
+                    pf_tzc: float | None = None):
+    """[rt] T-18: runtime CPU-tier split knobs + remote tier on/off + numerics-check period (cpu_tier.set_policy).
+    [bdw-prefill] prefill=0|1, pf_max, pf_tzc: the grouped CPU prefill path (LUT only)."""
     import cpu_tier
     return JSONResponse(cpu_tier.set_policy(b=b, tzc=tzc, a=a, maxn=maxn, rt=None if rt is None else bool(rt), check=check,
                                             b_rt=b_rt, auto_b=None if auto_b is None else bool(auto_b),
                                             e4=None if e4 is None else bool(e4), ra=ra, rb=rb, fuse=fuse,
-                                            fuse_maxn=fuse_maxn, pf_lean=pf_lean, lut=lut, ovl_after=ovl_after))
+                                            fuse_maxn=fuse_maxn, pf_lean=pf_lean, lut=lut, ovl_after=ovl_after,
+                                            prefill=prefill, pf_max=pf_max, pf_tzc=pf_tzc))
 
 
 @app.get("/ec_bg")
