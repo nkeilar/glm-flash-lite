@@ -1,6 +1,6 @@
 > **Fork note (nkeilar/glm-flash-lite, branch `broadwell-pcie3`):** this branch adds patches for older hardware
 > (dual-socket Broadwell AVX2, PCIe 3.0, one RTX 3090) on top of upstream commit `1966a4f`. See
-> [BROADWELL.md](BROADWELL.md) for the switches, the measured profile (15.2 tok/s on that box) and how to adapt it,
+> [BROADWELL.md](BROADWELL.md) for the switches, the measured profile (30.1 tok/s decode for one conversation on that box) and how to adapt it,
 > and the write-up at https://nathankeilar.com/systems/glm53-flash-320b-moe-one-rtx-3090. Upstream:
 > https://github.com/sybil-solutions/glm-flash-lite
 
